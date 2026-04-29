@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "astral-sdk"
+version = "0.1.0"
+description = "Open Python SDK for ArduPilot drones: MAVLink primitives, camera drivers, and examples."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+    { name = "Astral AI, Inc.", email = "team@astral.us" },
+]
+keywords = ["drone", "mavlink", "ardupilot", "robotics", "uav"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "pymavlink>=2.4",
+    "pyserial>=3.5",
+    "numpy>=1.24",
+    "PyYAML>=6.0",
+    "opencv-python>=4.8",
+]
+
+[project.optional-dependencies]
+camera-oak = ["depthai>=2.24"]
+camera-realsense = ["pyrealsense2>=2.55"]
+all = ["depthai>=2.24", "pyrealsense2>=2.55"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://astral.us"
+Repository = "https://github.com/astral-us/astral-sdk"
+Documentation = "https://astral.us/docs"
+Issues = "https://github.com/astral-us/astral-sdk/issues"
+
+[project.scripts]
+astral-arm-disarm = "astral_sdk.arm_disarm:main"
+astral-motor-test = "astral_sdk.motor_test:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/astral_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/astral_sdk",
+    "examples",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

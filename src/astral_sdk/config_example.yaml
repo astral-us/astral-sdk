@@ -1,0 +1,20 @@
+# astral-sdk configuration template
+# Copy this to config.yaml and edit for your setup.
+# By default, astral-sdk loads config.yaml from the current working directory.
+# Override the directory with set_config_path() or the
+# ASTRAL_SDK_CONFIG_DIR environment variable.
+
+# Flight Controller Connection
+# Tip: prefer a stable /dev/serial/by-id/... path over /dev/ttyACM*
+serial_port: "/dev/ttyACM0"
+baud_rate: 115200
+
+# Battery Monitoring (used by configure_battery_monitoring())
+battery:
+  cells: 4                       # Number of cells (3S=3, 4S=4, 6S=6)
+  capacity_mah: 5000             # Battery capacity in mAh
+  low_voltage_per_cell: 3.5      # Low battery warning (V per cell)
+  critical_voltage_per_cell: 3.3 # Critical battery warning (V per cell)
+
+# Logging
+log_level: "INFO"
