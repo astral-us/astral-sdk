@@ -143,14 +143,23 @@ def _connect():
         port = _os.environ.get("ASTRAL_SDK_SERIAL_PORT", port)
         baud = int(_os.environ.get("ASTRAL_SDK_BAUD_RATE", baud))
 
-        if not _os.path.exists(port):
+        # Network URLs (SITL, MAVProxy, etc.) bypass the serial-device check.
+        is_network = port.startswith(("tcp:", "tcpin:", "udp:", "udpin:", "udpout:"))
+
+        if not is_network and not _os.path.exists(port):
             raise ConnectionError(
                 f"Flight controller not found at {port}. "
-                f"Check USB connection and verify the serial port in config.yaml."
+                f"Check USB connection and verify the serial port in config.yaml. "
+                f"For SITL/simulation, set ASTRAL_SDK_SERIAL_PORT to a MAVLink URL "
+                f"(e.g. tcp:127.0.0.1:5760)."
             )
 
-        print(f"Connecting to {port} at {baud}...")
-        _master = mavutil.mavlink_connection(port, baud=baud, source_system=255)
+        if is_network:
+            print(f"Connecting to {port}...")
+            _master = mavutil.mavlink_connection(port, source_system=255)
+        else:
+            print(f"Connecting to {port} at {baud}...")
+            _master = mavutil.mavlink_connection(port, baud=baud, source_system=255)
 
         # First heartbeat (any); then prefer ArduPilot FC.
         msg = _master.recv_match(type="HEARTBEAT", blocking=True, timeout=10)
