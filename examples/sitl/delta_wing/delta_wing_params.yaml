@@ -1,0 +1,103 @@
+# Delta-Wing UAV Physical and Aerodynamic Parameters
+# ===================================================
+# Vehicle: delta-wing pusher-prop UAV
+# Reference condition: sea level ISA, V=41.7 m/s (150 km/h), alpha=5 deg
+
+vehicle:
+  name: "ZeroClaw Delta Wing"
+  mass_kg: 200.0
+  wingspan_m: 2.5
+  length_m: 3.5
+  wing_area_m2: 3.5          # S = b^2 / AR
+  aspect_ratio: 1.786        # AR = b^2 / S = 2.5^2 / 3.5
+  mean_aerodynamic_chord_m: 1.524  # MAC = S / b = 3.5 / 2.3 (effective span ~2.3)
+
+  # Inertia tensor (kg*m^2) — diagonal for symmetric delta wing
+  inertia_xx: 45.0   # roll  (x = forward)
+  inertia_yy: 60.0   # pitch (y = right)
+  inertia_zz: 95.0   # yaw   (z = down in body, up in world)
+
+  # Center of mass offset from reference point (m) — body frame
+  cg_offset_x: 0.0
+  cg_offset_y: 0.0
+  cg_offset_z: 0.0
+
+aerodynamics:
+  # Lift curve slope (per radian) — strong vortex lift for delta wing
+  CL_alpha: 3.5          # Linear lift slope (lower than elliptical, vortex adds nonlinear term)
+  CL_0: 0.05             # Zero-alpha lift (cambered leading edge)
+  CL_q: 3.5              # Pitch rate contribution to lift
+
+  # Vortex lift (Polhamus leading-edge suction analogy)
+  Kp: 1.5                # Potential flow vortex coefficient
+  Kv: 2.8                # Vortex lift coefficient (sin^2(alpha)*cos(alpha))
+
+  # Drag
+  CD_0: 0.018            # Zero-lift parasite drag
+  oswald_efficiency: 0.70  # e (Oswald factor — delta wings are ~0.7)
+
+  # Pitching moment
+  Cm_0: 0.04            # Zero-alpha pitching moment
+  Cm_alpha: -0.3         # Pitch stability derivative (negative = stable)
+  Cm_q: -8.0             # Pitch damping
+  Cm_de: 1.5            # Elevator (elevon symmetric) effectiveness
+
+  # Roll moment
+  Cl_p: -0.45            # Roll damping (negative = stable)
+  Cl_da: 0.18            # Aileron (elevon differential) effectiveness
+
+  # Yaw moment
+  Cn_beta: 0.04          # Weathercock stability (reduced — delta wings have low Cn_beta)
+  Cn_r: -0.08            # Yaw damping
+  Cn_dr: -0.06           # Rudder effectiveness
+
+  # Side force
+  CY_beta: -0.25         # Side force slope
+
+  # Alpha limits (radians)
+  alpha_stall_rad: 0.35   # ~20 degrees
+  alpha_max_rad: 0.52     # ~30 degrees (delta wings have high stall AoA)
+
+propulsion:
+  # Pusher propeller model
+  T_max_N: 500.0          # Maximum static thrust
+  T_idle_N: 5.0           # Idle thrust
+  # Thrust lapse with airspeed: T = T_max * throttle * (1 - k_v * V / V_ref)
+  thrust_velocity_factor: 0.15   # k_v — thrust drops at high speed
+  V_ref_ms: 41.7                 # Reference velocity for thrust lapse
+
+  # Propeller torque (reaction moment about body x-axis)
+  prop_torque_factor: 0.02  # Q = T * factor * sign(throttle)
+  prop_diameter_m: 0.6
+
+  # Motor time constant
+  motor_tau_s: 0.05
+
+actuators:
+  # Elevon deflection limits (radians)
+  elevon_max_rad: 0.349   # ±20 degrees
+  rudder_max_rad: 0.349   # ±20 degrees
+
+  # Elevon mixing:
+  #   elevator_cmd = (elevon_L + elevon_R) / 2
+  #   aileron_cmd  = (elevon_R - elevon_L) / 2
+  actuator_time_constant_s: 0.05
+
+initial_conditions:
+  altitude_m: 300.0
+  airspeed_ms: 41.7       # 150 km/h
+  heading_deg: 0.0        # north
+  alpha_deg: 5.0          # trim angle of attack
+  throttle: 0.60          # trim throttle
+  elevon_left_rad: 0.0
+  elevon_right_rad: 0.0
+  rudder_rad: 0.0
+
+simulation:
+  dt_s: 0.01              # 100 Hz physics
+  gravity_ms2: 9.81
+  air_density_sl: 1.225   # kg/m^3 at sea level ISA
+  temperature_sl_K: 288.15
+  pressure_sl_Pa: 101325.0
+  lapse_rate: 0.0065      # K/m (ISA troposphere)
+  gas_constant_R: 287.05  # J/(kg*K)
