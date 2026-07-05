@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    Copy this file to "PhroverCloud.plist" (gitignored) in the same directory, fill in
+    your own backend's endpoints, and add it to the PhroverOperator target's bundle
+    resources. Without a PhroverCloud.plist, the app skips sign-in/telemetry entirely and
+    runs on-device only.
+    -->
+    <key>Region</key>
+    <string>us-west-2</string>
+    <key>APIEndpoint</key>
+    <string>https://your-api-id.execute-api.us-west-2.amazonaws.com/prod</string>
+    <key>IdentityPoolId</key>
+    <string>us-west-2:00000000-0000-0000-0000-000000000000</string>
+    <key>UserPoolId</key>
+    <string>us-west-2_XXXXXXXXX</string>
+    <key>IoTEndpoint</key>
+    <string>your-iot-endpoint-ats.iot.us-west-2.amazonaws.com</string>
+    <key>CognitoClientId</key>
+    <string>xxxxxxxxxxxxxxxxxxxxxxxxxx</string>
+</dict>
+</plist>

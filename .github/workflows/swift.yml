@@ -1,0 +1,48 @@
+name: swift
+
+# Public regression gate for the Swift half of this repo (RoverNav / PhroverKit /
+# PhroverCloud / the PhroverOperator example app). See README.md "Swift (Phrover)".
+on:
+  push:
+  pull_request:
+
+jobs:
+  # RoverNav is pure Foundation — builds/tests on a bare macOS runner, no Xcode
+  # destination or iOS Simulator needed. Fastest signal, runs first.
+  rovernav-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build --target RoverNav
+
+  # PhroverKit/PhroverCloud import ARKit, which doesn't exist on macOS, so the rest of
+  # the package (and its full test suite, including RoverNavTests) needs an iOS
+  # destination via xcodebuild rather than plain `swift build`/`swift test`.
+  xcodebuild-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: xcodebuild version
+        run: xcodebuild -version
+      - name: Pick an available iPhone simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j \
+            | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(e['udid'] for k,v in d.items() if 'iOS' in k for e in v if e['isAvailable'] and 'iPhone' in e['name']))")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+      - name: Build all three products + run RoverNavTests
+        run: |
+          xcodebuild test -scheme astral-sdk-Package \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:RoverNavTests
+      - name: Build the PhroverOperator example app
+        working-directory: examples/PhroverOperator
+        run: |
+          xcodebuild build -scheme PhroverOperator \
+            -destination "id=${{ steps.sim.outputs.udid }}"
+      - name: Run PhroverOperator launch smoke test
+        working-directory: examples/PhroverOperator
+        run: |
+          xcodebuild test -scheme PhroverOperator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:PhroverOperatorUITests/PhroverOperatorUITests/testLaunch_showsAuthOrTabs

@@ -1,0 +1,15 @@
+{
+  "originHash" : "77d588677aeff57f7d8970f85437b4bf89d5cd8007e3fe4eb3b256c08fee76eb",
+  "pins" : [
+    {
+      "identity" : "aws-sdk-ios-spm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/aws-amplify/aws-sdk-ios-spm",
+      "state" : {
+        "revision" : "f2e9fbed08dd14a962f8d62d7e302d73b9ecb429",
+        "version" : "2.41.0"
+      }
+    }
+  ],
+  "version" : 3
+}

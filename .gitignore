@@ -50,6 +50,13 @@ ENV/
 .uv/
 uv.lock
 
+# Swift / Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
 # IDE
 .idea/
 .vscode/
@@ -69,3 +76,4 @@ logs/
 *.png
 !examples/*.png
 !docs/**/*.png
+examples/PhroverOperator/PhroverOperator/Config/PhroverCloud.plist

@@ -2,12 +2,15 @@
 
 **Drones that finish the mission when the network doesn't.**
 
-`astral-sdk` is the open Python interface for ArduPilot-based drones used
-in the [Astral](https://astral.us) stack. It bundles MAVLink primitives,
-camera drivers, and minimal examples so that you can integrate drone
-hardware into your own applications without reinventing the boilerplate.
+`astral-sdk` is the open interface for the [Astral](https://astral.us) stack — a Python
+package for ArduPilot-based drones, and a set of Swift packages for Phrover, the
+phone-brained WAVE ROVER. Everything that runs on the drone or the phone is here,
+including the on-device reasoning loop; only the cloud backend is closed (see
+["What's not in this repo"](#whats-not-in-this-repo)).
 
-## Install
+## Python (drones)
+
+### Install
 
 ```bash
 uv add astral-sdk
@@ -27,7 +30,7 @@ pip install astral-sdk[camera-realsense]  # Intel RealSense D435i
 pip install astral-sdk[all]               # both
 ```
 
-## Quickstart
+### Quickstart
 
 Copy `src/astral_sdk/config_example.yaml` to `config.yaml` in your working
 directory and edit `serial_port` to match your flight controller.
@@ -59,6 +62,66 @@ See the [`examples/`](./examples) directory for runnable scripts:
   [`tests/test_e2e_sitl.py`](./tests/test_e2e_sitl.py) — a real, runnable test that
   doubles as a per-vehicle-type usage reference.
 
+### Hardware compatibility
+
+- **Flight controller**: any ArduPilot-compatible board reachable over
+  MAVLink. Tested on Cube Orange.
+- **Companion computer**: tested on NVIDIA Jetson Orin Nano. macOS and
+  generic Linux work for development against SITL.
+- **Cameras**: Luxonis OAK-D Lite, Intel RealSense D435i.
+
+## Swift (Phrover)
+
+Phrover is the phone-brained WAVE ROVER: a cheap 4WD chassis whose brain is an iPhone
+running Apple's on-device Foundation Model, ARKit, and CoreML — talking to the chassis'
+ESP32 over WiFi. Three library products, layered so you only pull in what you need:
+
+| Product | Contents | Depends on |
+|---|---|---|
+| `RoverNav` | Planning/control core — `Vec2`, `Pose2D`, `Costmap`, `AStarPlanner`, `PursuitController`, `WheelCommand`. Pure Foundation. | — |
+| `PhroverKit` | The brain — perception (`ARSessionManager`, `Detector`), nav orchestration (`NavigationController`, `CostmapBuilder`, `ObstacleGuard`, `WorldMapStore`), voice (`DialogAgent`, `SpeechIn`/`SpeechOut`), and ESP32 comms (`RoverControl`, `RoverTelemetry`). | `RoverNav` |
+| `PhroverCloud` | Reference cloud client — Cognito auth, AWS IoT MQTT telemetry, dialog escalation. Optional: bring your own backend instead, or skip it entirely and drive on-device only. | `PhroverKit`, `aws-sdk-ios-spm` |
+
+### Install
+
+Add the package in Xcode (File → Add Package Dependencies) or in `Package.swift`:
+
+```swift
+.package(url: "https://github.com/astral-us/astral-sdk", from: "0.1.0")
+```
+
+then depend on the products you need:
+
+```swift
+.target(name: "YourApp", dependencies: [
+    .product(name: "PhroverKit", package: "astral-sdk"),
+])
+```
+
+### Quickstart
+
+See [`examples/PhroverOperator`](./examples/PhroverOperator) for a complete, runnable
+reference app — a thin SwiftUI wrapper over `PhroverKit`/`PhroverCloud` with manual
+teleop, autonomous point-to-point navigation, and voice control. It runs fully on-device
+with no cloud setup; copy `Config/PhroverCloud.example.plist` to `PhroverCloud.plist` and
+fill in your own backend's endpoints to add sign-in and telemetry.
+
+```swift
+import PhroverKit
+
+let control = RoverControl()       // ESP32 at 192.168.4.1 by default (AP mode)
+try await control.send(WheelCommand(left: 0.2, right: 0.2))
+try await control.stop()
+```
+
+### Hardware compatibility
+
+- **Chassis**: Waveshare WAVE ROVER (or any base speaking the same Waveshare JSON
+  protocol — `GET /js?json={"T":1,"L":<m/s>,"R":<m/s>}`).
+- **Phone**: iPhone/iPad with LiDAR for full autonomy (`ARSessionManager` uses scene
+  depth); manual teleop and voice work without LiDAR. iOS 26+ (Apple Foundation Model
+  floor).
+
 ## What's included
 
 - **Python SDK** — MAVLink wrappers for arming, takeoff, landing,
@@ -69,29 +132,23 @@ See the [`examples/`](./examples) directory for runnable scripts:
 - **ROS 2 bridge** — an optional `astral_drone` package under
   `ros2_ws/` that exposes the camera and MAVLink as ROS 2 topics for use
   with Isaac ROS Visual SLAM and Nav2.
+- **Swift SDK** — `RoverNav`/`PhroverKit`/`PhroverCloud`, the full on-device brain
+  (perception, navigation, voice, on-device reasoning) and ESP32 comms for Phrover,
+  plus the `PhroverOperator` reference app.
 
 ## What's not in this repo
 
-The Astral product stack also includes pieces that are intentionally not
-open source. To set expectations:
+Everything that runs on a drone or on the phone is open, including the on-device
+reasoning/planning loop — that's the whole point of this repo. What's intentionally
+**not** here is the cloud backend:
 
-- **Cloud orchestration.** Fleet provisioning, IoT messaging, video
-  ingestion, and remote-pilot routing live in our service. They are not
-  required to fly with this SDK.
-- **On-device VLM stack.** Reasoning loop, vision-language prompts,
-  grounding, target selection, and reactive planning are proprietary.
-- **Flight hardware.** The companion-computer image, installer scripts,
-  and platform integrations ship with our hardware product.
+- **Cloud orchestration.** Fleet provisioning, IoT messaging, video ingestion, and
+  remote-pilot/dialog-escalation routing (the Lambda handlers behind `/rover/converse`
+  and friends) live in our service. Nothing here requires them: drones fly and Phrover
+  drives/navigates/talks fully on-device without any cloud step.
 
-If you need any of those, talk to us at [astral.us](https://astral.us).
-
-## Hardware compatibility
-
-- **Flight controller**: any ArduPilot-compatible board reachable over
-  MAVLink. Tested on Cube Orange.
-- **Companion computer**: tested on NVIDIA Jetson Orin Nano. macOS and
-  generic Linux work for development against SITL.
-- **Cameras**: Luxonis OAK-D Lite, Intel RealSense D435i.
+If you need fleet management, video pipelines, or hosted dialog escalation, talk to us
+at [astral.us](https://astral.us).
 
 ## Documentation
 
