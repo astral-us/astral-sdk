@@ -55,5 +55,12 @@ def test_arm_disarm_module_importable():
 
 
 def test_motor_test_module_importable():
-    from astral_sdk import motor_test as mt
-    assert callable(mt.run_motor_test)
+    # NOT `from astral_sdk import motor_test` — that name is also the top-level
+    # drone.motor_test() function re-exported in __init__.py, and whichever of the
+    # two (function vs. this CLI submodule) gets imported first "wins" the
+    # astral_sdk.motor_test attribute for the rest of the process. The documented,
+    # deterministic way to reach this submodule (see examples/motor_test.py) is a
+    # direct dotted import, which always resolves to the real submodule regardless
+    # of import order.
+    from astral_sdk.motor_test import run_motor_test
+    assert callable(run_motor_test)
