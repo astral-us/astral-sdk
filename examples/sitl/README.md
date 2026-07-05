@@ -38,6 +38,15 @@ or `udpin:` and skips the serial-device check. Everything downstream
 (arm, takeoff, velocity commands, telemetry) is pymavlink under the hood
 and is transport-agnostic.
 
+## See it across all three vehicle types
+
+`fly_sitl.py` above only drives ArduCopter. For a working reference on ArduRover and
+ArduPlane too — same SDK calls (`arm`/`set_velocity`/`get_telemetry`/`disarm`), one SITL
+instance per frame — see [`tests/test_e2e_sitl.py`](../../tests/test_e2e_sitl.py) at the
+repo root. It's a real, runnable test (`cd sdk && pytest tests/test_e2e_sitl.py -v`, or
+just read it), not just documentation — a good way to see the SDK's vehicle-agnostic
+calls actually exercised end to end per type.
+
 ## Next step
 
 For a perception-in-the-loop sim with cameras, ROS 2, and Nav2, see the

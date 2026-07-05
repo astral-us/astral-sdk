@@ -54,6 +54,10 @@ See the [`examples/`](./examples) directory for runnable scripts:
 - `motor_test.py` — verify motor order and ESC connections.
 - `arm_takeoff_land.py` — minimal flight cycle.
 - `camera_capture.py` — capture a frame from the onboard camera.
+- `sitl/` — run the SDK against simulated ArduPilot, no hardware needed. For the same
+  calls exercised against all three supported frames (Copter, Rover, Plane), see
+  [`tests/test_e2e_sitl.py`](./tests/test_e2e_sitl.py) — a real, runnable test that
+  doubles as a per-vehicle-type usage reference.
 
 ## What's included
 
