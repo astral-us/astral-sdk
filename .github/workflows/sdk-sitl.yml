@@ -55,7 +55,7 @@ jobs:
           ./waf copter rover plane
 
       - name: Install SDK
-        run: pip install -e .
+        run: pip install -e .[dev]
         working-directory: sdk
 
       - name: Run SITL e2e tests
