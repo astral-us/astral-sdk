@@ -38,12 +38,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 # ArduPilot's default multi-instance port scheme: TCP MAVLink port = 5760 + 10*instance.
+# Note: the ground-rover vehicle's sim_vehicle.py -v name is "Rover", not "ArduRover"
+# (see ArduPilot's Tools/autotest/pysim/vehicleinfo.json).
 _FRAMES = [
     ("ArduCopter", 0, 5760),
-    ("ArduRover", 1, 5770),
+    ("Rover", 1, 5770),
     ("ArduPlane", 2, 5780),
 ]
 _BOOT_TIMEOUT_S = 90.0
+_ARM_RETRY_TIMEOUT_S = 30.0
 
 
 def _wait_for_port(port: int, timeout: float) -> bool:
@@ -80,11 +83,24 @@ def sitl_port(request):
         drone.disconnect()
 
 
+def _arm_with_retry(timeout: float) -> bool:
+    # ArduCopter hard-blocks arming (even force-arm) until its boot-time sensor
+    # calibration finishes, which can outlast the TCP port opening. Retry rather
+    # than treating the FC's transient "not ready yet" as a failure.
+    deadline = time.time() + timeout
+    while True:
+        if drone.arm():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(1.0)
+
+
 def test_arm_move_telemetry_disarm(sitl_port):
     frame, port = sitl_port
     os.environ["ASTRAL_SDK_SERIAL_PORT"] = f"tcp:127.0.0.1:{port}"
     try:
-        assert drone.arm(), f"{frame}: arm() failed"
+        assert _arm_with_retry(_ARM_RETRY_TIMEOUT_S), f"{frame}: arm() failed"
         assert drone.is_armed(), f"{frame}: not armed after arm()"
 
         drone.set_velocity(0.5, 0.0, 0.0)
