@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -e .
+      - run: pip install -e .[dev]
       - run: pytest tests/test_imports.py -v
 
   sitl:
@@ -50,6 +50,7 @@ jobs:
         run: |
           cd ardupilot
           . ~/.profile
+          python3 -m pip install pexpect
           ./waf configure --board sitl
           ./waf copter rover plane
 
