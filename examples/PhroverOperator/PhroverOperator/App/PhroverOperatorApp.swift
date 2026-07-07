@@ -107,7 +107,7 @@ struct RootView: View {
                 .tabItem { Label("Drive", systemImage: "gamecontroller") }
             NavigateView(ar: ar, nav: nav)
                 .tabItem { Label("Navigate", systemImage: "map") }
-            ConversationView(ar: ar, control: control, nav: nav, cloudBrain: cloud?.brain)
+            ConversationView(ar: ar, nav: nav, cloudBrain: cloud?.brain)
                 .tabItem { Label("Talk", systemImage: "bubble.left.and.bubble.right") }
         }
     }

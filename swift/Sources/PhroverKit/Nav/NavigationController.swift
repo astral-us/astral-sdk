@@ -118,9 +118,6 @@ public final class NavigationController {
 
     private func performRotate(to targetYaw: Double) async {
         let angularTolerance = 0.05 // rad
-        let rotateGain = 2.0
-        let maxAngular = 1.5 // rad/s — matches PursuitController's default turn rate
-
         while !Task.isCancelled {
             guard let pose = ar.pose else { break }
             let error = normalizeAngle(targetYaw - pose.yaw)
@@ -140,10 +137,7 @@ public final class NavigationController {
                 continue
             }
 
-            let w = min(max(error * rotateGain, -maxAngular), maxAngular)
-            let cmd = DifferentialDrive.wheels(v: 0, w: w,
-                                               wheelBase: RoverConfig.wheelBase,
-                                               maxWheelSpeed: RoverConfig.maxWheelSpeed)
+            let cmd = RotationCommand.command(forYawError: error)
             try? await control.send(cmd)
             try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
         }

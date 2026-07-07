@@ -22,6 +22,10 @@ public enum RoverConfig {
     // MARK: - Physical parameters (WAVE ROVER)
     public static let wheelBase = 0.13         // m, track width (left↔right)
     public static let maxWheelSpeed = 0.5      // m/s per Waveshare closed-loop range on encoder bases; base rover is open-loop
+    /// Minimum in-place turn command that reliably overcomes WAVE ROVER static friction.
+    /// The autonomous rotate loop may compute a smaller speed from yaw error, but values
+    /// below this can make interpreted voice turns appear to do nothing.
+    public static let minimumRotateWheelSpeed = 0.25
 
     // MARK: - Safety
     /// If no successful command round-trip within this window, ObstacleGuard forces a stop.

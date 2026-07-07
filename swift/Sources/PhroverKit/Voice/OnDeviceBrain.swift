@@ -24,7 +24,7 @@ struct OnDeviceDecision {
     @Guide(description: "When action is say: a short spoken response. Empty otherwise.")
     var spokenText: String
 
-    @Guide(description: "When action is lookAround: degrees to rotate, counterclockwise positive. 90 to 360 is typical for a scan.")
+    @Guide(description: "When action is lookAround: degrees to rotate, counterclockwise positive. Use positive degrees for 'turn left' and negative degrees for 'turn right'. 90 to 360 is typical for a scan.")
     var lookAroundDegrees: Double
 
     @Guide(description: "When action is explore: the id of an opening from the openings list to go check (e.g. 'opening_1'). Prefer unexplored ones. Empty otherwise.")
@@ -96,7 +96,9 @@ public final class OnDeviceBrain: RoverBrain {
             at a known position (use navigateToMemory or the position), or it may be in an \
             unexplored part of the space: choose explore with an opening id from the \
             openings list to go check — prefer unexplored openings, and if one you checked \
-            turned out empty, try the next. Use lookAround to scan in place. Ask only if \
+            turned out empty, try the next. Use lookAround to scan in place, including \
+            explicit commands like "turn left" or "turn right" (left is positive degrees, \
+            right is negative degrees). Ask only if \
             you genuinely need clarification and haven't already asked; if a previous \
             question went unanswered, do your best with what you have rather than asking \
             again. Choose done once the operator's request is fully satisfied — including \
