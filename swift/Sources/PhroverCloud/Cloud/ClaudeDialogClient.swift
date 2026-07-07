@@ -1,10 +1,10 @@
 import Foundation
 import PhroverKit
 
-/// Cloud conversational fallback, used only when the on-device model escalates (see
-/// `DialogAgent` in PhroverKit). Talks to the reference `eco/aws` API Gateway, which
-/// forwards to an LLM — conforms to `DialogEscalating` so it plugs directly into
-/// `DialogAgent(dialogEscalation:)`.
+/// Cloud conversational fallback for pure text dialog. Talks to the reference `eco/aws`
+/// `/rover/converse` route, which forwards to an LLM — conforms to `DialogEscalating` so
+/// any `DialogEscalating`-consuming caller can use it. (`MissionAgent`'s action loop uses
+/// `RoverBrain`/`CloudBrain` instead — this client is for plain conversation, not actions.)
 public actor ClaudeDialogClient: DialogEscalating {
     private let baseURL: URL
     private let session: URLSession = .shared

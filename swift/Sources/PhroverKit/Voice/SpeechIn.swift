@@ -68,6 +68,33 @@ public final class SpeechIn {
         }
     }
 
+    /// Listen for a single utterance and return it, or `nil` on timeout / recognizer
+    /// failure. Convenience over `start(onFinal:)` for a mission agent's ask-then-listen
+    /// turns, where "no answer" must be a normal, handled outcome rather than an error.
+    public func listenOnce(timeout: TimeInterval) async -> String? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
+            var didResume = false
+            let resumeOnce: (String?) -> Void = { [weak self] text in
+                guard !didResume else { return }
+                didResume = true
+                self?.stop()
+                continuation.resume(returning: text)
+            }
+
+            do {
+                try start { text in resumeOnce(text) }
+            } catch {
+                resumeOnce(nil)
+                return
+            }
+
+            Task {
+                try? await Task.sleep(for: .seconds(timeout))
+                resumeOnce(nil)
+            }
+        }
+    }
+
     public func stop() {
         audioEngine.inputNode.removeTap(onBus: 0)
         if audioEngine.isRunning { audioEngine.stop() }

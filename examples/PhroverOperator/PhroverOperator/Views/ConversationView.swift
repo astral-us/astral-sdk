@@ -1,16 +1,22 @@
 import SwiftUI
 import PhroverKit
+import PhroverCloud
 
 /// Voice UI. Push-to-talk (hold the mic button) rather than always-on wake-word
 /// listening — simpler and more reliable in noisy environments.
+///
+/// Backed by `MissionAgent`: there's no command grammar here, just "say whatever you
+/// want" — the agent looks around, asks questions, and navigates as it decides it needs
+/// to. Uses the cloud brain (open-vocabulary grounding) with on-device fallback when a
+/// `PhroverCloud.plist` is configured; on-device only otherwise.
 struct ConversationView: View {
+    let ar: ARSessionManager
     let nav: NavigationController
-    let dialogEscalation: DialogEscalating
+    let cloudBrain: CloudBrain?
 
     @State private var speechIn = SpeechIn()
     @State private var speechOut = SpeechOut()
-    @State private var dialog: DialogAgent?
-    @State private var reply = ""
+    @State private var agent: MissionAgent?
     @State private var authorized = false
 
     var body: some View {
@@ -31,8 +37,8 @@ struct ConversationView: View {
                         .onEnded { _ in speechIn.stop() }
                 )
 
-            if !reply.isEmpty {
-                Text(reply)
+            if let agent {
+                Text(phaseLabel(agent.phase))
                     .font(.body)
                     .padding()
                     .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
@@ -43,7 +49,12 @@ struct ConversationView: View {
         .padding()
         .task {
             authorized = await speechIn.requestAuthorization()
-            dialog = DialogAgent(nav: nav, dialogEscalation: dialogEscalation)
+            let detector = await Detector()
+            let perception = ARPerceptionSource(ar: ar, detector: detector)
+            let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
+            let onDevice = OnDeviceBrain()
+            let brain: RoverBrain = cloudBrain.map { HybridBrain(cloud: $0, onDevice: onDevice) } ?? onDevice
+            agent = MissionAgent(motion: nav, perception: perception, voice: voice) { brain }
         }
     }
 
@@ -56,14 +67,20 @@ struct ConversationView: View {
         }
     }
 
+    private func phaseLabel(_ phase: MissionAgent.Phase) -> String {
+        switch phase {
+        case .idle: return "Ready"
+        case .thinking: return "Thinking…"
+        case .acting: return "On it…"
+        case .waitingForAnswer: return "Waiting for your answer…"
+        }
+    }
+
     private func startListening() {
         guard authorized, speechIn.state != .listening else { return }
         try? speechIn.start { utterance in
             Task {
-                guard let dialog else { return }
-                let text = await dialog.handle(utterance)
-                reply = text
-                speechOut.speak(text)
+                await agent?.handle(utterance)
             }
         }
     }

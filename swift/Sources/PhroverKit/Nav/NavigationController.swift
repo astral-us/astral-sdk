@@ -48,6 +48,24 @@ public final class NavigationController {
         loop = Task { await drive(to: goal) }
     }
 
+    /// Rotate in place by `angle` radians (CCW positive, matching `Pose2D.yaw`) and wait
+    /// for it to finish. A pure turn, no path planning — used by the mission agent to scan
+    /// for something not currently in view (e.g. up to a full `2 * .pi` look-around).
+    /// Honors the same `ObstacleGuard` gate and command cadence as `drive()`, and can be
+    /// interrupted by `cancel()`.
+    public func rotate(by angle: Double) async {
+        cancel()
+        guard let startYaw = ar.pose?.yaw else {
+            state = .failed("No ARKit pose yet — move the device to establish tracking.")
+            return
+        }
+        let targetYaw = normalizeAngle(startYaw + angle)
+        state = .driving
+        let task = Task { await performRotate(to: targetYaw) }
+        loop = task
+        await task.value
+    }
+
     /// Stop and clear the current goal.
     public func cancel() {
         loop?.cancel()
@@ -96,5 +114,39 @@ public final class NavigationController {
         guard let p = planner.plan(from: from, to: to, in: costmap) else { return false }
         path = p
         return true
+    }
+
+    private func performRotate(to targetYaw: Double) async {
+        let angularTolerance = 0.05 // rad
+        let rotateGain = 2.0
+        let maxAngular = 1.5 // rad/s — matches PursuitController's default turn rate
+
+        while !Task.isCancelled {
+            guard let pose = ar.pose else { break }
+            let error = normalizeAngle(targetYaw - pose.yaw)
+            if abs(error) <= angularTolerance {
+                try? await control.stop()
+                state = .arrived
+                return
+            }
+
+            let lastAck = await control.lastAckAt
+            let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
+                                               lastAckAt: lastAck,
+                                               feedback: nil)
+            guard decision == .go else {
+                try? await control.stop()
+                try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+                continue
+            }
+
+            let w = min(max(error * rotateGain, -maxAngular), maxAngular)
+            let cmd = DifferentialDrive.wheels(v: 0, w: w,
+                                               wheelBase: RoverConfig.wheelBase,
+                                               maxWheelSpeed: RoverConfig.maxWheelSpeed)
+            try? await control.send(cmd)
+            try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+        }
+        try? await control.stop()
     }
 }

@@ -40,12 +40,16 @@ final class CloudSession {
     let auth: AuthService
     let mqtt: MQTTService
     let dialog: ClaudeDialogClient
+    /// Vision + tool-use mission brain — plugs into `MissionAgent` via `HybridBrain` once
+    /// signed in; `ConversationView` falls back to on-device-only until then.
+    let brain: CloudBrain
     private let telemetry: RoverTelemetryPublisher
 
     private init(config: PhroverCloudConfig, ar: ARSessionManager, nav: NavigationController) {
         auth = AuthService(config: config)
         mqtt = MQTTService(config: config)
         dialog = ClaudeDialogClient(config: config)
+        brain = CloudBrain(config: config)
         telemetry = RoverTelemetryPublisher(ar: ar, nav: nav, mqtt: mqtt)
     }
 
@@ -64,6 +68,7 @@ final class CloudSession {
             return
         }
         await dialog.setTokenProvider { [weak auth] in await auth?.idToken }
+        brain.setTokenProvider { [weak auth] in await auth?.idToken }
         guard let token = auth.idToken else { return }
         do {
             try await mqtt.connect(withToken: token)
@@ -102,7 +107,7 @@ struct RootView: View {
                 .tabItem { Label("Drive", systemImage: "gamecontroller") }
             NavigateView(ar: ar, nav: nav)
                 .tabItem { Label("Navigate", systemImage: "map") }
-            ConversationView(nav: nav, dialogEscalation: cloud?.dialog ?? NoDialogEscalation())
+            ConversationView(ar: ar, nav: nav, cloudBrain: cloud?.brain)
                 .tabItem { Label("Talk", systemImage: "bubble.left.and.bubble.right") }
         }
     }
