@@ -127,6 +127,30 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertTrue(motion.navigateCalls.isEmpty)
     }
 
+    func testLogsBrainErrorsWithContext() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [PerceivedObject(label: "chair", confidence: 0.82, normalizedPoint: CGPoint(x: 0.4, y: 0.6))]
+        perception.frontiers = [Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5)]
+        let voice = FakeVoice()
+        let brain = ThrowingBrain(error: FakeBrainError.modelUnavailable)
+        var logged: [(error: Error, context: MissionContext)] = []
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 brainErrorLogger: { error, context in logged.append((error, context)) },
+                                 currentBrain: { brain })
+
+        await agent.handle("go to the chair")
+
+        XCTAssertEqual(logged.count, 1)
+        XCTAssertEqual(logged.first?.error as? FakeBrainError, .modelUnavailable)
+        XCTAssertEqual(logged.first?.context.utterance, "go to the chair")
+        XCTAssertEqual(logged.first?.context.visibleObjects.map(\.label), ["chair"])
+        XCTAssertEqual(logged.first?.context.explorationCandidates.map(\.id), ["opening_1"])
+        XCTAssertEqual(voice.spoken, ["Sorry, I'm having trouble thinking right now."])
+    }
+
     func testStopDecisionCancelsMotion() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -142,6 +166,10 @@ final class MissionAgentTests: XCTestCase {
 
 // MARK: - Fakes
 
+private enum FakeBrainError: Error, Equatable {
+    case modelUnavailable
+}
+
 @MainActor
 private final class FakeBrain: RoverBrain {
     private var script: [RoverDecision]
@@ -152,6 +180,17 @@ private final class FakeBrain: RoverBrain {
     func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         seenContexts.append(context)
         return BrainOutput(decision: script.isEmpty ? .done : script.removeFirst())
+    }
+}
+
+@MainActor
+private final class ThrowingBrain: RoverBrain {
+    private let error: Error
+
+    init(error: Error) { self.error = error }
+
+    func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        throw error
     }
 }
 

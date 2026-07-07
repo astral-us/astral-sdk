@@ -149,6 +149,7 @@ public final class MissionAgent {
     private let askTimeout: TimeInterval
     private let phaseDidChange: ((Phase) -> Void)?
     private let currentBrain: () -> RoverBrain?
+    private let brainErrorLogger: (Error, MissionContext) -> Void
 
     private var lastAnswerWasInconclusive = false
     private var nextCandidateNumber = 1
@@ -167,6 +168,9 @@ public final class MissionAgent {
                 askTimeout: TimeInterval = 8,
                 maxTicksPerUtterance: Int = 25,
                 phaseDidChange: ((Phase) -> Void)? = nil,
+                brainErrorLogger: @escaping (Error, MissionContext) -> Void = { error, context in
+                    BrainErrorFileLog.append(error: error, context: context)
+                },
                 currentBrain: @escaping () -> RoverBrain?) {
         self.motion = motion
         self.perception = perception
@@ -174,6 +178,7 @@ public final class MissionAgent {
         self.askTimeout = askTimeout
         self.maxTicksPerUtterance = maxTicksPerUtterance
         self.phaseDidChange = phaseDidChange
+        self.brainErrorLogger = brainErrorLogger
         self.currentBrain = currentBrain
     }
 
@@ -208,6 +213,7 @@ public final class MissionAgent {
             do {
                 output = try await brain.nextAction(ctx)
             } catch {
+                brainErrorLogger(error, ctx)
                 voice.speak("Sorry, I'm having trouble thinking right now.")
                 break
             }
