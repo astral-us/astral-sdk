@@ -17,10 +17,12 @@ public final class SpeechIn {
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    private var tapInstalled = false
+    private var isStarting = false
 
     public init() {}
 
-    public func requestAuthorization() async -> Bool {
+    public nonisolated func requestAuthorization() async -> Bool {
         await withCheckedContinuation { c in
             SFSpeechRecognizer.requestAuthorization { status in
                 c.resume(returning: status == .authorized)
@@ -32,10 +34,14 @@ public final class SpeechIn {
     /// Push-to-talk is the intended usage — always-on listening risks false wake triggers
     /// in noisy environments.
     public func start(onFinal: @escaping (String) -> Void) throws {
+        guard !isStarting, state != .listening else { return }
         guard let recognizer, recognizer.isAvailable else {
             state = .unavailable
             throw SpeechError.recognizerUnavailable
         }
+        isStarting = true
+        defer { isStarting = false }
+
         stop()
 
         let req = SFSpeechAudioBufferRecognitionRequest()
@@ -43,11 +49,8 @@ public final class SpeechIn {
         req.requiresOnDeviceRecognition = true
         request = req
 
-        let node = audioEngine.inputNode
-        let format = node.outputFormat(forBus: 0)
-        node.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            req.append(buffer)
-        }
+        Self.installTap(on: audioEngine.inputNode, request: req)
+        tapInstalled = true
         audioEngine.prepare()
         try audioEngine.start()
         state = .listening
@@ -59,11 +62,11 @@ public final class SpeechIn {
                     self.partialTranscript = result.bestTranscription.formattedString
                     if result.isFinal {
                         let text = result.bestTranscription.formattedString
-                        self.stop()
+                        self.finishRecognition(cancelTask: false)
                         onFinal(text)
                     }
                 }
-                if error != nil { self.stop() }
+                if error != nil { self.finishRecognition(cancelTask: false) }
             }
         }
     }
@@ -77,7 +80,7 @@ public final class SpeechIn {
             let resumeOnce: (String?) -> Void = { [weak self] text in
                 guard !didResume else { return }
                 didResume = true
-                self?.stop()
+                self?.finishRecognition(cancelTask: true)
                 continuation.resume(returning: text)
             }
 
@@ -96,13 +99,31 @@ public final class SpeechIn {
     }
 
     public func stop() {
-        audioEngine.inputNode.removeTap(onBus: 0)
+        finishRecognition(cancelTask: true)
+    }
+
+    private func finishRecognition(cancelTask: Bool) {
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
         if audioEngine.isRunning { audioEngine.stop() }
         request?.endAudio()
-        task?.cancel()
+        if cancelTask { task?.cancel() }
         task = nil
         request = nil
+        isStarting = false
         if state != .unavailable { state = .idle }
+    }
+
+    private nonisolated static func installTap(
+        on node: AVAudioInputNode,
+        request: SFSpeechAudioBufferRecognitionRequest
+    ) {
+        let format = node.outputFormat(forBus: 0)
+        node.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            request.append(buffer)
+        }
     }
 }
 
