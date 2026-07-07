@@ -44,6 +44,13 @@ let package = Package(
         ),
         .testTarget(name: "PhroverKitTests", dependencies: ["PhroverKit"], path: "swift/Tests/PhroverKitTests"),
 
+        // Deliberately separate from PhroverKitTests: makes real, slow, non-deterministic
+        // calls to the on-device Foundation Model (needs Apple Intelligence ready on the
+        // host Mac/device). eco/e2e/harness/phrover.py's fast gate only passes
+        // `-only-testing:RoverNavTests -only-testing:PhroverKitTests`, so this target never
+        // runs there — invoke explicitly with `-only-testing:PhroverKitLiveProbes`.
+        .testTarget(name: "PhroverKitLiveProbes", dependencies: ["PhroverKit"], path: "swift/Tests/PhroverKitLiveProbes"),
+
         .target(
             name: "PhroverCloud",
             dependencies: [

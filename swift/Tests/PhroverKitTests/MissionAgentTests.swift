@@ -103,9 +103,9 @@ private final class FakeBrain: RoverBrain {
 
     init(script: [RoverDecision]) { self.script = script }
 
-    func nextAction(_ context: MissionContext) async throws -> RoverDecision {
+    func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         seenContexts.append(context)
-        return script.isEmpty ? .done : script.removeFirst()
+        return BrainOutput(decision: script.isEmpty ? .done : script.removeFirst())
     }
 }
 

@@ -26,7 +26,7 @@ public final class CloudBrain: RoverBrain {
         tokenProvider = provider
     }
 
-    public func nextAction(_ context: MissionContext) async throws -> RoverDecision {
+    public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         var request = URLRequest(url: baseURL.appendingPathComponent("rover/act"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -39,10 +39,11 @@ public final class CloudBrain: RoverBrain {
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw CloudBrainError.serverError
         }
-        guard let decision = try JSONDecoder().decode(ActResponse.self, from: data).decision else {
+        let act = try JSONDecoder().decode(ActResponse.self, from: data)
+        guard let decision = act.decision else {
             throw CloudBrainError.malformedDecision
         }
-        return decision
+        return BrainOutput(decision: decision, updatedPlan: act.updatedPlan)
     }
 }
 
@@ -64,7 +65,15 @@ private struct ActRequest: Encodable {
     struct WirePose: Encodable { let x: Double; let y: Double; let yaw: Double }
     struct WireObject: Encodable { let label: String; let confidence: Float; let x: Double; let y: Double }
     struct WireTurn: Encodable { let utterance: String; let pose: WirePose }
-    struct WireMemory: Encodable { let turns: [WireTurn]; let missionStartPose: WirePose? }
+    struct WireRememberedObject: Encodable { let label: String; let x: Double; let y: Double; let timesSeen: Int }
+    struct WireMemory: Encodable {
+        let turns: [WireTurn]
+        let missionStartPose: WirePose?
+        let rememberedObjects: [WireRememberedObject]
+    }
+    struct WireCandidate: Encodable {
+        let id: String; let x: Double; let y: Double; let widthMeters: Double; let status: String
+    }
 
     let utterance: String?
     let frameJPEGBase64: String?
@@ -72,6 +81,8 @@ private struct ActRequest: Encodable {
     let pose: WirePose?
     let navState: String
     let memory: WireMemory
+    let explorationCandidates: [WireCandidate]
+    let plan: String?
     let lastAnswerWasInconclusive: Bool
 
     init(_ context: MissionContext) {
@@ -86,7 +97,15 @@ private struct ActRequest: Encodable {
             turns: context.memory.turns.map {
                 WireTurn(utterance: $0.utterance, pose: WirePose(x: $0.pose.position.x, y: $0.pose.position.y, yaw: $0.pose.yaw))
             },
-            missionStartPose: context.memory.missionStartPose.map { WirePose(x: $0.position.x, y: $0.position.y, yaw: $0.yaw) })
+            missionStartPose: context.memory.missionStartPose.map { WirePose(x: $0.position.x, y: $0.position.y, yaw: $0.yaw) },
+            rememberedObjects: context.memory.rememberedObjects.map {
+                WireRememberedObject(label: $0.label, x: $0.worldPoint.x, y: $0.worldPoint.y, timesSeen: $0.timesSeen)
+            })
+        explorationCandidates = context.explorationCandidates.map {
+            WireCandidate(id: $0.id, x: $0.worldPoint.x, y: $0.worldPoint.y,
+                          widthMeters: $0.widthMeters, status: $0.status.rawValue)
+        }
+        plan = context.plan
         lastAnswerWasInconclusive = context.lastAnswerWasInconclusive
     }
 
@@ -111,6 +130,8 @@ private struct ActResponse: Decodable {
     let y: Double?
     let angle: Double?        // radians — only when action == "lookAround"
     let text: String?         // question (ask) or spoken text (say)
+    let candidateId: String?  // only when action == "explore"
+    let updatedPlan: String?  // optional plan rewrite, any action
 
     var decision: RoverDecision? {
         switch action {
@@ -120,6 +141,9 @@ private struct ActResponse: Decodable {
             case "worldPoint": return .navigate(.worldPoint(Vec2(x, y)))
             default: return .navigate(.imagePoint(CGPoint(x: x, y: y)))
             }
+        case "explore":
+            guard let candidateId, !candidateId.isEmpty else { return nil }
+            return .explore(candidateId: candidateId)
         case "lookAround":
             return .lookAround(angle: angle ?? .pi / 2)
         case "ask":

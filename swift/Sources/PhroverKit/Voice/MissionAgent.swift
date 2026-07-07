@@ -24,6 +24,28 @@ public protocol RoverPerception: AnyObject {
     func detectObjects() -> [PerceivedObject]
     func unproject(normalizedPoint: CGPoint) -> Vec2?
     func capturedFrameJPEG() -> Data?
+    /// Resolve a free-text description ("the green chair") to a normalized point in the
+    /// current view, or `nil` if nothing matches. Has a default (substring-match)
+    /// implementation below; conform your own for open-vocabulary/attribute grounding.
+    func groundObject(query: String) -> CGPoint?
+    /// Openings into unexplored space (frontier detection over the scene mesh). Default
+    /// implementation returns [] for perception sources with no mapping capability.
+    func explorationFrontiers() -> [Frontier]
+}
+
+extension RoverPerception {
+    /// Default grounding: case-insensitive substring match against `detectObjects()`
+    /// labels, picking the highest-confidence match. No attribute/color understanding —
+    /// "green chair" matches the same as "chair". Override for anything smarter.
+    public func groundObject(query: String) -> CGPoint? {
+        let q = query.lowercased()
+        return detectObjects()
+            .filter { q.contains($0.label.lowercased()) || $0.label.lowercased().contains(q) }
+            .max { $0.confidence < $1.confidence }?
+            .normalizedPoint
+    }
+
+    public func explorationFrontiers() -> [Frontier] { [] }
 }
 
 /// Default `RoverPerception`: on-device COCO detection over the live ARKit frame.
@@ -54,6 +76,12 @@ public final class ARPerceptionSource: RoverPerception {
 
     public func capturedFrameJPEG() -> Data? {
         FrameEncoder.jpeg(ar.latestPixelBuffer)
+    }
+
+    public func explorationFrontiers() -> [Frontier] {
+        guard let center = ar.pose?.position else { return [] }
+        let (map, observed) = CostmapBuilder.buildWithObserved(from: ar.meshAnchors, center: center)
+        return FrontierFinder.candidates(costmap: map, observed: observed)
     }
 }
 
@@ -102,6 +130,13 @@ public final class MissionAgent {
 
     public private(set) var phase: Phase = .idle
     public private(set) var memory = MissionMemory()
+    /// The mission plan as last written by a brain (see `BrainOutput.updatedPlan`).
+    public private(set) var plan: String?
+    /// Openings into unexplored space, with stable ids and visited status maintained
+    /// across ticks. Visited candidates are kept (they're memory — "already checked, it
+    /// was a hallway"); unexplored ones that stop being frontiers (e.g. seen through
+    /// without visiting) are dropped so the brain isn't offered stale openings.
+    public private(set) var explorationCandidates: [ExplorationCandidate] = []
 
     private let motion: RoverMotion
     private let perception: RoverPerception
@@ -110,6 +145,11 @@ public final class MissionAgent {
     private let currentBrain: () -> RoverBrain?
 
     private var lastAnswerWasInconclusive = false
+    private var nextCandidateNumber = 1
+    /// A frontier within this distance of a known candidate is the same opening.
+    private let candidateMatchRadius = 1.0
+    /// Getting this close to a candidate marks it visited.
+    private let visitedRadius = 1.0
 
     /// Hard cap on think-ticks per utterance so a brain that never emits `.stop`/`.done`
     /// can't loop forever (matters most for scripted/fake brains in tests).
@@ -152,25 +192,35 @@ public final class MissionAgent {
             }
 
             phase = .thinking
+            updateWorldModel()
             let ctx = makeContext(utterance: nextUtterance)
             nextUtterance = nil
 
-            let decision: RoverDecision
+            let output: BrainOutput
             do {
-                decision = try await brain.nextAction(ctx)
+                output = try await brain.nextAction(ctx)
             } catch {
                 voice.speak("Sorry, I'm having trouble thinking right now.")
                 break
             }
+            if let updated = output.updatedPlan, !updated.isEmpty { plan = updated }
 
             phase = .acting
-            switch decision {
+            switch output.decision {
             case .navigate(let target):
                 guard let goal = resolve(target) else {
                     voice.speak("I couldn't quite figure out where that is.")
                     continue
                 }
                 motion.navigate(to: goal)
+                await waitForMotionToSettle()
+
+            case .explore(let candidateId):
+                guard let candidate = explorationCandidates.first(where: { $0.id == candidateId }) else {
+                    voice.speak("I'm not sure which opening that is anymore.")
+                    continue
+                }
+                motion.navigate(to: candidate.worldPoint)
                 await waitForMotionToSettle()
 
             case .lookAround(let angle):
@@ -202,10 +252,61 @@ public final class MissionAgent {
         phase = .idle
     }
 
+    /// Once per tick, before thinking: fold what perception sees *right now* into
+    /// persistent world memory, so the brain reasons over more than the current frame.
+    private func updateWorldModel() {
+        // Object permanence: pin every current detection to the nav plane.
+        for object in perception.detectObjects() {
+            if let world = perception.unproject(normalizedPoint: object.normalizedPoint) {
+                memory.rememberObject(label: object.label, at: world)
+            }
+        }
+
+        // Exploration candidates: match fresh frontiers to known openings by proximity so
+        // ids (and visited status) stay stable across ticks; unmatched frontiers become
+        // new candidates. Visited ones are kept even after their frontier disappears
+        // (they're memory: "already checked, it was a hallway"); stale *unexplored* ones
+        // are dropped so the brain isn't offered openings that no longer exist.
+        var refreshed: [ExplorationCandidate] = []
+        var matchedIds = Set<String>()
+        for frontier in perception.explorationFrontiers() {
+            if let existing = explorationCandidates.first(where: {
+                !matchedIds.contains($0.id) &&
+                $0.worldPoint.distance(to: frontier.centroid) < candidateMatchRadius
+            }) {
+                var updated = existing
+                updated.worldPoint = frontier.centroid
+                updated.widthMeters = frontier.widthMeters
+                refreshed.append(updated)
+                matchedIds.insert(existing.id)
+            } else {
+                refreshed.append(ExplorationCandidate(id: "opening_\(nextCandidateNumber)",
+                                                      worldPoint: frontier.centroid,
+                                                      widthMeters: frontier.widthMeters))
+                nextCandidateNumber += 1
+            }
+        }
+        let rememberedVisited = explorationCandidates.filter {
+            $0.status == .visited && !matchedIds.contains($0.id)
+        }
+        explorationCandidates = refreshed + rememberedVisited
+
+        // Being at (or driving right up to) an opening counts as having checked it.
+        if let here = perception.pose?.position {
+            for i in explorationCandidates.indices
+            where explorationCandidates[i].worldPoint.distance(to: here) < visitedRadius {
+                explorationCandidates[i].status = .visited
+            }
+        }
+    }
+
     private func resolve(_ target: NavigationTarget) -> Vec2? {
         switch target {
         case .worldPoint(let p): return p
         case .imagePoint(let p): return perception.unproject(normalizedPoint: p)
+        case .visualQuery(let q):
+            guard let point = perception.groundObject(query: q) else { return nil }
+            return perception.unproject(normalizedPoint: point)
         }
     }
 
@@ -222,6 +323,8 @@ public final class MissionAgent {
                        pose: perception.pose,
                        navState: motion.state,
                        memory: memory,
+                       explorationCandidates: explorationCandidates,
+                       plan: plan,
                        lastAnswerWasInconclusive: lastAnswerWasInconclusive)
     }
 }

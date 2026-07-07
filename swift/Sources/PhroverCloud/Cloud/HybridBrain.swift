@@ -18,7 +18,7 @@ public final class HybridBrain: RoverBrain {
         self.isOnline = isOnline
     }
 
-    public func nextAction(_ context: MissionContext) async throws -> RoverDecision {
+    public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         guard isOnline() else { return try await onDevice.nextAction(context) }
         do {
             return try await cloud.nextAction(context)

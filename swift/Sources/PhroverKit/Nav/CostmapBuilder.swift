@@ -30,9 +30,21 @@ public enum CostmapBuilder {
     public static func build(from meshAnchors: [ARMeshAnchor],
                              center: Vec2,
                              params: Params = Params()) -> Costmap {
+        buildWithObserved(from: meshAnchors, center: center, params: params).map
+    }
+
+    /// Same as `build`, but also reports which cells have any mesh evidence at all —
+    /// including the bare-floor vertices the obstacle pass filters out. That "observed"
+    /// signal is what distinguishes open floor the rover has actually seen from unmapped
+    /// space beyond a doorway (`Costmap` alone can't: both read as free), and is the input
+    /// `FrontierFinder` needs to propose exploration candidates.
+    public static func buildWithObserved(from meshAnchors: [ARMeshAnchor],
+                                         center: Vec2,
+                                         params: Params = Params()) -> (map: Costmap, observed: ObservedGrid) {
         let cells = Int((params.size / params.resolution).rounded())
         let origin = Vec2(center.x - params.size / 2, center.y - params.size / 2)
         var map = Costmap(width: cells, height: cells, resolution: params.resolution, origin: origin)
+        var observed = ObservedGrid(matching: map)
 
         // Estimate floor height as the lowest vertex we see (ARKit Y is up).
         var floorY = Float.infinity
@@ -50,14 +62,16 @@ public enum CostmapBuilder {
                     .assumingMemoryBound(to: (Float, Float, Float).self).pointee
                 let local = SIMD4<Float>(vp.0, vp.1, vp.2, 1)
                 let world = t * local
+                let groundPoint = Vec2(Double(world.x), Double(world.z))
+                observed.markObserved(at: groundPoint)
                 let heightAboveFloor = world.y - floorY
                 guard heightAboveFloor > Float(params.floorBand),
                       heightAboveFloor < Float(params.ceilingBand) else { continue }
-                map.markObstacle(at: Vec2(Double(world.x), Double(world.z)))
+                map.markObstacle(at: groundPoint)
             }
         }
 
         map.inflate(radius: params.inflationRadius)
-        return map
+        return (map, observed)
     }
 }
