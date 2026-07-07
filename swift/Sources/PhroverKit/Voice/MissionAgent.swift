@@ -217,6 +217,7 @@ public final class MissionAgent {
             switch output.decision {
             case .navigate(let target):
                 guard let goal = resolve(target) else {
+                    if await searchForUnresolvedVisualTarget(target) { continue }
                     voice.speak("I couldn't quite figure out where that is.")
                     continue
                 }
@@ -316,6 +317,17 @@ public final class MissionAgent {
             guard let point = perception.groundObject(query: q) else { return nil }
             return perception.unproject(normalizedPoint: point)
         }
+    }
+
+    private func searchForUnresolvedVisualTarget(_ target: NavigationTarget) async -> Bool {
+        guard case .visualQuery = target else { return false }
+        if let candidate = explorationCandidates.first(where: { $0.status == .unexplored }) {
+            motion.navigate(to: candidate.worldPoint)
+            await waitForMotionToSettle()
+        } else {
+            await motion.rotate(by: .pi / 2)
+        }
+        return true
     }
 
     private func waitForMotionToSettle() async {

@@ -35,6 +35,33 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(motion.rotateCalls, [.pi])
     }
 
+    func testSearchesOpeningWhenVisualTargetIsNotCurrentlyDetected() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.frontiers = [Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5)]
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("chair")), .done])
+        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { brain }
+
+        await agent.handle("go to the chair")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(2, 1)])
+        XCTAssertTrue(voice.spoken.isEmpty)
+    }
+
+    func testScansWhenVisualTargetIsNotDetectedAndNoOpeningIsKnown() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("table")), .done])
+        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { brain }
+
+        await agent.handle("go to the table")
+
+        XCTAssertEqual(motion.rotateCalls, [.pi / 2])
+        XCTAssertTrue(voice.spoken.isEmpty)
+    }
+
     func testReportsPhaseChangesWhileHandlingCommand() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -156,11 +183,13 @@ private final class FakeMotion: RoverMotion {
 private final class FakePerception: RoverPerception {
     var pose: Pose2D? = Pose2D(position: .zero, yaw: 0)
     var objects: [PerceivedObject] = []
+    var frontiers: [Frontier] = []
     var unprojectResult: Vec2? = Vec2(1, 2)
 
     func detectObjects() -> [PerceivedObject] { objects }
     func unproject(normalizedPoint: CGPoint) -> Vec2? { unprojectResult }
     func capturedFrameJPEG() -> Data? { nil }
+    func explorationFrontiers() -> [Frontier] { frontiers }
 }
 
 @MainActor
