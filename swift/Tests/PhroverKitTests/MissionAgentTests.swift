@@ -35,6 +35,25 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(motion.rotateCalls, [.pi])
     }
 
+    func testReportsPhaseChangesWhileHandlingCommand() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.lookAround(angle: .pi), .done])
+        var observedPhases: [MissionAgent.Phase] = []
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 phaseDidChange: { observedPhases.append($0) },
+                                 currentBrain: { brain })
+
+        await agent.handle("turn left")
+
+        XCTAssertTrue(observedPhases.contains(.thinking))
+        XCTAssertTrue(observedPhases.contains(.acting))
+        XCTAssertEqual(observedPhases.last, .idle)
+    }
+
     func testAsksThenActsOnTheAnswer() async {
         let motion = FakeMotion()
         let perception = FakePerception()

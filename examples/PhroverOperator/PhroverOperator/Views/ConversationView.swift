@@ -17,6 +17,7 @@ struct ConversationView: View {
     @State private var speechIn = SpeechIn()
     @State private var speechOut = SpeechOut()
     @State private var agent: MissionAgent?
+    @State private var missionPhase: MissionAgent.Phase = .idle
     @State private var authorized = false
 
     var body: some View {
@@ -37,8 +38,8 @@ struct ConversationView: View {
                         .onEnded { _ in speechIn.stop() }
                 )
 
-            if let agent {
-                Text(phaseLabel(agent.phase))
+            if agent != nil {
+                Text(phaseStatusLabel)
                     .font(.body)
                     .padding()
                     .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
@@ -54,7 +55,9 @@ struct ConversationView: View {
             let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
             let onDevice = OnDeviceBrain()
             let brain: RoverBrain = cloudBrain.map { HybridBrain(cloud: $0, onDevice: onDevice) } ?? onDevice
-            agent = MissionAgent(motion: nav, perception: perception, voice: voice) { brain }
+            agent = MissionAgent(motion: nav, perception: perception, voice: voice, phaseDidChange: { phase in
+                missionPhase = phase
+            }) { brain }
         }
     }
 
@@ -76,10 +79,18 @@ struct ConversationView: View {
         }
     }
 
+    private var phaseStatusLabel: String {
+        if speechIn.state == .listening {
+            return speechIn.partialTranscript.isEmpty ? "Listening…" : "Processing speech…"
+        }
+        return phaseLabel(missionPhase)
+    }
+
     private func startListening() {
         guard authorized, speechIn.state != .listening else { return }
         try? speechIn.start { utterance in
-            Task {
+            Task { @MainActor in
+                missionPhase = .thinking
                 await agent?.handle(utterance)
             }
         }

@@ -128,7 +128,12 @@ public final class SpeechRoverVoice: RoverVoice {
 public final class MissionAgent {
     public enum Phase: Equatable { case idle, thinking, acting, waitingForAnswer }
 
-    public private(set) var phase: Phase = .idle
+    public private(set) var phase: Phase = .idle {
+        didSet {
+            guard phase != oldValue else { return }
+            phaseDidChange?(phase)
+        }
+    }
     public private(set) var memory = MissionMemory()
     /// The mission plan as last written by a brain (see `BrainOutput.updatedPlan`).
     public private(set) var plan: String?
@@ -142,6 +147,7 @@ public final class MissionAgent {
     private let perception: RoverPerception
     private let voice: RoverVoice
     private let askTimeout: TimeInterval
+    private let phaseDidChange: ((Phase) -> Void)?
     private let currentBrain: () -> RoverBrain?
 
     private var lastAnswerWasInconclusive = false
@@ -160,12 +166,14 @@ public final class MissionAgent {
                 voice: RoverVoice,
                 askTimeout: TimeInterval = 8,
                 maxTicksPerUtterance: Int = 25,
+                phaseDidChange: ((Phase) -> Void)? = nil,
                 currentBrain: @escaping () -> RoverBrain?) {
         self.motion = motion
         self.perception = perception
         self.voice = voice
         self.askTimeout = askTimeout
         self.maxTicksPerUtterance = maxTicksPerUtterance
+        self.phaseDidChange = phaseDidChange
         self.currentBrain = currentBrain
     }
 
