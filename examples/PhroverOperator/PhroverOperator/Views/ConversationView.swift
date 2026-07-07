@@ -11,6 +11,7 @@ import PhroverCloud
 /// `PhroverCloud.plist` is configured; on-device only otherwise.
 struct ConversationView: View {
     let ar: ARSessionManager
+    let control: RoverControl
     let nav: NavigationController
     let cloudBrain: CloudBrain?
 
@@ -18,6 +19,7 @@ struct ConversationView: View {
     @State private var speechOut = SpeechOut()
     @State private var agent: MissionAgent?
     @State private var authorized = false
+    @State private var voiceDriveStatus: String?
 
     var body: some View {
         VStack(spacing: 20) {
@@ -37,7 +39,12 @@ struct ConversationView: View {
                         .onEnded { _ in speechIn.stop() }
                 )
 
-            if let agent {
+            if let voiceDriveStatus {
+                Text(voiceDriveStatus)
+                    .font(.body)
+                    .padding()
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            } else if let agent {
                 Text(phaseLabel(agent.phase))
                     .font(.body)
                     .padding()
@@ -79,9 +86,28 @@ struct ConversationView: View {
     private func startListening() {
         guard authorized, speechIn.state != .listening else { return }
         try? speechIn.start { utterance in
+            if let command = VoiceDriveCommand.parse(utterance) {
+                Task { await runVoiceDriveCommand(command) }
+                return
+            }
             Task {
                 await agent?.handle(utterance)
             }
         }
+    }
+
+    private func runVoiceDriveCommand(_ command: VoiceDriveCommand) async {
+        voiceDriveStatus = command.statusText
+        do {
+            try await control.send(command.wheelCommand)
+            if command.durationSeconds > 0 {
+                try await Task.sleep(nanoseconds: UInt64(command.durationSeconds * 1_000_000_000))
+                try await control.stop()
+            }
+        } catch {
+            voiceDriveStatus = "Rover command failed"
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+        }
+        voiceDriveStatus = nil
     }
 }
