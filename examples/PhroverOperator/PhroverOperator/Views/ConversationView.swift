@@ -35,7 +35,7 @@ struct ConversationView: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { _ in startListening() }
-                        .onEnded { _ in speechIn.stop() }
+                        .onEnded { _ in speechIn.finish() }
                 )
 
             if agent != nil {
@@ -65,6 +65,7 @@ struct ConversationView: View {
         if !authorized { return "Enable Speech Recognition in Settings" }
         switch speechIn.state {
         case .listening: return "Listening…"
+        case .processing: return "Processing speech…"
         case .unavailable: return "Speech recognition unavailable"
         case .idle: return "Hold to talk"
         }
@@ -83,6 +84,7 @@ struct ConversationView: View {
         if speechIn.state == .listening {
             return speechIn.partialTranscript.isEmpty ? "Listening…" : "Processing speech…"
         }
+        if speechIn.state == .processing { return "Thinking…" }
         return phaseLabel(missionPhase)
     }
 

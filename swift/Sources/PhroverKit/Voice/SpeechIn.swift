@@ -8,7 +8,7 @@ import AVFoundation
 @Observable
 @MainActor
 public final class SpeechIn {
-    public enum State: Equatable { case idle, listening, unavailable }
+    public enum State: Equatable { case idle, listening, processing, unavailable }
 
     public private(set) var state: State = .idle
     public private(set) var partialTranscript = ""
@@ -102,18 +102,32 @@ public final class SpeechIn {
         finishRecognition(cancelTask: true)
     }
 
+    /// End microphone capture and let Speech deliver the final transcript. This is the
+    /// push-to-talk release path; cancelling here would drop the command before the agent
+    /// can interpret it.
+    public func finish() {
+        guard state == .listening else { return }
+        finishAudioInput()
+        request?.endAudio()
+        state = .processing
+    }
+
     private func finishRecognition(cancelTask: Bool) {
-        if tapInstalled {
-            audioEngine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
-        if audioEngine.isRunning { audioEngine.stop() }
+        finishAudioInput()
         request?.endAudio()
         if cancelTask { task?.cancel() }
         task = nil
         request = nil
         isStarting = false
         if state != .unavailable { state = .idle }
+    }
+
+    private func finishAudioInput() {
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        if audioEngine.isRunning { audioEngine.stop() }
     }
 
     private nonisolated static func installTap(
