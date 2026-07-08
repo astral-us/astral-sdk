@@ -153,6 +153,8 @@ public final class MissionAgent {
 
     private var lastAnswerWasInconclusive = false
     private var nextCandidateNumber = 1
+    private var isHandlingMission = false
+    private var missionGeneration = 0
     /// A frontier within this distance of a known candidate is the same opening.
     private let candidateMatchRadius = 1.0
     /// Getting this close to a candidate marks it visited.
@@ -185,27 +187,47 @@ public final class MissionAgent {
     /// Handle one operator utterance end-to-end.
     public func handle(_ utterance: String) async {
         if isEmergencyStopUtterance(utterance) {
+            missionGeneration += 1
+            isHandlingMission = false
             phase = .acting
             motion.cancel()
             phase = .idle
             return
         }
 
+        guard !isHandlingMission else {
+            voice.speak("I'm still working on the previous command. Say stop if you want me to cancel it.")
+            return
+        }
         guard let pose = perception.pose else {
             voice.speak("I don't have my bearings yet — give me a moment to look around.")
             return
         }
+
+        isHandlingMission = true
+        missionGeneration += 1
+        let missionID = missionGeneration
+        defer {
+            if missionGeneration == missionID {
+                isHandlingMission = false
+            }
+        }
+
         memory.record(utterance: utterance, at: pose)
         lastAnswerWasInconclusive = false
-        await runLoop(firstUtterance: utterance)
+        await runLoop(firstUtterance: utterance, missionID: missionID)
     }
 
     // MARK: - Loop
 
-    private func runLoop(firstUtterance: String?) async {
+    private func runLoop(firstUtterance: String?, missionID: Int) async {
         var nextUtterance = firstUtterance
 
         for _ in 0..<maxTicksPerUtterance {
+            guard isCurrentMission(missionID) else {
+                phase = .idle
+                return
+            }
             guard let brain = currentBrain() else {
                 voice.speak("Sorry, I can't think right now.")
                 break
@@ -220,9 +242,17 @@ public final class MissionAgent {
             do {
                 output = try await brain.nextAction(ctx)
             } catch {
+                guard isCurrentMission(missionID) else {
+                    phase = .idle
+                    return
+                }
                 brainErrorLogger(error, ctx)
                 voice.speak("Sorry, I'm having trouble thinking right now.")
                 break
+            }
+            guard isCurrentMission(missionID) else {
+                phase = .idle
+                return
             }
             if let updated = output.updatedPlan, !updated.isEmpty { plan = updated }
 
@@ -272,6 +302,10 @@ public final class MissionAgent {
             }
         }
         phase = .idle
+    }
+
+    private func isCurrentMission(_ missionID: Int) -> Bool {
+        missionGeneration == missionID
     }
 
     private func isEmergencyStopUtterance(_ utterance: String) -> Bool {

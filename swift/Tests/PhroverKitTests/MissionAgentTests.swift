@@ -196,6 +196,46 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertTrue(voice.spoken.isEmpty)
         XCTAssertTrue(logged.isEmpty)
     }
+
+    func testNormalCommandDoesNotEnterBrainWhileMissionIsThinking() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        let voice = FakeVoice()
+        let brain = BlockingBrain()
+        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { brain }
+
+        let first = Task { @MainActor in await agent.handle("go to the chair") }
+        await brain.waitUntilEntered()
+
+        let second = Task { @MainActor in await agent.handle("go to the table") }
+        try? await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(brain.seenContexts.map(\.utterance), ["go to the chair"])
+        XCTAssertEqual(voice.spoken, ["I'm still working on the previous command. Say stop if you want me to cancel it."])
+
+        brain.finishAll(with: .done)
+        await first.value
+        await second.value
+    }
+
+    func testEmergencyStopInvalidatesInFlightBrainDecision() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        let voice = FakeVoice()
+        let brain = BlockingBrain()
+        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { brain }
+
+        let first = Task { @MainActor in await agent.handle("go to the chair") }
+        await brain.waitUntilEntered()
+
+        await agent.handle("stop")
+        brain.finishAll(with: .navigate(.worldPoint(Vec2(4, 5))))
+        await first.value
+
+        XCTAssertEqual(motion.cancelCallCount, 1)
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        XCTAssertEqual(agent.phase, .idle)
+    }
 }
 
 // MARK: - Fakes
@@ -225,6 +265,34 @@ private final class ThrowingBrain: RoverBrain {
 
     func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         throw error
+    }
+}
+
+@MainActor
+private final class BlockingBrain: RoverBrain {
+    private(set) var seenContexts: [MissionContext] = []
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var decision: RoverDecision?
+
+    func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        seenContexts.append(context)
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        while decision == nil {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return BrainOutput(decision: decision ?? .done)
+    }
+
+    func waitUntilEntered() async {
+        guard seenContexts.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            enteredContinuation = continuation
+        }
+    }
+
+    func finishAll(with decision: RoverDecision) {
+        self.decision = decision
     }
 }
 

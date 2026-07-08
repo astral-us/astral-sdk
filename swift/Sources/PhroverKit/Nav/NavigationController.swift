@@ -24,6 +24,7 @@ public final class NavigationController {
     private let pursuit = PursuitController(params: .init(
         wheelBase: RoverConfig.wheelBase, goalTolerance: 0.2))
     private let guardLayer = ObstacleGuard()
+    private static let obstacleArrivalDistance = 0.65
 
     private var loop: Task<Void, Never>?
     private var replanCounter = 0
@@ -71,6 +72,7 @@ public final class NavigationController {
         loop?.cancel()
         loop = nil
         Task { try? await control.stop() }
+        state = .idle
     }
 
     // MARK: - Loop
@@ -88,12 +90,21 @@ public final class NavigationController {
             let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
                                                lastAckAt: lastAck,
                                                feedback: nil)
-            guard decision == .go else {
+            switch decision {
+            case .go:
+                break
+            case .stopObstacle(let clearance):
                 try? await control.stop()
-                // For a static obstacle, replanning next tick may route around it; for
-                // comms loss / tip we just keep commanding stop until cleared.
-                try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
-                continue
+                state = Self.stateAfterObstacleStop(pose: pose, goal: goal, clearance: clearance)
+                return
+            case .stopCommsLost:
+                try? await control.stop()
+                state = .failed("Rover command link lost.")
+                return
+            case .stopTipping:
+                try? await control.stop()
+                state = .failed("Rover may be tipping.")
+                return
             }
 
             let out = pursuit.step(pose: pose, path: path)
@@ -131,10 +142,21 @@ public final class NavigationController {
             let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
                                                lastAckAt: lastAck,
                                                feedback: nil)
-            guard decision == .go else {
+            switch decision {
+            case .go:
+                break
+            case .stopObstacle(let clearance):
                 try? await control.stop()
-                try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
-                continue
+                state = .failed(Self.obstacleMessage(clearance: clearance))
+                return
+            case .stopCommsLost:
+                try? await control.stop()
+                state = .failed("Rover command link lost.")
+                return
+            case .stopTipping:
+                try? await control.stop()
+                state = .failed("Rover may be tipping.")
+                return
             }
 
             let cmd = RotationCommand.command(forYawError: error)
@@ -142,5 +164,16 @@ public final class NavigationController {
             try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
         }
         try? await control.stop()
+    }
+
+    static func stateAfterObstacleStop(pose: Pose2D, goal: Vec2, clearance: Double) -> State {
+        if pose.position.distance(to: goal) <= obstacleArrivalDistance {
+            return .arrived
+        }
+        return .failed(obstacleMessage(clearance: clearance))
+    }
+
+    private static func obstacleMessage(clearance: Double) -> String {
+        String(format: "Obstacle ahead at %.2f m.", clearance)
     }
 }
