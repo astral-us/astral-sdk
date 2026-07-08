@@ -184,6 +184,13 @@ public final class MissionAgent {
 
     /// Handle one operator utterance end-to-end.
     public func handle(_ utterance: String) async {
+        if isEmergencyStopUtterance(utterance) {
+            phase = .acting
+            motion.cancel()
+            phase = .idle
+            return
+        }
+
         guard let pose = perception.pose else {
             voice.speak("I don't have my bearings yet — give me a moment to look around.")
             return
@@ -265,6 +272,16 @@ public final class MissionAgent {
             }
         }
         phase = .idle
+    }
+
+    private func isEmergencyStopUtterance(_ utterance: String) -> Bool {
+        let tokens = Set(utterance
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty })
+        return tokens.contains("stop")
+            || tokens.contains("halt")
+            || tokens.contains("cancel")
     }
 
     /// Once per tick, before thinking: fold what perception sees *right now* into

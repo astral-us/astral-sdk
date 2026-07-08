@@ -162,6 +162,40 @@ final class MissionAgentTests: XCTestCase {
 
         XCTAssertEqual(motion.cancelCallCount, 1)
     }
+
+    func testEmergencyStopBypassesMissingPoseAndBrain() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = nil
+        let voice = FakeVoice()
+        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { nil }
+
+        await agent.handle("stop")
+
+        XCTAssertEqual(motion.cancelCallCount, 1)
+        XCTAssertEqual(agent.phase, .idle)
+        XCTAssertTrue(voice.spoken.isEmpty)
+    }
+
+    func testEmergencyStopBypassesBrainErrors() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        let voice = FakeVoice()
+        let brain = ThrowingBrain(error: FakeBrainError.modelUnavailable)
+        var logged: [(error: Error, context: MissionContext)] = []
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 brainErrorLogger: { error, context in logged.append((error, context)) },
+                                 currentBrain: { brain })
+
+        await agent.handle("emergency stop")
+
+        XCTAssertEqual(motion.cancelCallCount, 1)
+        XCTAssertEqual(agent.phase, .idle)
+        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertTrue(logged.isEmpty)
+    }
 }
 
 // MARK: - Fakes
