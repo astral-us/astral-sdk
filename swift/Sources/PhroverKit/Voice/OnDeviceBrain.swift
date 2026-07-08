@@ -46,6 +46,11 @@ enum OnDeviceAction: String, CaseIterable {
     case done
 }
 
+@MainActor
+protocol OnDeviceBrainResponder {
+    func nextAction(prompt: String, context: MissionContext) async throws -> BrainOutput
+}
+
 /// Fallback brain: Apple's on-device Foundation Model, reasoning over a *text* summary of
 /// what's visible. The model itself only sees COCO labels (no color/attribute
 /// understanding — it can't tell "green" from "red"), but it can still emit a free-text
@@ -55,33 +60,39 @@ enum OnDeviceAction: String, CaseIterable {
 /// the richer understanding `CloudBrain` provides when online.
 @MainActor
 public final class OnDeviceBrain: RoverBrain {
-    private let model: SystemLanguageModel
-    private var session: LanguageModelSession?
+    private let isAvailableProvider: () -> Bool
+    private let makeResponder: () -> OnDeviceBrainResponder
 
     /// - Parameter adapter: an optional custom-trained adapter (Apple's adapter training
     ///   toolkit produces `.fmadapter` packages) specializing the base on-device model for
     ///   rover missions. `nil` uses the stock system model.
     public init(adapter: SystemLanguageModel.Adapter? = nil) {
-        model = adapter.map { SystemLanguageModel(adapter: $0) } ?? SystemLanguageModel.default
+        let model = adapter.map { SystemLanguageModel(adapter: $0) } ?? SystemLanguageModel.default
+        isAvailableProvider = {
+            if case .available = model.availability { return true }
+            return false
+        }
+        makeResponder = {
+            FoundationModelsOnDeviceResponder(model: model, instructions: Self.instructions)
+        }
+    }
+
+    init(isAvailable: @escaping () -> Bool, makeResponder: @escaping () -> OnDeviceBrainResponder) {
+        self.isAvailableProvider = isAvailable
+        self.makeResponder = makeResponder
     }
 
     public var isAvailable: Bool {
-        if case .available = model.availability { return true }
-        return false
+        isAvailableProvider()
     }
 
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         guard isAvailable else { throw RoverBrainError.unavailable }
         let prompt = promptText(context)
-        let result = try await currentSession().respond(to: prompt, generating: OnDeviceDecision.self)
-        let raw = result.content
-        return BrainOutput(decision: map(raw, context: context),
-                           updatedPlan: raw.updatedPlan.isEmpty ? nil : raw.updatedPlan)
+        return try await makeResponder().nextAction(prompt: prompt, context: context)
     }
 
-    private func currentSession() -> LanguageModelSession {
-        if let session { return session }
-        let s = LanguageModelSession(model: model, instructions: """
+    private static let instructions = """
             You are the on-device brain of a small autonomous ground rover. Decide the \
             single next action given what the operator said, what's currently visible, \
             remembered objects, unexplored openings, and your mission plan. Keep a short \
@@ -103,10 +114,7 @@ public final class OnDeviceBrain: RoverBrain {
             question went unanswered, do your best with what you have rather than asking \
             again. Choose done once the operator's request is fully satisfied — including \
             any later steps of your plan, like returning after fetching something.
-            """)
-        session = s
-        return s
-    }
+            """
 
     private func promptText(_ context: MissionContext) -> String {
         var lines: [String] = []
@@ -143,7 +151,7 @@ public final class OnDeviceBrain: RoverBrain {
         return lines.joined(separator: "\n")
     }
 
-    private func map(_ raw: OnDeviceDecision, context: MissionContext) -> RoverDecision {
+    fileprivate static func map(_ raw: OnDeviceDecision, context: MissionContext) -> RoverDecision {
         switch raw.action {
         case .navigateToObject:
             // A remembered object matching the description beats a fresh visual search —
@@ -186,7 +194,7 @@ public final class OnDeviceBrain: RoverBrain {
     /// "back" resolve to the mission's starting pose; a remembered object's label resolves
     /// to where it was seen (object permanence); anything else is matched against past
     /// utterances by substring containment.
-    private func bestMemoryMatch(_ query: String, in memory: MissionMemory) -> Pose2D? {
+    fileprivate static func bestMemoryMatch(_ query: String, in memory: MissionMemory) -> Pose2D? {
         let q = query.lowercased()
         if ["home", "start", "began", "back"].contains(where: q.contains) {
             return memory.missionStartPose
@@ -195,5 +203,21 @@ public final class OnDeviceBrain: RoverBrain {
             return Pose2D(position: object.worldPoint, yaw: 0)
         }
         return memory.turns.last { $0.utterance.lowercased().contains(q) || q.contains($0.utterance.lowercased()) }?.pose
+    }
+}
+
+@MainActor
+private final class FoundationModelsOnDeviceResponder: OnDeviceBrainResponder {
+    private let session: LanguageModelSession
+
+    init(model: SystemLanguageModel, instructions: String) {
+        session = LanguageModelSession(model: model, instructions: instructions)
+    }
+
+    func nextAction(prompt: String, context: MissionContext) async throws -> BrainOutput {
+        let result = try await session.respond(to: prompt, generating: OnDeviceDecision.self)
+        let raw = result.content
+        return BrainOutput(decision: OnDeviceBrain.map(raw, context: context),
+                           updatedPlan: raw.updatedPlan.isEmpty ? nil : raw.updatedPlan)
     }
 }
