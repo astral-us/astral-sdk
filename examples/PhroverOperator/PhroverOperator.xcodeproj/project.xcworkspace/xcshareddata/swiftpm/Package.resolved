@@ -1,5 +1,5 @@
 {
-  "originHash" : "90d4417d5f9055862f138bf8e1ec18f912c0c612bc30ead0fe7b0ef449b1e1ed",
+  "originHash" : "2675da12bf421c4f1c511a7c54ce979fdf275e62a3d6bc7086e5510ea9382528",
   "pins" : [
     {
       "identity" : "aws-sdk-ios-spm",

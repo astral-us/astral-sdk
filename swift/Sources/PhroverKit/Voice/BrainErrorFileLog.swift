@@ -12,6 +12,8 @@ public enum BrainErrorFileLog {
         guard let url = logFileURL else { return }
         let line = format(error: error, context: context, now: now)
         do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
             if !FileManager.default.fileExists(atPath: url.path) {
                 try line.write(to: url, atomically: true, encoding: .utf8)
                 return

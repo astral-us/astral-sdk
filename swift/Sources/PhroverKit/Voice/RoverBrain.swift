@@ -4,7 +4,7 @@ import RoverNav
 
 /// One perceived object, as seen by whichever detector produced it — the on-device COCO
 /// `Detector`, or a cloud VLM's open-vocabulary grounding.
-public struct PerceivedObject: Equatable {
+public struct PerceivedObject: Equatable, Sendable {
     public var label: String
     public var confidence: Float
     /// Normalized Vision-space point (bottom-left origin), suitable for
@@ -22,8 +22,8 @@ public struct PerceivedObject: Equatable {
 /// said it), plus every object it has seen pinned to a world coordinate. There's no naming
 /// grammar and no special-cased return-to-origin — a brain reads this itself to work out
 /// things like "go home", "and back", or "the chair we passed earlier".
-public struct MissionMemory {
-    public struct Turn {
+public struct MissionMemory: Sendable {
+    public struct Turn: Sendable {
         public var utterance: String
         public var pose: Pose2D
         public var timestamp: Date
@@ -38,7 +38,7 @@ public struct MissionMemory {
     /// Object permanence: a detection pinned to the nav plane. Once the camera turns away
     /// the detection is gone, but this record — "chair at (1.2, 3.4)" — survives, so a
     /// brain can navigate back to it via `.worldPoint` with no re-detection needed.
-    public struct RememberedObject: Equatable {
+    public struct RememberedObject: Equatable, Sendable {
         public var label: String
         public var worldPoint: Vec2
         public var lastSeenAt: Date
@@ -86,8 +86,8 @@ public struct MissionMemory {
 /// was just a hallway") isn't modeled — that lives in the brain's reading of what it saw
 /// after driving there; this list only answers "where could I still go look, and where
 /// have I already been".
-public struct ExplorationCandidate: Equatable {
-    public enum Status: String, Equatable { case unexplored, visited }
+public struct ExplorationCandidate: Equatable, Sendable {
+    public enum Status: String, Equatable, Sendable { case unexplored, visited }
 
     public var id: String
     public var worldPoint: Vec2
@@ -103,7 +103,7 @@ public struct ExplorationCandidate: Equatable {
 }
 
 /// Where a `navigate` decision should go.
-public enum NavigationTarget: Equatable {
+public enum NavigationTarget: Equatable, Sendable {
     /// A point in the current camera frame to unproject via LiDAR depth — how a brain
     /// points at something it just grounded itself (e.g. the cloud VLM, which can already
     /// see the image and point directly).
@@ -123,7 +123,7 @@ public enum NavigationTarget: Equatable {
 /// The one action a `RoverBrain` chooses per think-tick. Deliberately small and closed so
 /// `MissionAgent` remains the sole place that turns a decision into motor commands — no
 /// brain output reaches `RoverControl` directly.
-public enum RoverDecision: Equatable {
+public enum RoverDecision: Equatable, Sendable {
     case navigate(NavigationTarget)
     /// Drive to an `ExplorationCandidate` (by id) to see what's beyond it — the primitive
     /// for "the chair must be in another room, go check the doorway". Which opening to
@@ -146,7 +146,7 @@ public enum RoverDecision: Equatable {
 /// green chair — done. 2. return to start."); `MissionAgent` just stores it and echoes it
 /// back in the next `MissionContext`, so multi-leg intent survives across ticks without
 /// any step schema or completion tracking in code.
-public struct BrainOutput: Equatable {
+public struct BrainOutput: Equatable, Sendable {
     public var decision: RoverDecision
     public var updatedPlan: String?
 
@@ -159,7 +159,7 @@ public struct BrainOutput: Equatable {
 /// Snapshot of the world + conversation handed to a `RoverBrain` each think-tick.
 /// Deliberately data-only so different brains — an on-device text reasoner, a cloud vision
 /// reasoner — can consume the same shape, each using whatever subset it can.
-public struct MissionContext {
+public struct MissionContext: Sendable {
     /// What the operator just said, if this tick was triggered by a fresh utterance.
     public var utterance: String?
     /// Downscaled JPEG of the rover's current view, for brains that can see. `nil` when no

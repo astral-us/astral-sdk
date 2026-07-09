@@ -27,6 +27,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var latestCamera: ARCamera?
     /// Latest LiDAR depth map (meters, aligned to `latestCamera.imageResolution`'s aspect).
     public private(set) var latestDepthMap: CVPixelBuffer?
+    private var lastClearanceLogAt = Date.distantPast
 
     public override init() {
         super.init()
@@ -42,6 +43,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
         }
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            config.frameSemantics.insert(.smoothedSceneDepth)
+        }
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -54,9 +58,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         pose = Self.groundPose(from: frame.camera.transform)
         latestPixelBuffer = frame.capturedImage
         latestCamera = frame.camera
-        if let depth = frame.sceneDepth {
+        if let depth = frame.smoothedSceneDepth ?? frame.sceneDepth {
             forwardClearance = Self.forwardClearance(from: depth)
             latestDepthMap = depth.depthMap
+            logForwardClearanceIfNeeded()
         }
     }
 
@@ -69,6 +74,24 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         var map = Dictionary(meshAnchors.map { ($0.identifier, $0) }, uniquingKeysWith: { a, _ in a })
         for m in mesh { map[m.identifier] = m }
         meshAnchors = Array(map.values)
+    }
+
+    private func logForwardClearanceIfNeeded(now: Date = Date()) {
+        guard now.timeIntervalSince(lastClearanceLogAt) >= 1 else { return }
+        lastClearanceLogAt = now
+        RuntimeFileLog.append("forward_clearance", fields: [
+            "meters": forwardClearance.isFinite ? String(format: "%.2f", forwardClearance) : "inf",
+            "tracking": trackingStateDescription(trackingState)
+        ], now: now)
+    }
+
+    private func trackingStateDescription(_ state: ARCamera.TrackingState) -> String {
+        switch state {
+        case .normal: return "normal"
+        case .limited: return "limited"
+        case .notAvailable: return "notAvailable"
+        @unknown default: return "unknown"
+        }
     }
 
     // MARK: - Object grounding
@@ -151,25 +174,34 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return Pose2D(position: Vec2(Double(p.x), Double(p.z)), yaw: yaw)
     }
 
-    /// Minimum depth (m) sampled from the center region of the LiDAR depth map.
+    /// Robust near depth (m) sampled from the center region of the LiDAR depth map.
     static func forwardClearance(from depth: ARDepthData) -> Double {
-        let map = depth.depthMap
+        forwardClearance(fromDepthMap: depth.depthMap)
+    }
+
+    /// Robust near depth (m) sampled from the driving corridor of the LiDAR depth map.
+    static func forwardClearance(fromDepthMap map: CVPixelBuffer) -> Double {
         CVPixelBufferLockBaseAddress(map, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
         let w = CVPixelBufferGetWidth(map), h = CVPixelBufferGetHeight(map)
-        guard let base = CVPixelBufferGetBaseAddress(map) else { return .infinity }
+        guard let base = CVPixelBufferGetBaseAddress(map), w > 0, h > 0 else { return .infinity }
         let rowBytes = CVPixelBufferGetBytesPerRow(map)
         let ptr = base.assumingMemoryBound(to: Float32.self)
         let stride = rowBytes / MemoryLayout<Float32>.size
 
-        var minD = Float.infinity
-        // Sample a central band (roughly the rover's forward path).
-        for y in (h * 2 / 5)..<(h * 3 / 5) {
-            for x in (w * 2 / 5)..<(w * 3 / 5) {
+        var depths: [Float] = []
+        depths.reserveCapacity((h / 3) * (w / 2))
+        // Sample a wider central driving corridor. A wall slightly off-center in the
+        // mounted phone's view still needs to stop the rover before contact.
+        for y in (h / 3)..<(h * 2 / 3) {
+            for x in (w / 4)..<(w * 3 / 4) {
                 let d = ptr[y * stride + x]
-                if d > 0.05 && d < minD { minD = d }
+                if d > 0.05 && d.isFinite { depths.append(d) }
             }
         }
-        return minD.isFinite ? Double(minD) : .infinity
+        guard !depths.isEmpty else { return .infinity }
+        depths.sort()
+        let index = min(depths.count - 1, max(0, Int(Double(depths.count - 1) * 0.10)))
+        return Double(depths[index])
     }
 }

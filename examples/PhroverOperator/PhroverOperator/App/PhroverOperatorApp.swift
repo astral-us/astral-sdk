@@ -28,7 +28,19 @@ struct PhroverOperatorApp: App {
     var body: some Scene {
         WindowGroup {
             RootView(ar: ar, control: control, nav: nav, cloud: cloud)
-                .task { ar.start() }
+                .task {
+                    ar.start()
+                    Task {
+                        do {
+                            try await control.enableFeedbackFlow()
+                            RuntimeFileLog.append("feedback_flow_enabled")
+                        } catch {
+                            RuntimeFileLog.append("feedback_flow_failed", fields: [
+                                "error": error.localizedDescription
+                            ])
+                        }
+                    }
+                }
         }
     }
 }

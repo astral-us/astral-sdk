@@ -1,0 +1,257 @@
+# Phrover Fixes - July 7, 2026 PDT
+
+This document summarizes the issues we investigated and the fixes committed on branch
+`fix/speech-recognition`. The pulled phone logs use UTC timestamps, so several log entries
+appear as July 8, 2026 UTC.
+
+## Current Branch
+
+- Branch: `fix/speech-recognition`
+- Base before this workstream: `main` at `c2e8cf5`
+- Latest fix commit: `39e6bba Reset on-device brain session per decision`
+- Latest uncommitted update: runtime mission logging, rover command failure handling,
+  app-start feedback enablement, and wider LiDAR clearance sampling.
+
+## Pulled Logs
+
+- First app document pull:
+  `/private/tmp/phrover-documents-20260707-2209/phrover-brain-errors.log`
+- Later app document pull for busy-thinking behavior:
+  `/private/tmp/phrover-documents-20260708-busy-thinking/phrover-brain-errors.log`
+- Latest app document pull after the "thinking too long / On it..." report:
+  `/private/tmp/phrover-documents-20260708T055900Z`
+- App document pull for the repeated `Thinking...` / `On it...` blinking report:
+  `/private/tmp/phrover-documents-20260708-voice-blink/phrover-runtime.log`
+- App document pull for the clear-hallway `Forward clearance: 0.35 m` report:
+  `/private/tmp/phrover-documents-20260708-hallway-clearance/phrover-runtime.log`
+- Latest app document pull for voice command doing nothing / comms lost:
+  `/private/tmp/phrover-documents-20260708-latest/phrover-runtime.log`
+- Latest app document pull for blocker recovery rotating too much:
+  `/private/tmp/phrover-documents-20260708-latest-4/phrover-runtime.log`
+- Latest app document pull for repeated blocker selection after recovery:
+  `/private/tmp/phrover-documents-20260708-current/phrover-runtime.log`
+- Latest app document pull for target-object drift and scan behavior:
+  `/private/tmp/phrover-documents-20260708-target-scan/phrover-runtime.log`
+
+Key log findings:
+
+- `2026-07-08T03:45:01Z` and `2026-07-08T03:45:46Z` showed
+  `FoundationModels.LanguageModelSession.GenerationError`:
+  `Attempted to call respond(to:) a second time before the model finished responding to the previous prompt.`
+- `2026-07-08T05:25:11Z`, `05:25:34Z`, `05:26:02Z`, and `05:27:13Z` showed
+  `FoundationModels.LanguageModelSession.GenerationError`:
+  `Exceeded model context window size`.
+- Several later entries also showed nav state:
+  `failed: Rover command link lost.`
+- The latest app document pull succeeded but contained no files. That means the installed
+  app did not have a pullable `phrover-brain-errors.log` or runtime log at that moment.
+  A new general runtime log was added after this pull so future device pulls should include
+  `Documents/phrover-runtime.log`.
+- The exact phrase `Sorry, I am busy thinking right now` was not found in the pulled file log or current source. The current committed busy response is:
+  `I'm still working on the previous command. Say stop if you want me to cancel it.`
+- The `Thinking...` / `On it...` blinking report was reproduced in the runtime log:
+  - `2026-07-08T15:31:25Z` received `Go to the black chair in the other room`.
+  - Every attempted action immediately hit `nav_safety_stop clearance=0.36 reason=obstacle`.
+  - After each failed motion, the mission loop asked the brain for another action instead of
+    ending the mission, so it repeated until tick 24 and then finished.
+  - There was no `phrover-brain-errors.log` in this pull, so this was mission-control behavior,
+    not a FoundationModels crash.
+- The hallway pull showed the same LiDAR safety value on real hardware:
+  - Forward clearance stabilized around `0.34` to `0.35 m` while tracking was `normal`.
+  - `2026-07-08T15:58:32Z` received `Go to the black chair in the room`.
+  - Navigation immediately stopped with `nav_safety_stop clearance=0.35 reason=obstacle`.
+  - That confirmed the app was not showing stale UI; the clearance calculation was reporting
+    a near depth sample in the driving corridor.
+- The latest pull showed two more voice/navigation issues:
+  - `2026-07-08T16:58:32Z` logged `voice_command_received utterance=` with an empty
+    transcript, and the app still started a mission.
+  - `2026-07-08T16:58:54Z` received `Go to the table and come back`, clearance was about
+    `1.17 m`, but navigation immediately stopped with `nav_safety_stop reason=comms_lost`.
+  - The code checked the rover comms watchdog before sending the first command for a new
+    navigation attempt, so an old successful command ack could expire while the rover was
+    idle and then block the next voice command before it moved.
+- The blocker-recovery pull showed the mission did receive and act on the target command:
+  - `2026-07-08T18:54:52Z` received `Go to the table and back`.
+  - `2026-07-08T18:55:45Z` stopped with `Obstacle ahead at 0.20 m.`
+  - The next line logged `mission_blocked_heading ... recovery=rotate_90deg`.
+  - After that, no new `mission_thinking` or `mission_decision` entries appeared until
+    the operator said `Stop` at `2026-07-08T18:56:53Z`. That means the mission was stuck
+    waiting for the recovery rotation instead of returning to object search.
+- The latest repeated-blocker pull showed the 30-degree recovery was installed and working,
+  but the mission could still choose a blocked opening again:
+  - `2026-07-08T22:19:20Z` received `Go to the oranges`.
+  - `2026-07-08T22:20:08Z` stopped at `Obstacle ahead at 0.26 m.`, logged
+    `mission_blocked_heading ... recovery=rotate_30deg`, then timed out the recovery turn.
+  - The mission returned to `mission_thinking`, but later picked another blocked exploration
+    candidate and repeated until a rover command timed out. That means blocked openings were
+  still being presented as selectable unexplored candidates after recovery.
+- The target-scan pull showed the object detector was loaded, but the mission did not keep
+  the operator's requested object locked:
+  - `2026-07-08T23:57:23Z` and `2026-07-09T00:00:09Z` logged
+    `detector_loaded resource=RoverYOLO.mlmodelc`.
+  - `2026-07-09T00:05:15Z` received `Go to the refrigerator` and first decided
+    `navigate(visualQuery(the refrigerator))`.
+  - At `2026-07-09T00:07:25Z`, while still in the same mission, the brain changed the target
+    to `navigate(visualQuery(the green chair))`.
+  - The mission then alternated between refrigerator, green refrigerator, green chair, and
+    exploration decisions while repeatedly hitting `Obstacle ahead` stops.
+  - `2026-07-09T00:09:01Z` received another `Go to the refrigerator`, but after the first
+    blocked motion the next decision was `explore(opening_6)` instead of continuing a
+    deliberate scan for the requested refrigerator.
+
+## Issues And Fixes
+
+| Issue | Evidence / Symptom | Fix | Commit |
+| --- | --- | --- | --- |
+| Speech recognition crashed due to Swift concurrency queue isolation. | LLDB showed `_dispatch_assert_queue_fail` in `SpeechIn.requestAuthorization` and audio tap callbacks. | Moved speech authorization/audio callbacks onto the expected actor-safe path. | `d9db314 Fix speech recognition concurrency crashes` |
+| App signing failed with invalid Speech Recognition entitlement. | Xcode reported `com.apple.developer.speech-recognition not found and could not be included in profile`. | Removed the invalid entitlement so the app can be signed with the available profile. | `e4c6891 Remove invalid speech signing entitlement` |
+| Direct voice drive commands did not consistently send the expected rover commands. | Voice command path recognized simple commands but did not reliably drive the rover. | Added direct command handling for drive-style commands. | `dc37063 Fix direct voice drive commands` |
+| Interpreted voice rotation did not turn correctly. | User saw `Turn left` but the rover did not rotate as expected. | Added rotation command handling and tests for left/right wheel directions. | `35b8e39 Fix interpreted voice rotation` |
+| Talk screen status stayed `ready` even while a command was being processed. | UI showed the command text but did not show that the brain was thinking or acting. | Wired mission phase changes into the conversation UI so status can show processing state. | `0073059 Show voice command processing status` |
+| Speech recognition could start handling a command before recognition fully finished. | Voice flow could overlap speech capture and command handling. | Changed `SpeechIn` and `ConversationView` so command handling begins after final recognition. | `43b1756 Finish speech recognition before handling command` |
+| If the requested object was not visible, the rover did nothing useful. | User expected requests like chair/table to search if not detected. | Added mission behavior to explore known frontiers or rotate in place when a visual target cannot be grounded. | `1773ed5 Search when requested object is not visible` |
+| Brain failures were hard to diagnose after testing on the iPhone. | There was no durable app-side brain error file to pull from the phone. | Added `BrainErrorFileLog` writing detailed context to `Documents/phrover-brain-errors.log`. | `0839d1f Log brain errors to app documents` |
+| Stop voice command did not work while the brain was unavailable or busy. | Stop could still require a valid pose/brain path, so it could be blocked by the same failure. | Made emergency stop bypass missing pose and brain errors, directly canceling motion. | `482a0dc Bypass brain for voice emergency stop` |
+| Multiple voice commands could enter the brain at the same time. | FoundationModels logged `Attempted to call respond(to:) a second time before the model finished responding`. | Added mission-generation tracking so only one normal mission is handled at once, while stop invalidates the in-flight mission. | `f86c85e Fix voice command and navigation safety handling` |
+| LiDAR obstacle handling could keep the rover in a driving loop. | When LiDAR detected an obstacle, the code sent `stop()` but then slept and continued the loop. The app stayed busy instead of becoming ready. | On obstacle, the navigation loop now stops and exits. If the obstacle is near the target, state becomes `.arrived`; if it is a wall/early obstacle, state becomes `.failed(...)`. | `f86c85e Fix voice command and navigation safety handling` |
+| Cancel did not always return nav state to ready/idle. | `NavigationController.cancel()` stopped motors but did not update `state`. | `cancel()` now sets navigation state to `.idle`. | `f86c85e Fix voice command and navigation safety handling` |
+| On-device brain eventually failed with `Exceeded model context window size`. | Pulled logs at `2026-07-08T05:25:11Z` through `05:27:13Z` showed the context-window error. | `OnDeviceBrain` now creates a fresh FoundationModels session/responder for every decision instead of reusing one growing session. | `39e6bba Reset on-device brain session per decision` |
+| Talk could blink between `Thinking...` and `On it...` without anything happening. | The navigation loop used `try? await control.send(...)`, so rover HTTP failures were swallowed and nav could remain `.driving` forever. | Command send failures now stop the rover best-effort, set nav state to `.failed("Rover command failed: ...")`, exit the motion loop, and write `nav_command_failed` to the runtime log. | Uncommitted |
+| Talk could behave differently after switching to Drive view. | `DriveView` enabled rover feedback flow, but Talk/Navigate could run before that view was opened. | App startup now enables feedback flow once and records `feedback_flow_enabled` or `feedback_flow_failed` in `Documents/phrover-runtime.log`. | Uncommitted |
+| Forward clearance could display incorrectly and miss walls. | The previous LiDAR safety value sampled only the center 20% of the depth map and used raw `sceneDepth`. A wall slightly off the phone's center line could be missed. | AR now requests `smoothedSceneDepth` when available, prefers it over raw depth, samples a wider driving corridor, and logs `forward_clearance` about once per second. | Uncommitted |
+| Phone pulls did not show why voice commands stalled unless the brain threw an error. | The existing pullable log only captured brain exceptions, not normal mission state transitions or nav command failures. | Added `RuntimeFileLog` writing `Documents/phrover-runtime.log` with voice command, thinking, decision, motion-settled, feedback-flow, nav-failure, and clearance events. | Uncommitted |
+| Voice command was received but Talk blinked between `Thinking...` and `On it...` with no rover motion. | Runtime log showed the mission repeatedly deciding `explore(opening_1)` / `navigate(...)`, then immediately settling to `failed: Obstacle ahead at 0.36 m.`, then asking the brain again. | `MissionAgent` now treats navigation `.failed(...)` as terminal for the current mission: it speaks the failure reason, logs `mission_motion_failed`, returns to idle, and stops asking the brain for more actions. | Uncommitted |
+| Clear hallway reported `Forward clearance: 0.35 m`. | Pulled runtime log showed stable `forward_clearance meters=0.34/0.35 tracking=normal`, and the mission stopped with `Obstacle ahead at 0.35 m.` even though the hallway photo looked clear. The previous algorithm returned the single nearest valid depth sample, so floor, side-wall, mount, or depth noise outliers could pin the clearance. | `forwardClearance(fromDepthMap:)` now returns a low percentile of valid driving-corridor depth samples instead of the absolute minimum. A real nearby obstacle cluster still stops the rover, but a single near outlier no longer makes a clear hallway look blocked. | Uncommitted |
+| Empty speech result started a mission. | Latest runtime log had `voice_command_received utterance=` followed by `mission_thinking` and an explore decision. | `MissionAgent.handle` now trims utterances and ignores blank speech results before logging them as received or invoking the brain. | Uncommitted |
+| Voice command did nothing because navigation immediately reported `Rover command link lost.` | Latest runtime log showed a valid command with clear forward clearance, then `nav_safety_stop reason=comms_lost` before any command-failure detail. The watchdog compared the current time to an old `lastAckAt` from before the new mission. | Navigation now ignores stale acks until the current drive/rotate loop has successfully sent its first command. After that first send, the comms watchdog remains active. | Uncommitted |
+| After hitting a blocker, the rover rotated too much and could not keep searching for the requested object. | Latest runtime log showed `mission_blocked_heading ... recovery=rotate_90deg`, then no new mission decisions until the operator said `Stop` 68 seconds later. The mission was waiting inside the recovery turn instead of returning to the brain/perception loop. | Blocked-heading recovery now uses a short `30°` scan turn instead of `90°`, bounds that recovery with a timeout, cancels it if it does not settle, and logs `mission_blocked_heading_recovery_settled` or `mission_blocked_heading_recovery_timeout`. | Uncommitted |
+| After recovering from a blocked opening, the brain could choose that same blocked opening again. | Latest runtime log showed `Go to the oranges`, then repeated `mission_blocked_heading ... recovery=rotate_30deg` and new `mission_decision explore(...)` loops. The 30-degree recovery returned control to the brain, but the blocked exploration candidate still had `unexplored` status. | When an `.explore(candidateId:)` motion is blocked, `MissionAgent` now marks that candidate `visited` before the next brain decision and logs `mission_exploration_candidate_blocked`. In this context, `visited` means checked/not worth choosing again. | Uncommitted |
+| It was hard to tell whether the camera and object detector were working from the Talk screen. | The Drive/Navigate screens showed AR tracking and clearance, but Talk had no live camera preview or visible object labels. That made it unclear whether "go to the table" failed because speech, brain, camera frames, detector labels, or LiDAR grounding failed. | Talk now shows a small live camera preview with tracking, forward clearance, and top detected labels/confidence using the same detector instance that feeds `MissionAgent`. | Uncommitted |
+| Talk showed `Visible: none` even while pointing at a chair. | The bundled CoreML metadata confirms the YOLO model includes COCO labels such as `chair` and `dining table`, so the label was not missing. The detector was only running Vision with one camera orientation, which can produce no observations even when the live preview is aimed correctly. | `Detector` now retries common Vision image orientations when the primary orientation returns no detections, logs detector failures by orientation, exposes load state, and Talk shows `Detector: loaded/unavailable` next to `Visible`. | Uncommitted |
+| Talk showed `Detector: unavailable`. | The built iPhone app bundle contains `RoverYOLO.mlmodelc`, but `Detector` only searched for `RoverYOLO.mlpackage`, so model initialization could fail before any object detection ran. | `Detector` now prefers the compiled `.mlmodelc` resource, falls back to `.mlpackage`/`.mlmodel`, and logs `detector_loaded` or `detector_unavailable` with the resource/error in `phrover-runtime.log`. | Uncommitted |
+| Target-object commands could drift to a different object and explore before checking the requested target. | Latest runtime log showed `Go to the refrigerator`, then later `navigate(visualQuery(the green chair))` in the same mission, plus immediate `explore(opening_6)` after a refrigerator command. | `MissionAgent` now locks the first visual query for a mission, ignores later visual-query drift, requires a detector match at `0.90` confidence or higher before navigating to the object, and rotates in 30-degree scan steps for up to a full circle before falling back to opening exploration. Runtime logs now include visible labels/confidence, target-lock, target-match, target-miss, and target-scan-step events. | Uncommitted |
+| Runtime log writes could fail in runners where the Documents directory was missing. | The iOS simulator test run printed `Runtime log write failed: The folder "phrover-runtime.log" doesn't exist.` | `RuntimeFileLog` and `BrainErrorFileLog` now create the parent Documents directory before writing, so pullable logs are more reliable across app/test containers. | Uncommitted |
+| Object detection crashed or logged a GPU background permission error. | Device log showed `Insufficient Permission (to submit GPU work from background)` from `model0_main__Op2_MpsGraphInference` on the Apple A17 Pro GPU. That means CoreML/Vision was trying to submit Metal work while the app was backgrounded or winding down. | `Detector` now loads the CoreML model with `.cpuAndNeuralEngine`, excluding GPU execution so live preview or mission perception cannot submit forbidden background Metal command buffers. | Uncommitted |
+| Talk stayed stuck after obstacle recovery with no new rover action. | Pulled `/private/tmp/phrover-documents-20260709-log-pull/phrover-runtime.log`. The latest run logged `voice_command_received utterance=Go to the refrigerator`, `mission_target_match confidence=1.00`, then `mission_blocked_heading_recovery_timeout`. After that it logged `mission_thinking ... objects=bed:0.93` but no later `mission_decision` before `Stop`, proving the brain decision call hung. | `MissionAgent` now enforces a brain-decision timeout. If `brain.nextAction` does not return, the mission logs `mission_brain_timeout`, speaks the thinking-error message, exits the loop, and returns to Ready instead of staying busy forever. | Uncommitted |
+
+## Commits In Order
+
+| Commit | Local Time | Summary |
+| --- | --- | --- |
+| `d9db314` | 2026-07-07 11:15:44 PDT | Fix speech recognition concurrency crashes |
+| `e4c6891` | 2026-07-07 12:27:57 PDT | Remove invalid speech signing entitlement |
+| `dc37063` | 2026-07-07 13:01:23 PDT | Fix direct voice drive commands |
+| `35b8e39` | 2026-07-07 13:10:54 PDT | Fix interpreted voice rotation |
+| `0073059` | 2026-07-07 13:44:15 PDT | Show voice command processing status |
+| `43b1756` | 2026-07-07 13:56:40 PDT | Finish speech recognition before handling command |
+| `1773ed5` | 2026-07-07 14:42:59 PDT | Search when requested object is not visible |
+| `0839d1f` | 2026-07-07 15:10:55 PDT | Log brain errors to app documents |
+| `482a0dc` | 2026-07-07 17:28:13 PDT | Bypass brain for voice emergency stop |
+| `f86c85e` | 2026-07-07 22:21:03 PDT | Fix voice command and navigation safety handling |
+| `39e6bba` | 2026-07-07 22:37:21 PDT | Reset on-device brain session per decision |
+
+## Verification Run During The Workstream
+
+- `PhroverKitTests` passed after the navigation safety fix:
+  27 tests, 0 failures.
+- `OnDeviceBrainTests` passed after the fresh-session fix:
+  1 test, 0 failures.
+- Full `PhroverKitTests` passed after the latest fix:
+  28 tests, 0 failures.
+- `git diff --check` passed after the latest fix.
+- After the latest uncommitted runtime/nav/LiDAR update, full `PhroverKitTests` passed:
+  30 tests, 0 failures.
+- After the latest uncommitted runtime/nav/LiDAR update, the sample app build passed:
+  `PhroverOperator` simulator build, `CODE_SIGNING_ALLOWED=NO`.
+- `git diff --check` passed after the latest uncommitted update.
+- After the mission-stop-on-navigation-failure fix, the new regression test
+  `MissionAgentTests.testStopsMissionWhenNavigationFails` first failed because the mission
+  called the brain 3 times after navigation failed, then passed after the fix.
+- After the mission-stop-on-navigation-failure fix, full `PhroverKitTests` passed:
+  31 tests, 0 failures.
+- After the mission-stop-on-navigation-failure fix, the sample app build passed:
+  `PhroverOperator` simulator build, `CODE_SIGNING_ALLOWED=NO`.
+- After the clear-hallway clearance fix, `UnprojectionTests.testForwardClearanceIgnoresSingleNearOutlierInDrivingCorridor`
+  first failed because a single `0.35 m` sample controlled the result, then passed after
+  the robust percentile sampling change.
+- After the clear-hallway clearance fix, full `PhroverKitTests` passed:
+  32 tests, 0 failures.
+- After the clear-hallway clearance fix, the sample app build passed:
+  `PhroverOperator` simulator build, `CODE_SIGNING_ALLOWED=NO`.
+- `git diff --check` passed after the clear-hallway clearance fix.
+- After the empty-utterance and stale-ack fixes, the new focused tests passed:
+  `MissionAgentTests.testBlankUtteranceIsIgnored`,
+  `NavigationSafetyTests.testStaleAckIsIgnoredUntilNavigationSendsFirstCommand`, and
+  `NavigationSafetyTests.testStaleAckStopsActiveNavigationAfterFirstCommand`.
+- For the blocker-recovery fix, the new focused regression first failed before production
+  support because `blockedHeadingRecoveryTimeout` did not exist and the old code still used
+  a fixed `90°` recovery.
+- After the blocker-recovery fix, the focused iOS simulator tests passed:
+  `MissionAgentTests.testRotatesAndContinuesWhenHeadingIsBlockedByObstacle` and
+  `MissionAgentTests.testBlockedHeadingRecoveryCancelsScanTurnThatDoesNotSettle`.
+- After the blocker-recovery fix, full `PhroverKitTests` passed on the iOS simulator:
+  38 tests, 0 failures.
+- After the blocker-recovery fix, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- `git diff --check` passed after the blocker-recovery fix.
+- After the repeated-blocker fix, the new regression
+  `MissionAgentTests.testMarksBlockedExplorationCandidateVisitedBeforeNextDecision` first
+  failed because a blocked opening stayed `unexplored`, then passed after the fix.
+- After the repeated-blocker fix, full `PhroverKitTests` passed on the iOS simulator:
+  39 tests, 0 failures.
+- After the repeated-blocker fix, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- `git diff --check` passed after the repeated-blocker fix.
+- For the Talk camera debug panel, the new focused formatter tests first failed because
+  `PerceptionDebugSummary` did not exist, then passed after the helper was added.
+- After the Talk camera debug panel, full `PhroverKitTests` passed on the iOS simulator:
+  41 tests, 0 failures.
+- After the Talk camera debug panel, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- For the `Visible: none` chair issue, the new focused detector-orientation test first
+  failed because `Detector.detectionOrientations` did not exist, then passed after adding
+  orientation fallback.
+- After the detector-orientation fallback, full `PhroverKitTests` passed on the iOS
+  simulator: 42 tests, 0 failures.
+- After the detector-orientation fallback, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- For the `Detector: unavailable` issue, the new focused resource test first failed because
+  `Detector.modelResourceURL` did not exist, then passed after the loader started preferring
+  the compiled `.mlmodelc` bundle.
+- After the detector resource fix, full `PhroverKitTests` passed on the iOS simulator:
+  43 tests, 0 failures.
+- After the detector resource fix, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- For the target-lock scan fix, new focused MissionAgent regressions were added for
+  30-degree visual-target scanning, ignoring below-90% matches, and keeping the original
+  requested target when a later brain decision drifts to another object.
+- After the target-lock scan fix, focused `MissionAgentTests` passed on the iOS simulator:
+  22 tests, 0 failures.
+- After the log-directory fix, focused `MissionAgentTests` passed again on the iOS simulator:
+  22 tests, 0 failures, and the previous runtime-log write warnings were gone.
+- After the target-lock scan fix, the sample app build passed:
+  `PhroverOperator` generic iOS build.
+- For the GPU background-permission issue, the new focused detector test first failed
+  because `Detector.modelConfiguration` did not exist, then passed after the detector
+  started excluding GPU compute.
+- After the GPU background-permission fix, focused `DetectorTests` passed on the iOS
+  simulator: 3 tests, 0 failures.
+- After the GPU background-permission fix, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- For the post-obstacle thinking hang, the new focused regression first failed because
+  `MissionAgent` had no `brainDecisionTimeout`, then passed after adding the timeout race.
+- After the brain-timeout fix, focused `MissionAgentTests` passed on the iOS simulator:
+  23 tests, 0 failures.
+
+## Remaining Notes
+
+- Older builds only wrote brain errors, not every spoken status message. That is why the
+  exact busy-thinking phrase did not appear in the pulled log. The latest uncommitted
+  update adds `Documents/phrover-runtime.log` for normal voice/navigation/LiDAR events.
+- To analyze the next phone run, pull app Documents again and inspect:
+  - `phrover-runtime.log`
+  - `phrover-brain-errors.log`
+- Remaining uncommitted files at the time this summary was written:
+  - `examples/PhroverOperator/PhroverOperator.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
+  - `docs/component-and-sequence-diagrams.md`
+  - this summary file

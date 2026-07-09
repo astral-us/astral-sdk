@@ -22,10 +22,12 @@ public struct ObstacleGuard: Sendable {
     public func evaluate(forwardClearance: Double,
                           lastAckAt: Date?,
                           now: Date = Date(),
-                          feedback: RoverFeedback?) -> Decision {
+                          feedback: RoverFeedback?,
+                          requireFreshAck: Bool = true,
+                          checkForwardObstacle: Bool = true) -> Decision {
         if let fb = feedback, fb.isTipping() { return .stopTipping }
-        if forwardClearance < stopDistance { return .stopObstacle(clearance: forwardClearance) }
-        if let last = lastAckAt {
+        if checkForwardObstacle, forwardClearance < stopDistance { return .stopObstacle(clearance: forwardClearance) }
+        if requireFreshAck, let last = lastAckAt {
             if now.timeIntervalSince(last) > watchdogTimeout { return .stopCommsLost }
         }
         return .go

@@ -13,7 +13,7 @@ import RoverNav
 @Observable
 @MainActor
 public final class NavigationController {
-    public enum State: Equatable { case idle, planning, driving, arrived, failed(String) }
+    public enum State: Equatable, Sendable { case idle, planning, driving, arrived, failed(String) }
 
     public private(set) var state: State = .idle
     public private(set) var path: [Vec2] = []
@@ -52,8 +52,8 @@ public final class NavigationController {
     /// Rotate in place by `angle` radians (CCW positive, matching `Pose2D.yaw`) and wait
     /// for it to finish. A pure turn, no path planning — used by the mission agent to scan
     /// for something not currently in view (e.g. up to a full `2 * .pi` look-around).
-    /// Honors the same `ObstacleGuard` gate and command cadence as `drive()`, and can be
-    /// interrupted by `cancel()`.
+    /// Uses the same command cadence/watchdog as `drive()`, but does not treat forward
+    /// clearance as a hard stop because this is an in-place search turn, not forward motion.
     public func rotate(by angle: Double) async {
         cancel()
         guard let startYaw = ar.pose?.yaw else {
@@ -78,6 +78,7 @@ public final class NavigationController {
     // MARK: - Loop
 
     private func drive(to goal: Vec2) async {
+        var hasSentCommand = false
         while !Task.isCancelled {
             guard let pose = ar.pose else { break }
 
@@ -89,21 +90,29 @@ public final class NavigationController {
             let lastAck = await control.lastAckAt
             let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
                                                lastAckAt: lastAck,
-                                               feedback: nil)
+                                               feedback: nil,
+                                               requireFreshAck: hasSentCommand)
             switch decision {
             case .go:
                 break
             case .stopObstacle(let clearance):
                 try? await control.stop()
                 state = Self.stateAfterObstacleStop(pose: pose, goal: goal, clearance: clearance)
+                RuntimeFileLog.append("nav_safety_stop", fields: [
+                    "reason": "obstacle",
+                    "clearance": String(format: "%.2f", clearance),
+                    "state": state.description
+                ])
                 return
             case .stopCommsLost:
                 try? await control.stop()
                 state = .failed("Rover command link lost.")
+                RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "comms_lost"])
                 return
             case .stopTipping:
                 try? await control.stop()
                 state = .failed("Rover may be tipping.")
+                RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "tipping"])
                 return
             }
 
@@ -113,7 +122,18 @@ public final class NavigationController {
                 state = .arrived
                 return
             }
-            try? await control.send(out.command)
+            do {
+                try await control.send(out.command)
+                hasSentCommand = true
+            } catch {
+                try? await control.stop()
+                state = Self.stateAfterCommandFailure(error)
+                RuntimeFileLog.append("nav_command_failed", fields: [
+                    "error": error.localizedDescription,
+                    "state": state.description
+                ])
+                return
+            }
             try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
         }
         try? await control.stop()
@@ -129,6 +149,7 @@ public final class NavigationController {
 
     private func performRotate(to targetYaw: Double) async {
         let angularTolerance = 0.05 // rad
+        var hasSentCommand = false
         while !Task.isCancelled {
             guard let pose = ar.pose else { break }
             let error = normalizeAngle(targetYaw - pose.yaw)
@@ -141,26 +162,45 @@ public final class NavigationController {
             let lastAck = await control.lastAckAt
             let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
                                                lastAckAt: lastAck,
-                                               feedback: nil)
+                                               feedback: nil,
+                                               requireFreshAck: hasSentCommand,
+                                               checkForwardObstacle: false)
             switch decision {
             case .go:
                 break
             case .stopObstacle(let clearance):
                 try? await control.stop()
                 state = .failed(Self.obstacleMessage(clearance: clearance))
+                RuntimeFileLog.append("nav_safety_stop", fields: [
+                    "reason": "obstacle_while_rotating",
+                    "clearance": String(format: "%.2f", clearance)
+                ])
                 return
             case .stopCommsLost:
                 try? await control.stop()
                 state = .failed("Rover command link lost.")
+                RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "comms_lost_while_rotating"])
                 return
             case .stopTipping:
                 try? await control.stop()
                 state = .failed("Rover may be tipping.")
+                RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "tipping_while_rotating"])
                 return
             }
 
             let cmd = RotationCommand.command(forYawError: error)
-            try? await control.send(cmd)
+            do {
+                try await control.send(cmd)
+                hasSentCommand = true
+            } catch {
+                try? await control.stop()
+                state = Self.stateAfterCommandFailure(error)
+                RuntimeFileLog.append("nav_command_failed", fields: [
+                    "error": error.localizedDescription,
+                    "state": state.description
+                ])
+                return
+            }
             try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
         }
         try? await control.stop()
@@ -173,7 +213,23 @@ public final class NavigationController {
         return .failed(obstacleMessage(clearance: clearance))
     }
 
+    static func stateAfterCommandFailure(_ error: Error) -> State {
+        .failed("Rover command failed: \(error.localizedDescription)")
+    }
+
     private static func obstacleMessage(clearance: Double) -> String {
         String(format: "Obstacle ahead at %.2f m.", clearance)
+    }
+}
+
+extension NavigationController.State: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .idle: return "idle"
+        case .planning: return "planning"
+        case .driving: return "driving"
+        case .arrived: return "arrived"
+        case .failed(let reason): return "failed: \(reason)"
+        }
     }
 }

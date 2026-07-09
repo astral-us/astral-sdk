@@ -2,6 +2,7 @@ import Foundation
 import Vision
 import CoreML
 import CoreVideo
+import ImageIO
 
 /// On-device object detector (person + generic obstacles) via a CoreML model wrapped
 /// in Vision. Ships with a bundled YOLO-family `.mlpackage`; swap the model name to use
@@ -18,25 +19,90 @@ public final class Detector {
     }
 
     private var request: VNCoreMLRequest?
+    public var isLoaded: Bool { request != nil }
 
-    /// Compiles the bundled `.mlpackage` at load time (SwiftPM resource bundles ship the
-    /// package uncompiled, unlike an Xcode app target which auto-compiles it at build time).
+    /// Loads Xcode's compiled `.mlmodelc` when available, with source model fallback for
+    /// package contexts that still ship `.mlpackage`/`.mlmodel` resources.
     public init(modelName: String = "RoverYOLO") async {
-        guard let packageURL = Bundle.module.url(forResource: modelName, withExtension: "mlpackage"),
-              let compiledURL = try? await MLModel.compileModel(at: packageURL),
-              let model = try? VNCoreMLModel(for: MLModel(contentsOf: compiledURL)) else {
+        guard let modelURL = Self.modelResourceURL(modelName: modelName) else {
             request = nil
+            RuntimeFileLog.append("detector_unavailable", fields: [
+                "reason": "model_resource_missing",
+                "model": modelName
+            ])
             return
         }
-        let req = VNCoreMLRequest(model: model)
-        req.imageCropAndScaleOption = .scaleFill
-        request = req
+
+        do {
+            let loadURL: URL
+            if modelURL.pathExtension == "mlmodelc" {
+                loadURL = modelURL
+            } else {
+                loadURL = try await MLModel.compileModel(at: modelURL)
+            }
+            let model = try VNCoreMLModel(for: MLModel(contentsOf: loadURL,
+                                                       configuration: Self.modelConfiguration()))
+            let req = VNCoreMLRequest(model: model)
+            req.imageCropAndScaleOption = .scaleFill
+            request = req
+            RuntimeFileLog.append("detector_loaded", fields: [
+                "resource": modelURL.lastPathComponent
+            ])
+        } catch {
+            request = nil
+            RuntimeFileLog.append("detector_unavailable", fields: [
+                "reason": "model_load_failed",
+                "resource": modelURL.lastPathComponent,
+                "error": error.localizedDescription
+            ])
+        }
+    }
+
+    static func modelResourceURL(modelName: String, bundle: Bundle = .module) -> URL? {
+        bundle.url(forResource: modelName, withExtension: "mlmodelc")
+            ?? bundle.url(forResource: modelName, withExtension: "mlpackage")
+            ?? bundle.url(forResource: modelName, withExtension: "mlmodel")
+    }
+
+    static func modelConfiguration() -> MLModelConfiguration {
+        let configuration = MLModelConfiguration()
+        // iOS denies GPU/Metal command buffers once the app is backgrounded. Keeping the
+        // detector off GPU avoids MPSGraph background-execution crashes from live preview
+        // or mission perception work that is winding down during app lifecycle changes.
+        configuration.computeUnits = .cpuAndNeuralEngine
+        return configuration
     }
 
     public func detect(_ pixelBuffer: CVPixelBuffer) -> [Detection] {
         guard let request else { return [] }
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right)
-        try? handler.perform([request])
+        for orientation in Self.detectionOrientations(preferred: .right) {
+            let detections = detect(pixelBuffer, request: request, orientation: orientation)
+            if !detections.isEmpty { return detections }
+        }
+        return []
+    }
+
+    static func detectionOrientations(preferred: CGImagePropertyOrientation) -> [CGImagePropertyOrientation] {
+        var orientations = [preferred]
+        for fallback in [CGImagePropertyOrientation.right, .up, .left, .down] where fallback != preferred {
+            orientations.append(fallback)
+        }
+        return orientations
+    }
+
+    private func detect(_ pixelBuffer: CVPixelBuffer,
+                        request: VNCoreMLRequest,
+                        orientation: CGImagePropertyOrientation) -> [Detection] {
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation)
+        do {
+            try handler.perform([request])
+        } catch {
+            RuntimeFileLog.append("detector_failed", fields: [
+                "orientation": "\(orientation.rawValue)",
+                "error": error.localizedDescription
+            ])
+            return []
+        }
         guard let results = request.results as? [VNRecognizedObjectObservation] else { return [] }
         return results.map {
             Detection(label: $0.labels.first?.identifier ?? "object",

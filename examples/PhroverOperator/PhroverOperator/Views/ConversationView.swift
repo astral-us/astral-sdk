@@ -1,6 +1,8 @@
 import SwiftUI
 import PhroverKit
 import PhroverCloud
+import CoreImage
+import UIKit
 
 /// Voice UI. Push-to-talk (hold the mic button) rather than always-on wake-word
 /// listening — simpler and more reliable in noisy environments.
@@ -19,31 +21,38 @@ struct ConversationView: View {
     @State private var agent: MissionAgent?
     @State private var missionPhase: MissionAgent.Phase = .idle
     @State private var authorized = false
+    @State private var detector: Detector?
 
     var body: some View {
         VStack(spacing: 20) {
             Text(statusLabel).font(.headline)
+
+            LiveCameraDebugPanel(ar: ar, detector: detector)
+                .frame(maxWidth: 220)
 
             Text(speechIn.partialTranscript)
                 .foregroundStyle(.secondary)
                 .frame(minHeight: 40)
                 .multilineTextAlignment(.center)
 
-            Image(systemName: "mic.circle.fill")
-                .font(.system(size: 72))
-                .foregroundStyle(speechIn.state == .listening ? .red : .accentColor)
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { _ in startListening() }
-                        .onEnded { _ in speechIn.finish() }
-                )
+            VStack(spacing: 16) {
+                if agent != nil {
+                    Text(phaseStatusLabel)
+                        .font(.body)
+                        .padding()
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
 
-            if agent != nil {
-                Text(phaseStatusLabel)
-                    .font(.body)
-                    .padding()
-                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                Image(systemName: "mic.circle.fill")
+                    .font(.system(size: 72))
+                    .foregroundStyle(speechIn.state == .listening ? .red : .accentColor)
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in startListening() }
+                            .onEnded { _ in speechIn.finish() }
+                    )
             }
+            .padding(.bottom, 96)
 
             Spacer()
         }
@@ -51,6 +60,7 @@ struct ConversationView: View {
         .task {
             authorized = await speechIn.requestAuthorization()
             let detector = await Detector()
+            self.detector = detector
             let perception = ARPerceptionSource(ar: ar, detector: detector)
             let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
             let onDevice = OnDeviceBrain()
@@ -96,5 +106,106 @@ struct ConversationView: View {
                 await agent?.handle(utterance)
             }
         }
+    }
+}
+
+private struct LiveCameraDebugPanel: View {
+    let ar: ARSessionManager
+    let detector: Detector?
+
+    @State private var previewImage: UIImage?
+    @State private var visibleObjects: [PerceivedObject] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Group {
+                if let previewImage {
+                    Image(uiImage: previewImage)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    ZStack {
+                        Color.black.opacity(0.08)
+                        Image(systemName: "camera")
+                            .font(.title2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .frame(height: 124)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(alignment: .topLeading) {
+                Text("Live")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(.thinMaterial, in: Capsule())
+                    .padding(6)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Tracking: \(trackingLabel)")
+                Text(String(format: "Clearance: %.2f m", ar.forwardClearance))
+                Text("Detector: \(detectorStatus)")
+                Text("Visible: \(PerceptionDebugSummary.visibleObjects(visibleObjects))")
+                    .lineLimit(2)
+            }
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(.secondary)
+        }
+        .task(id: detector != nil) {
+            await refreshLoop()
+        }
+    }
+
+    private var trackingLabel: String {
+        switch ar.trackingState {
+        case .normal: return "normal"
+        case .limited: return "limited"
+        case .notAvailable: return "none"
+        @unknown default: return "?"
+        }
+    }
+
+    private var detectorStatus: String {
+        guard let detector else { return "loading" }
+        return detector.isLoaded ? "loaded" : "unavailable"
+    }
+
+    @MainActor
+    private func refreshLoop() async {
+        while !Task.isCancelled {
+            refresh()
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+    }
+
+    @MainActor
+    private func refresh() {
+        guard let buffer = ar.latestPixelBuffer else {
+            previewImage = nil
+            visibleObjects = []
+            return
+        }
+
+        previewImage = Self.previewImage(from: buffer)
+
+        guard let detector else {
+            visibleObjects = []
+            return
+        }
+
+        visibleObjects = detector.detect(buffer).map {
+            PerceivedObject(label: $0.label,
+                            confidence: $0.confidence,
+                            normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
+        }
+    }
+
+    private static func previewImage(from pixelBuffer: CVPixelBuffer) -> UIImage? {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let context = CIContext()
+        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
+        return UIImage(cgImage: cgImage, scale: UIScreen.main.scale, orientation: .right)
     }
 }

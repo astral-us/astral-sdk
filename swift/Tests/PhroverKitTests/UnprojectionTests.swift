@@ -40,6 +40,28 @@ final class UnprojectionTests: XCTestCase {
         XCTAssertNil(ARSessionManager.sampleDepth(depthMap, atVisionNormalizedPoint: CGPoint(x: 0.5, y: 0.5), imageSize: imageSize))
     }
 
+    func testForwardClearanceCatchesOffCenterObstacleInDrivingCorridor() {
+        let depthMap = Self.makeDepthBuffer(width: 20, height: 20, constantDepth: 3.5)
+        for y in 9...11 {
+            for x in 12...14 {
+                Self.setDepth(0.35, x: x, y: y, in: depthMap)
+            }
+        }
+
+        let clearance = ARSessionManager.forwardClearance(fromDepthMap: depthMap)
+
+        XCTAssertEqual(clearance, 0.35, accuracy: 0.001)
+    }
+
+    func testForwardClearanceIgnoresSingleNearOutlierInDrivingCorridor() {
+        let depthMap = Self.makeDepthBuffer(width: 20, height: 20, constantDepth: 3.5)
+        Self.setDepth(0.35, x: 10, y: 10, in: depthMap)
+
+        let clearance = ARSessionManager.forwardClearance(fromDepthMap: depthMap)
+
+        XCTAssertEqual(clearance, 3.5, accuracy: 0.001)
+    }
+
     func testUnprojectPointAtIdentityTransform() {
         // fx = fy = 500, principal point (cx, cy) = (400, 300), raw sensor 600x800.
         let intrinsics = simd_float3x3(columns: (
@@ -102,5 +124,13 @@ final class UnprojectionTests: XCTestCase {
             }
         }
         return buffer
+    }
+
+    private static func setDepth(_ depth: Float, x: Int, y: Int, in depthMap: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(depthMap, [])
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, []) }
+        let stride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+        let base = CVPixelBufferGetBaseAddress(depthMap)!.assumingMemoryBound(to: Float32.self)
+        base[y * stride + x] = depth
     }
 }
