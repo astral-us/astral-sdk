@@ -29,7 +29,12 @@ public enum RoverConfig {
 
     // MARK: - Safety
     /// If no successful command round-trip within this window, ObstacleGuard forces a stop.
-    public static let commsWatchdogTimeout: TimeInterval = 0.5
+    /// Keep this above brief planning/logging gaps; individual rover sends still retry and fail fast.
+    public static let commsWatchdogTimeout: TimeInterval = 2.0
     /// Drive-command resend period; keeps the base moving and doubles as a heartbeat.
     public static let commandInterval: TimeInterval = 0.1
+    /// Total HTTP attempts for a command when the rover WiFi link drops a packet.
+    public static let commandRetryAttempts = 3
+    /// Short retry delay between transient rover WiFi failures.
+    public static let commandRetryBackoff: TimeInterval = 0.15
 }

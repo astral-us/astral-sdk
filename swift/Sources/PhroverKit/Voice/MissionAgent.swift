@@ -127,6 +127,12 @@ public final class SpeechRoverVoice: RoverVoice {
 @MainActor
 public final class MissionAgent {
     public enum Phase: Equatable { case idle, thinking, acting, waitingForAnswer }
+    private enum VisualTargetScanResult {
+        case found(Vec2)
+        case notFound
+        case stopped
+        case cancelled
+    }
 
     public private(set) var phase: Phase = .idle {
         didSet {
@@ -152,6 +158,7 @@ public final class MissionAgent {
     private let blockedHeadingRecoveryTimeout: TimeInterval
     private let visualTargetConfidenceThreshold: Float
     private let visualTargetScanAngle: Double
+    private let visualTargetScanDelay: TimeInterval
     private let maxVisualTargetScanSteps: Int
     private let phaseDidChange: ((Phase) -> Void)?
     private let currentBrain: () -> RoverBrain?
@@ -180,6 +187,7 @@ public final class MissionAgent {
                 blockedHeadingRecoveryTimeout: TimeInterval = 1.2,
                 visualTargetConfidenceThreshold: Float = 0.90,
                 visualTargetScanAngle: Double = .pi / 6,
+                visualTargetScanDelay: TimeInterval = 3,
                 maxVisualTargetScanSteps: Int = 12,
                 phaseDidChange: ((Phase) -> Void)? = nil,
                 brainErrorLogger: @escaping (Error, MissionContext) -> Void = { error, context in
@@ -196,6 +204,7 @@ public final class MissionAgent {
         self.blockedHeadingRecoveryTimeout = blockedHeadingRecoveryTimeout
         self.visualTargetConfidenceThreshold = visualTargetConfidenceThreshold
         self.visualTargetScanAngle = visualTargetScanAngle
+        self.visualTargetScanDelay = visualTargetScanDelay
         self.maxVisualTargetScanSteps = maxVisualTargetScanSteps
         self.phaseDidChange = phaseDidChange
         self.brainErrorLogger = brainErrorLogger
@@ -333,9 +342,40 @@ public final class MissionAgent {
                                                                 lockedVisualQuery: &lockedVisualQuery,
                                                                 missionID: missionID)
                 guard let goal = resolve(effectiveTarget, missionID: missionID) else {
-                    if await scanForUnresolvedVisualTarget(effectiveTarget,
-                                                           missionID: missionID,
-                                                           scanSteps: &visualTargetScanSteps) { continue }
+                    switch await scanForUnresolvedVisualTarget(effectiveTarget,
+                                                               missionID: missionID,
+                                                               scanSteps: &visualTargetScanSteps) {
+                    case .found(let scannedGoal):
+                        visualTargetScanSteps = 0
+                        motion.navigate(to: scannedGoal)
+                        await waitForMotionToSettle()
+                        guard isCurrentMission(missionID) else {
+                            phase = .idle
+                            RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                            return
+                        }
+                        if await recoverOrStopMissionIfMotionFailed(missionID: missionID,
+                                                                    recoverFromBlockedHeading: true) { return }
+                        phase = .idle
+                        RuntimeFileLog.append("mission_target_navigation_done", fields: [
+                            "mission": "\(missionID)",
+                            "target": targetDescription(effectiveTarget)
+                        ])
+                        return
+                    case .stopped:
+                        return
+                    case .cancelled:
+                        phase = .idle
+                        RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                        return
+                    case .notFound:
+                        break
+                    }
+                    guard isCurrentMission(missionID) else {
+                        phase = .idle
+                        RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                        return
+                    }
                     if await searchForUnresolvedVisualTarget(effectiveTarget) { continue }
                     voice.speak("I couldn't quite figure out where that is.")
                     continue
@@ -522,7 +562,9 @@ public final class MissionAgent {
             "mission": "\(missionID)",
             "target": query,
             "label": match.label,
-            "confidence": String(format: "%.2f", match.confidence)
+            "confidence": String(format: "%.2f", match.confidence),
+            "direction": Self.visualTargetDirection(for: match.normalizedPoint),
+            "x": String(format: "%.2f", match.normalizedPoint.x)
         ])
         return match.normalizedPoint
     }
@@ -557,23 +599,157 @@ public final class MissionAgent {
             .lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty && !stopWords.contains($0) }
+            .map(canonicalVisualToken)
+    }
+
+    private static func canonicalVisualToken(_ token: String) -> String {
+        switch token {
+        case "fridge", "fridges":
+            return "refrigerator"
+        case "refrigerators":
+            return "refrigerator"
+        case "tvs", "television", "televisions":
+            return "tv"
+        default:
+            return token
+        }
+    }
+
+    static func visualTargetDirection(for normalizedPoint: CGPoint) -> String {
+        switch normalizedPoint.x {
+        case ..<0.42:
+            return "left"
+        case 0.58...:
+            return "right"
+        default:
+            return "ahead"
+        }
     }
 
     private func scanForUnresolvedVisualTarget(_ target: NavigationTarget,
                                                missionID: Int,
-                                               scanSteps: inout Int) async -> Bool {
-        guard case .visualQuery(let query) = target else { return false }
-        guard scanSteps < maxVisualTargetScanSteps else { return false }
-        scanSteps += 1
-        RuntimeFileLog.append("mission_target_scan_step", fields: [
+                                               scanSteps: inout Int) async -> VisualTargetScanResult {
+        guard case .visualQuery(let query) = target else { return .notFound }
+        while scanSteps < maxVisualTargetScanSteps {
+            switch await waitForVisualTarget(query: query, missionID: missionID) {
+            case .found(let goal):
+                return .found(goal)
+            case .noVisibleObjects:
+                stopBecauseNoObjectsAreVisible(missionID: missionID, target: query)
+                return .stopped
+            case .cancelled:
+                return .cancelled
+            case .timedOut:
+                break
+            }
+            guard isCurrentMission(missionID) else { return .cancelled }
+
+            scanSteps += 1
+            let angle = visualTargetScanAngle(forScanStep: scanSteps)
+            RuntimeFileLog.append("mission_target_scan_step", fields: [
+                "mission": "\(missionID)",
+                "target": query,
+                "step": "\(scanSteps)",
+                "max": "\(maxVisualTargetScanSteps)",
+                "angle": String(format: "%.0fdeg", angle * 180 / .pi)
+            ])
+            await motion.rotate(by: angle)
+            guard isCurrentMission(missionID) else { return .cancelled }
+
+            if let goal = resolve(.visualQuery(query), missionID: missionID) {
+                return .found(goal)
+            }
+        }
+
+        RuntimeFileLog.append("mission_target_scan_exhausted", fields: [
             "mission": "\(missionID)",
             "target": query,
-            "step": "\(scanSteps)",
-            "max": "\(maxVisualTargetScanSteps)",
-            "angle": String(format: "%.0fdeg", visualTargetScanAngle * 180 / .pi)
+            "steps": "\(scanSteps)"
         ])
-        await motion.rotate(by: visualTargetScanAngle)
-        return true
+        return .notFound
+    }
+
+    private enum VisualTargetWaitResult {
+        case found(Vec2)
+        case timedOut
+        case noVisibleObjects
+        case cancelled
+    }
+
+    private func waitForVisualTarget(query: String, missionID: Int) async -> VisualTargetWaitResult {
+        if visualTargetScanDelay <= 0 {
+            guard isCurrentMission(missionID) else { return .cancelled }
+            let objects = perception.detectObjects()
+            guard !objects.isEmpty else { return .noVisibleObjects }
+            if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
+               let goal = perception.unproject(normalizedPoint: point) {
+                return .found(goal)
+            }
+            return .timedOut
+        }
+
+        let deadline = Date().addingTimeInterval(visualTargetScanDelay)
+        while Date() < deadline {
+            guard isCurrentMission(missionID) else { return .cancelled }
+            let objects = perception.detectObjects()
+            guard !objects.isEmpty else { return .noVisibleObjects }
+            if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
+               let goal = perception.unproject(normalizedPoint: point) {
+                RuntimeFileLog.append("mission_target_scan_wait_match", fields: [
+                    "mission": "\(missionID)",
+                    "target": query
+                ])
+                return .found(goal)
+            }
+            let sleepSeconds = min(0.2, max(0.01, visualTargetScanDelay))
+            try? await Task.sleep(for: .seconds(sleepSeconds))
+        }
+
+        RuntimeFileLog.append("mission_target_scan_wait_timeout", fields: [
+            "mission": "\(missionID)",
+            "target": query,
+            "seconds": String(format: "%.2f", visualTargetScanDelay)
+        ])
+        return .timedOut
+    }
+
+    private func lockedVisualTargetPoint(query: String,
+                                         objects: [PerceivedObject],
+                                         missionID: Int) -> CGPoint? {
+        guard let match = Self.bestVisualTargetMatch(query: query,
+                                                     objects: objects,
+                                                     minimumConfidence: visualTargetConfidenceThreshold) else {
+            RuntimeFileLog.append("mission_target_not_locked", fields: [
+                "mission": "\(missionID)",
+                "target": query,
+                "visible": visibleObjectsLogSummary(objects),
+                "threshold": String(format: "%.2f", visualTargetConfidenceThreshold)
+            ])
+            return nil
+        }
+        RuntimeFileLog.append("mission_target_match", fields: [
+            "mission": "\(missionID)",
+            "target": query,
+            "label": match.label,
+            "confidence": String(format: "%.2f", match.confidence),
+            "direction": Self.visualTargetDirection(for: match.normalizedPoint),
+            "x": String(format: "%.2f", match.normalizedPoint.x)
+        ])
+        return match.normalizedPoint
+    }
+
+    private func stopBecauseNoObjectsAreVisible(missionID: Int, target: String) {
+        motion.cancel()
+        voice.speak("I can't see any objects to track.")
+        phase = .idle
+        RuntimeFileLog.append("mission_visible_none_stop", fields: [
+            "mission": "\(missionID)",
+            "target": target
+        ])
+    }
+
+    private func visualTargetScanAngle(forScanStep step: Int) -> Double {
+        step.isMultiple(of: 2) ? -visualTargetScanAngle : visualTargetScanAngle
     }
 
     private func searchForUnresolvedVisualTarget(_ target: NavigationTarget) async -> Bool {

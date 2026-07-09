@@ -51,13 +51,100 @@ public actor RoverControl {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = RoverConfig.commsWatchdogTimeout
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue("close", forHTTPHeaderField: "Connection")
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
 
-        let (_, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else { throw RoverControlError.invalidResponse }
-        guard (200...299).contains(http.statusCode) else {
-            throw RoverControlError.serverError(http.statusCode)
+        let attempts = max(1, RoverConfig.commandRetryAttempts)
+        var lastError: Error?
+
+        for attempt in 1...attempts {
+            var didLogResponse = false
+            do {
+                let (_, response) = try await session.data(for: req)
+                guard let http = response as? HTTPURLResponse else {
+                    RuntimeFileLog.append("rover_command_request", fields: Self.requestLogFields(url: url,
+                                                                                                  attempt: attempt,
+                                                                                                  maxAttempts: attempts,
+                                                                                                  statusCode: nil,
+                                                                                                  error: RoverControlError.invalidResponse))
+                    didLogResponse = true
+                    throw RoverControlError.invalidResponse
+                }
+                RuntimeFileLog.append("rover_command_request", fields: Self.requestLogFields(url: url,
+                                                                                              attempt: attempt,
+                                                                                              maxAttempts: attempts,
+                                                                                              statusCode: http.statusCode,
+                                                                                              error: nil))
+                didLogResponse = true
+                guard (200...299).contains(http.statusCode) else {
+                    throw RoverControlError.serverError(http.statusCode)
+                }
+                lastAckAt = Date()
+                return
+            } catch {
+                lastError = error
+                if !didLogResponse {
+                    RuntimeFileLog.append("rover_command_request", fields: Self.requestLogFields(url: url,
+                                                                                                  attempt: attempt,
+                                                                                                  maxAttempts: attempts,
+                                                                                                  statusCode: nil,
+                                                                                                  error: error))
+                }
+                guard attempt < attempts, Self.isRetryableTransportError(error) else {
+                    throw error
+                }
+
+                RuntimeFileLog.append("rover_command_retry", fields: [
+                    "attempt": "\(attempt)",
+                    "max": "\(attempts)",
+                    "error": error.localizedDescription
+                ])
+                try? await Task.sleep(for: .seconds(RoverConfig.commandRetryBackoff))
+            }
         }
-        lastAckAt = Date()
+
+        throw lastError ?? RoverControlError.invalidResponse
+    }
+
+    static func requestLogFields(url: URL,
+                                 attempt: Int,
+                                 maxAttempts: Int,
+                                 statusCode: Int?,
+                                 error: Error?) -> [String: String] {
+        var fields: [String: String] = [
+            "url": url.absoluteString,
+            "attempt": "\(attempt)",
+            "max": "\(maxAttempts)"
+        ]
+        if let statusCode {
+            fields["status"] = "\(statusCode)"
+        } else if error != nil {
+            fields["status"] = "transport_error"
+        } else {
+            fields["status"] = "unknown"
+        }
+        if let error {
+            fields["error"] = error.localizedDescription
+        }
+        return fields
+    }
+
+    private static func isRetryableTransportError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else { return false }
+
+        switch URLError.Code(rawValue: nsError.code) {
+        case .timedOut,
+             .cannotConnectToHost,
+             .networkConnectionLost,
+             .notConnectedToInternet,
+             .cannotFindHost,
+             .dnsLookupFailed:
+            return true
+        default:
+            return false
+        }
     }
 }
 

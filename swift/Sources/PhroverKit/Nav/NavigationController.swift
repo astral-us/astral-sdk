@@ -45,6 +45,13 @@ public final class NavigationController {
             state = .failed("No path to goal.")
             return
         }
+        RuntimeFileLog.append("nav_goal_start", fields: [
+            "goal_x": Self.formatMeters(goal.x),
+            "goal_y": Self.formatMeters(goal.y),
+            "pose_x": Self.formatMeters(start.x),
+            "pose_y": Self.formatMeters(start.y),
+            "distance_to_goal": Self.formatMeters(start.distance(to: goal))
+        ])
         state = .driving
         loop = Task { await drive(to: goal) }
     }
@@ -79,6 +86,7 @@ public final class NavigationController {
 
     private func drive(to goal: Vec2) async {
         var hasSentCommand = false
+        var consecutiveCommandFailures = 0
         while !Task.isCancelled {
             guard let pose = ar.pose else { break }
 
@@ -88,8 +96,10 @@ public final class NavigationController {
 
             // Safety gate.
             let lastAck = await control.lastAckAt
+            let now = Date()
             let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
                                                lastAckAt: lastAck,
+                                               now: now,
                                                feedback: nil,
                                                requireFreshAck: hasSentCommand)
             switch decision {
@@ -107,7 +117,10 @@ public final class NavigationController {
             case .stopCommsLost:
                 try? await control.stop()
                 state = .failed("Rover command link lost.")
-                RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "comms_lost"])
+                RuntimeFileLog.append("nav_safety_stop", fields: [
+                    "reason": "comms_lost",
+                    "ack_age": Self.ackAgeField(lastAckAt: lastAck, now: now)
+                ])
                 return
             case .stopTipping:
                 try? await control.stop()
@@ -122,10 +135,28 @@ public final class NavigationController {
                 state = .arrived
                 return
             }
+            var telemetry = Self.driveTelemetryFields(pose: pose,
+                                                       goal: goal,
+                                                       command: out.command,
+                                                       consecutiveCommandFailures: consecutiveCommandFailures)
+            telemetry["forward_clearance"] = Self.formatMeters(ar.forwardClearance)
+            telemetry["path_points"] = "\(path.count)"
+            RuntimeFileLog.append("nav_drive_tick", fields: telemetry)
             do {
                 try await control.send(out.command)
+                consecutiveCommandFailures = 0
                 hasSentCommand = true
             } catch {
+                consecutiveCommandFailures += 1
+                RuntimeFileLog.append("nav_command_send_failed", fields: Self.driveTelemetryFields(
+                    pose: pose,
+                    goal: goal,
+                    command: out.command,
+                    consecutiveCommandFailures: consecutiveCommandFailures
+                ).merging([
+                    "error": error.localizedDescription,
+                    "max_failures": "1"
+                ]) { current, _ in current })
                 try? await control.stop()
                 state = Self.stateAfterCommandFailure(error)
                 RuntimeFileLog.append("nav_command_failed", fields: [
@@ -160,8 +191,10 @@ public final class NavigationController {
             }
 
             let lastAck = await control.lastAckAt
+            let now = Date()
             let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
                                                lastAckAt: lastAck,
+                                               now: now,
                                                feedback: nil,
                                                requireFreshAck: hasSentCommand,
                                                checkForwardObstacle: false)
@@ -179,7 +212,10 @@ public final class NavigationController {
             case .stopCommsLost:
                 try? await control.stop()
                 state = .failed("Rover command link lost.")
-                RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "comms_lost_while_rotating"])
+                RuntimeFileLog.append("nav_safety_stop", fields: [
+                    "reason": "comms_lost_while_rotating",
+                    "ack_age": Self.ackAgeField(lastAckAt: lastAck, now: now)
+                ])
                 return
             case .stopTipping:
                 try? await control.stop()
@@ -189,6 +225,15 @@ public final class NavigationController {
             }
 
             let cmd = RotationCommand.command(forYawError: error)
+            RuntimeFileLog.append("nav_rotate_tick", fields: [
+                "pose_x": Self.formatMeters(pose.position.x),
+                "pose_y": Self.formatMeters(pose.position.y),
+                "pose_yaw_deg": Self.formatDegrees(pose.yaw),
+                "target_yaw_deg": Self.formatDegrees(targetYaw),
+                "yaw_error_deg": Self.formatDegrees(error),
+                "wheel_left": Self.formatMeters(cmd.left),
+                "wheel_right": Self.formatMeters(cmd.right)
+            ])
             do {
                 try await control.send(cmd)
                 hasSentCommand = true
@@ -217,8 +262,38 @@ public final class NavigationController {
         .failed("Rover command failed: \(error.localizedDescription)")
     }
 
+    static func driveTelemetryFields(pose: Pose2D,
+                                     goal: Vec2,
+                                     command: WheelCommand,
+                                     consecutiveCommandFailures: Int) -> [String: String] {
+        [
+            "goal_x": formatMeters(goal.x),
+            "goal_y": formatMeters(goal.y),
+            "pose_x": formatMeters(pose.position.x),
+            "pose_y": formatMeters(pose.position.y),
+            "pose_yaw_deg": formatDegrees(pose.yaw),
+            "distance_to_goal": formatMeters(pose.position.distance(to: goal)),
+            "wheel_left": formatMeters(command.left),
+            "wheel_right": formatMeters(command.right),
+            "command_failures": "\(consecutiveCommandFailures)"
+        ]
+    }
+
+    static func ackAgeField(lastAckAt: Date?, now: Date = Date()) -> String {
+        guard let lastAckAt else { return "none" }
+        return String(format: "%.2f", now.timeIntervalSince(lastAckAt))
+    }
+
     private static func obstacleMessage(clearance: Double) -> String {
         String(format: "Obstacle ahead at %.2f m.", clearance)
+    }
+
+    private static func formatMeters(_ value: Double) -> String {
+        String(format: "%.2f", value)
+    }
+
+    private static func formatDegrees(_ radians: Double) -> String {
+        String(format: "%.0f", radians * 180 / .pi)
     }
 }
 

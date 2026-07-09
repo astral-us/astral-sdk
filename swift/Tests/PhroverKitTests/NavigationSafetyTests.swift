@@ -56,6 +56,47 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertEqual(decision, .stopCommsLost)
     }
 
+    func testDefaultWatchdogToleratesShortCommandLoopGap() {
+        let guardLayer = ObstacleGuard()
+        let decision = guardLayer.evaluate(
+            forwardClearance: 2.0,
+            lastAckAt: Date(timeIntervalSince1970: 10.0),
+            now: Date(timeIntervalSince1970: 11.2),
+            feedback: nil,
+            requireFreshAck: true
+        )
+
+        XCTAssertEqual(decision, .go)
+    }
+
+    func testDefaultWatchdogStopsLongCommandLoopGap() {
+        let guardLayer = ObstacleGuard()
+        let decision = guardLayer.evaluate(
+            forwardClearance: 2.0,
+            lastAckAt: Date(timeIntervalSince1970: 10.0),
+            now: Date(timeIntervalSince1970: 12.1),
+            feedback: nil,
+            requireFreshAck: true
+        )
+
+        XCTAssertEqual(decision, .stopCommsLost)
+    }
+
+    func testAckAgeFieldFormatsCurrentAckAge() {
+        let value = NavigationController.ackAgeField(
+            lastAckAt: Date(timeIntervalSince1970: 10.0),
+            now: Date(timeIntervalSince1970: 11.234)
+        )
+
+        XCTAssertEqual(value, "1.23")
+    }
+
+    func testAckAgeFieldReportsMissingAck() {
+        let value = NavigationController.ackAgeField(lastAckAt: nil)
+
+        XCTAssertEqual(value, "none")
+    }
+
     func testForwardObstacleCanBeIgnoredForInPlaceRotation() {
         let guardLayer = ObstacleGuard(stopDistance: 0.45)
         let decision = guardLayer.evaluate(
@@ -66,6 +107,25 @@ final class NavigationSafetyTests: XCTestCase {
         )
 
         XCTAssertEqual(decision, .go)
+    }
+
+    func testNavigationTelemetryFieldsIncludeGoalPoseDistanceAndWheelCommand() {
+        let fields = NavigationController.driveTelemetryFields(
+            pose: Pose2D(position: Vec2(1.0, 2.0), yaw: .pi / 2),
+            goal: Vec2(1.0, 3.0),
+            command: WheelCommand(left: 0.12, right: 0.34),
+            consecutiveCommandFailures: 1
+        )
+
+        XCTAssertEqual(fields["goal_x"], "1.00")
+        XCTAssertEqual(fields["goal_y"], "3.00")
+        XCTAssertEqual(fields["pose_x"], "1.00")
+        XCTAssertEqual(fields["pose_y"], "2.00")
+        XCTAssertEqual(fields["pose_yaw_deg"], "90")
+        XCTAssertEqual(fields["distance_to_goal"], "1.00")
+        XCTAssertEqual(fields["wheel_left"], "0.12")
+        XCTAssertEqual(fields["wheel_right"], "0.34")
+        XCTAssertEqual(fields["command_failures"], "1")
     }
 }
 
