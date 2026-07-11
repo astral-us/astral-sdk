@@ -23,6 +23,112 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(agent.phase, .idle)
     }
 
+    func testVisualTargetMissionStopsAfterArrival() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.34, y: 0.5))
+        ]
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [
+            .navigate(.visualQuery("the refrigerator")),
+            .navigate(.visualQuery("the refrigerator")),
+        ])
+        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { brain }
+
+        await agent.handle("go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [perception.unprojectResult])
+        XCTAssertEqual(brain.seenContexts.count, 1)
+        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testStalledVisualNavigationScansAndResumesWithFreshTarget() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.failed("Navigation stalled."), .arrived]
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.34, y: 0.5))
+        ]
+        motion.onNavigate = { callCount in
+            if callCount == 1 {
+                perception.objects = [
+                    PerceivedObject(label: "book",
+                                    confidence: 0.99,
+                                    normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+                ]
+            }
+        }
+        motion.onRotate = { _ in
+            perception.objects = [
+                PerceivedObject(label: "refrigerator",
+                                confidence: 0.98,
+                                normalizedPoint: CGPoint(x: 0.52, y: 0.5))
+            ]
+        }
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("the refrigerator")), .done])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 visualTargetScanDelay: 0,
+                                 currentBrain: { brain })
+
+        await agent.handle("go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [perception.unprojectResult, perception.unprojectResult])
+        XCTAssertEqual(motion.rotateCalls, [.pi / 6])
+        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testBlockedVisualNavigationSlowlyScansUntilConfidentTargetIsReacquired() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.failed("Obstacle ahead at 0.42 m."), .arrived]
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.25, y: 0.5))
+        ]
+        perception.unprojectResult = Vec2(1, 2)
+        motion.onNavigate = { callCount in
+            guard callCount == 1 else { return }
+            perception.objects = [
+                PerceivedObject(label: "refrigerator",
+                                confidence: 0.89,
+                                normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+            ]
+            perception.unprojectResult = Vec2(3, 4)
+        }
+        motion.onScanRotate = { _ in
+            perception.objects = [
+                PerceivedObject(label: "refrigerator",
+                                confidence: 0.95,
+                                normalizedPoint: CGPoint(x: 0.72, y: 0.5))
+            ]
+        }
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("the refrigerator")), .done])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 visualTargetScanDelay: 0,
+                                 currentBrain: { brain })
+
+        await agent.handle("go to the refrigerator")
+
+        XCTAssertEqual(motion.scanRotateCalls, [.pi / 6])
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1, 2), Vec2(3, 4)])
+        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
     func testLooksAroundWhenNothingVisible() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -35,7 +141,7 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(motion.rotateCalls, [.pi])
     }
 
-    func testSearchesOpeningWhenVisualTargetIsNotCurrentlyDetected() async {
+    func testDoesNotDriveToOpeningWhenVisualTargetIsNotCurrentlyDetected() async {
         let motion = FakeMotion()
         let perception = FakePerception()
         perception.objects = [
@@ -56,8 +162,8 @@ final class MissionAgentTests: XCTestCase {
         await agent.handle("go to the chair")
 
         XCTAssertEqual(motion.rotateCalls, [.pi / 6])
-        XCTAssertEqual(motion.navigateCalls, [Vec2(2, 1)])
-        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        XCTAssertEqual(voice.spoken, ["I couldn't quite figure out where that is."])
     }
 
     func testStopsMissionWhenRoverCommandFails() async {
@@ -164,25 +270,82 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(voice.spoken, ["I couldn't quite figure out where that is."])
     }
 
-    func testStopsOperatingWhenNoObjectsAreVisibleForVisualTarget() async {
+    func testScansBeforeGivingUpWhenNoObjectsAreVisibleForVisualTarget() async {
         let motion = FakeMotion()
         let perception = FakePerception()
-        perception.frontiers = [Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5)]
         let voice = FakeVoice()
         let brain = FakeBrain(script: [.navigate(.visualQuery("chair")), .done])
         let agent = MissionAgent(motion: motion,
                                  perception: perception,
                                  voice: voice,
                                  visualTargetScanDelay: 0,
+                                 maxVisualTargetScanSteps: 2,
+                                 currentBrain: { brain })
+
+        await agent.handle("go to the chair")
+
+        XCTAssertEqual(motion.rotateCalls, [.pi / 6, -.pi / 3])
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        XCTAssertEqual(brain.seenContexts.count, 2)
+        XCTAssertEqual(voice.spoken, ["I couldn't quite figure out where that is."])
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testScansSlowlyWhenTargetIsOutOfViewAndNoObjectsAreVisible() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        motion.onRotate = { _ in
+            perception.objects = [
+                PerceivedObject(label: "chair",
+                                confidence: 0.95,
+                                normalizedPoint: CGPoint(x: 0.45, y: 0.5))
+            ]
+        }
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("chair")), .done])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 visualTargetScanDelay: 0.01,
                                  maxVisualTargetScanSteps: 3,
                                  currentBrain: { brain })
 
         await agent.handle("go to the chair")
 
-        XCTAssertTrue(motion.rotateCalls.isEmpty)
-        XCTAssertTrue(motion.navigateCalls.isEmpty)
         XCTAssertEqual(brain.seenContexts.count, 1)
-        XCTAssertEqual(voice.spoken, ["I can't see any objects to track."])
+        XCTAssertEqual(motion.rotateCalls, [.pi / 6])
+        XCTAssertEqual(motion.navigateCalls, [perception.unprojectResult])
+        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testWaitsForDetectorAfterScanTurnBeforeGivingUp() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        motion.onRotate = { _ in
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(20))
+                perception.objects = [
+                    PerceivedObject(label: "chair",
+                                    confidence: 0.95,
+                                    normalizedPoint: CGPoint(x: 0.52, y: 0.5))
+                ]
+            }
+        }
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("chair")), .done])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 visualTargetScanDelay: 0.05,
+                                 maxVisualTargetScanSteps: 1,
+                                 currentBrain: { brain })
+
+        await agent.handle("go to the chair")
+
+        XCTAssertEqual(motion.rotateCalls, [.pi / 6])
+        XCTAssertEqual(motion.navigateCalls, [perception.unprojectResult])
+        XCTAssertTrue(voice.spoken.isEmpty)
         XCTAssertEqual(agent.phase, .idle)
     }
 
@@ -295,7 +458,7 @@ final class MissionAgentTests: XCTestCase {
         await agent.handle("go to the chair")
 
         XCTAssertEqual(brain.seenContexts.count, 1)
-        XCTAssertEqual(motion.rotateCalls, [.pi / 6, -.pi / 6])
+        XCTAssertEqual(motion.rotateCalls, [.pi / 6, -.pi / 3])
         XCTAssertEqual(motion.navigateCalls, [perception.unprojectResult])
         XCTAssertTrue(voice.spoken.isEmpty)
     }
@@ -631,20 +794,26 @@ private final class FakeMotion: RoverMotion {
     var state: NavigationController.State = .idle
     private(set) var navigateCalls: [Vec2] = []
     private(set) var rotateCalls: [Double] = []
+    private(set) var scanRotateCalls: [Double] = []
     private(set) var cancelCallCount = 0
     /// What `state` settles to shortly after `navigate(to:)` — simulates the real drive
     /// loop reaching `.arrived` asynchronously.
     var navigateOutcome: NavigationController.State = .arrived
+    var navigateOutcomes: [NavigationController.State] = []
     var rotateNeverCompletes = false
     var rotateDelay: TimeInterval = 0
+    var onNavigate: ((Int) -> Void)?
     var onRotate: ((Double) -> Void)?
+    var onScanRotate: ((Double) -> Void)?
 
     func navigate(to goal: Vec2) {
         navigateCalls.append(goal)
+        onNavigate?(navigateCalls.count)
         state = .driving
+        let outcome = navigateOutcomes.isEmpty ? navigateOutcome : navigateOutcomes.removeFirst()
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(20))
-            state = navigateOutcome
+            state = outcome
         }
     }
 
@@ -662,6 +831,12 @@ private final class FakeMotion: RoverMotion {
             return
         }
         state = .arrived
+    }
+
+    func rotateForScan(by angle: Double) async {
+        scanRotateCalls.append(angle)
+        onScanRotate?(angle)
+        await rotate(by: angle)
     }
 
     func cancel() {

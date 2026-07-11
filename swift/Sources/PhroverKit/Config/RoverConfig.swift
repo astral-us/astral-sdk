@@ -26,6 +26,11 @@ public enum RoverConfig {
     /// The autonomous rotate loop may compute a smaller speed from yaw error, but values
     /// below this can make interpreted voice turns appear to do nothing.
     public static let minimumRotateWheelSpeed = 0.25
+    /// Search turns pulse the motors instead of spinning continuously. The pause gives
+    /// ARKit pose and Core ML detection a stable camera frame between heading changes.
+    public static let scanTurnPulseDuration: TimeInterval = 0.08
+    public static let scanTurnSettleDuration: TimeInterval = 0.30
+    public static let scanTurnYawTolerance = 7.0 * Double.pi / 180.0
 
     // MARK: - Safety
     /// If no successful command round-trip within this window, ObstacleGuard forces a stop.

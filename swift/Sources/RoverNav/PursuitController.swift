@@ -13,6 +13,7 @@ public struct PursuitController: Sendable {
         public var goalTolerance: Double     // m — position error to declare arrival
         public var rotateInPlaceAngle: Double // rad — above this heading error, spin first
         public var slowdownRadius: Double    // m — start easing off within this range of goal
+        public var minimumRotateWheelSpeed: Double // m/s — overcome drivetrain static friction
 
         public init(lookahead: Double = 0.5,
                     maxLinear: Double = 0.35,
@@ -20,7 +21,8 @@ public struct PursuitController: Sendable {
                     wheelBase: Double = 0.13,
                     goalTolerance: Double = 0.2,
                     rotateInPlaceAngle: Double = 0.7,
-                    slowdownRadius: Double = 0.6) {
+                    slowdownRadius: Double = 0.6,
+                    minimumRotateWheelSpeed: Double = 0) {
             self.lookahead = lookahead
             self.maxLinear = maxLinear
             self.maxAngular = maxAngular
@@ -28,6 +30,7 @@ public struct PursuitController: Sendable {
             self.goalTolerance = goalTolerance
             self.rotateInPlaceAngle = rotateInPlaceAngle
             self.slowdownRadius = slowdownRadius
+            self.minimumRotateWheelSpeed = minimumRotateWheelSpeed
         }
     }
 
@@ -65,8 +68,12 @@ public struct PursuitController: Sendable {
         // Large heading error (or target behind): rotate in place toward it.
         if abs(headingErr) > params.rotateInPlaceAngle {
             let w = clamp(headingErr * 2.0, -params.maxAngular, params.maxAngular)
+            let wheels = DifferentialDrive.wheels(v: 0,
+                                                   w: w,
+                                                   wheelBase: params.wheelBase,
+                                                   maxWheelSpeed: params.maxLinear)
             return Output(
-                command: DifferentialDrive.wheels(v: 0, w: w, wheelBase: params.wheelBase, maxWheelSpeed: params.maxLinear),
+                command: wheels.withMinimumMagnitude(params.minimumRotateWheelSpeed),
                 reachedGoal: false)
         }
 
@@ -96,6 +103,17 @@ public struct PursuitController: Sendable {
             i += 1
         }
         return goal
+    }
+}
+
+private extension WheelCommand {
+    func withMinimumMagnitude(_ minimum: Double) -> WheelCommand {
+        guard minimum > 0 else { return self }
+        func adjusted(_ value: Double) -> Double {
+            guard value != 0 else { return 0 }
+            return value.sign == .minus ? -max(abs(value), minimum) : max(abs(value), minimum)
+        }
+        return WheelCommand(left: adjusted(left), right: adjusted(right))
     }
 }
 

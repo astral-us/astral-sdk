@@ -11,7 +11,8 @@ appear as July 8, 2026 UTC.
 - Latest fix commit: `39e6bba Reset on-device brain session per decision`
 - Latest uncommitted update: runtime mission logging, rover command failure handling,
   app-start feedback enablement, wider LiDAR clearance sampling, requested-object scan
-  locking, rover command retry handling, and a less brittle comms watchdog.
+  locking, rover command retry handling, a less brittle comms watchdog, and post-turn
+  detector polling during visual-target scan.
 
 ## Pulled Logs
 
@@ -43,6 +44,11 @@ appear as July 8, 2026 UTC.
   `/private/tmp/phrover-documents-20260709-stop-visible-direction/phrover-runtime.log`
 - App document pull for recognized refrigerator command followed by false command-link loss:
   `/private/tmp/phrover-documents-20260709-latest-pull/phrover-runtime.log`
+- App document pull for visual-target arrival followed by an unnecessary second brain
+  decision:
+  `/private/tmp/phrover-documents-20260709-after-commit-pull/phrover-runtime.log`
+- App document pull for slow camera/object-detection behavior after scan turns:
+  `/private/tmp/phrover-documents-20260709-camera-slow/phrover-runtime.log`
 
 Key log findings:
 
@@ -147,6 +153,28 @@ Key log findings:
   - Around `2026-07-09T18:05:27Z` through `18:05:29Z`, the app repeatedly logged
     `visible=none`, but the scan loop continued to rotate. This made the rover keep operating
     even though the camera/detector had no object to track.
+- The latest July 9 pull showed a completed visual-target approach being treated as an
+  unfinished mission:
+  - `2026-07-09T22:16:37Z` received `Go to the refrigerator`.
+  - `2026-07-09T22:16:41Z` matched `refrigerator` at `0.99` confidence with
+    `direction=left`, then started navigation to the grounded point.
+  - From `2026-07-09T22:16:41Z` through `22:17:27Z`, `rover_command_request` entries
+    returned `status=200`, so this was not a rover HTTP transport failure.
+  - `2026-07-09T22:17:27Z` logged `nav_safety_stop clearance=0.34 reason=obstacle
+    state=arrived` and `motion_settled state=arrived`.
+  - Immediately after that, the same mission logged another `mission_thinking` and a second
+    `mission_decision navigate(visualQuery(the refrigerator))`, then stopped because
+    `visible=none`. The direct visual-target path did not treat `.arrived` as terminal.
+- The camera-slow pull showed the device app was not yet running all local fixes, but also
+  confirmed the detector timing risk in the local scan code:
+  - The pulled log still contained `mission_visible_none_stop`, which the local code had
+    already removed, so the installed iPhone build was behind this branch.
+  - `2026-07-09T22:57:47Z` received `Go to the refrigerator`.
+  - `2026-07-09T22:57:51Z` matched `refrigerator` at high confidence and started visual
+    navigation, proving the camera/detector path can work when the target is in frame.
+  - Local code review found that after each 30-degree scan turn, `MissionAgent` could check
+    the detector immediately against a stale frame. If the next camera/detector result
+    arrived a few milliseconds later, the scan could miss it and give up too early.
 
 ## Issues And Fixes
 
@@ -184,11 +212,13 @@ Key log findings:
 | Object detection crashed or logged a GPU background permission error. | Device log showed `Insufficient Permission (to submit GPU work from background)` from `model0_main__Op2_MpsGraphInference` on the Apple A17 Pro GPU. That means CoreML/Vision was trying to submit Metal work while the app was backgrounded or winding down. | `Detector` now loads the CoreML model with `.cpuAndNeuralEngine`, excluding GPU execution so live preview or mission perception cannot submit forbidden background Metal command buffers. | Uncommitted |
 | Talk stayed stuck after obstacle recovery with no new rover action. | Pulled `/private/tmp/phrover-documents-20260709-log-pull/phrover-runtime.log`. The latest run logged `voice_command_received utterance=Go to the refrigerator`, `mission_target_match confidence=1.00`, then `mission_blocked_heading_recovery_timeout`. After that it logged `mission_thinking ... objects=bed:0.93` but no later `mission_decision` before `Stop`, proving the brain decision call hung. | `MissionAgent` now enforces a brain-decision timeout. If `brain.nextAction` does not return, the mission logs `mission_brain_timeout`, speaks the thinking-error message, exits the loop, and returns to Ready instead of staying busy forever. | Uncommitted |
 | Target was detected, but navigation later failed with `Rover command link lost.` | Pulled `/private/tmp/phrover-documents-20260709-retry-log-pull/phrover-runtime.log`. The command `Go to the refrigerator` was heard, the detector saw `refrigerator` at `0.99`, the target match was `0.97`, and clearance stayed mostly above `1 m`. Navigation failed later with `nav_safety_stop reason=comms_lost`, so the remaining failure was the HTTP command/heartbeat link to the rover. | `RoverControl` now retries transient URL transport failures once after a short backoff and writes `rover_command_retry` to `phrover-runtime.log`. It does not retry encoding failures, invalid responses, or rover HTTP server errors. | Uncommitted |
-| Visual target scan kept operating when no objects were visible. | Pulled `/private/tmp/phrover-documents-20260709-stop-visible-direction/phrover-runtime.log`. The app logged `visible=none` repeatedly during a target scan, but the mission continued rotating. | During requested-object scan, `MissionAgent` now stops motion, speaks `I can't see any objects to track.`, returns to Ready, and logs `mission_visible_none_stop` as soon as detector output is empty. | Uncommitted |
+| Requested-object scan could stall when the target was out of view and detector output was empty. | The previous visible-none fix stopped immediately on empty detector output. That avoided blind movement, but it also meant commands such as `go to the chair` could stall if the requested object was just outside the current camera view. | `MissionAgent` now waits 1 second for detector output, then continues the same locked target search with slow stepped 30-degree left/right scan turns. Empty detector frames are no longer terminal during this scan; the rover gives the detector time to load new frames between steps and only gives up after the configured scan-step limit. | Uncommitted |
+| Camera/object detection was not fast enough after a scan turn. | The camera-slow pull showed target detection can work, but local code could rotate and immediately check object detection before Vision/CoreML had produced a fresh frame for the new heading. In tests, a target appearing 20 ms after rotation was missed. | After every scan turn, `MissionAgent` now waits for the requested target instead of doing a single immediate check. The wait loop polls multiple times inside the scan-delay window, so a slightly delayed detector frame can lock the target and navigate without another brain decision. | Uncommitted |
 | Stop command did not cancel an active requested-object scan immediately. | The same log showed `voice_command_stop` entries followed by continued `mission_target_not_locked` and `mission_target_scan_step` activity in the previous mission. | The visual-target scan loop now checks mission validity after each wait and after each rotate, returns `.cancelled`, and exits the mission instead of continuing after `stop`. | Uncommitted |
 | Requested target direction was not explicit, and `fridge` did not match `refrigerator`. | The log showed target `the fridge` while visible labels included `refrigerator:0.99`, but no target lock happened. | Visual target matching now canonicalizes common aliases such as `fridge` to `refrigerator`, and target matches log `direction=left/ahead/right` plus normalized `x` so the app can explain which way the object is from the camera frame. | Uncommitted |
 | After target lock, the rover command link timed out without enough movement telemetry to diagnose the path. | Pulled `/private/tmp/phrover-documents-20260709-current-analysis/phrover-runtime.log`. The app heard `Go to the refrigerator`, matched `refrigerator` at `0.99`, and logged `direction=left`, but later failed with `nav_command_failed error=The request timed out.` The log did not include goal point, pose, distance-to-goal, wheel command, or request status for each HTTP attempt. | Navigation now logs `nav_goal_start`, `nav_drive_tick`, `nav_rotate_tick`, and `nav_command_send_failed` with goal, pose, distance, wheel speeds, clearance, and command-failure count. `RoverControl` now logs every `rover_command_request` with request URL and HTTP status or transport error, sends `Connection: close` / `Cache-Control: no-cache` to avoid stale ESP32 HTTP connections, and allows 3 transient attempts before failing. | Uncommitted |
 | Navigation reported `Rover command link lost` even though rover HTTP requests were succeeding. | Pulled `/private/tmp/phrover-documents-20260709-latest-pull/phrover-runtime.log`. The app heard `Go to the refrigerator`, matched the requested object at `0.97`, and logged many `rover_command_request` entries with `status=200`. Navigation later stopped with `nav_safety_stop reason=comms_lost` after the old `0.5s` watchdog saw a brief command-loop gap. | Raised the default comms watchdog from `0.5s` to `2.0s` so short planning/logging gaps do not false-stop a healthy link. Actual rover sends still retry and fail through `nav_command_failed` when the ESP32 does not respond. `nav_safety_stop` now logs `ack_age` so future pulls show exactly how stale the last successful ack was. | Uncommitted |
+| Rover reached the requested object, then Talk re-entered `Thinking...` / `On it...` and did nothing useful. | Pulled `/private/tmp/phrover-documents-20260709-after-commit-pull/phrover-runtime.log`. The app heard `Go to the refrigerator`, matched the target at `0.99`, sent rover commands with `status=200`, and stopped near the object as `state=arrived`. The same mission then asked the brain for another decision and stopped with `visible=none`. | `MissionAgent` now treats simple direct `.visualQuery(...)` navigation that settles as `.arrived` as terminal: it logs `mission_target_navigation_done`, sets phase back to Ready/idle, and does not ask the brain for another decision. Multi-step commands like `come back` / `return` are allowed to continue after arrival. | Uncommitted |
 
 ## Commits In Order
 
@@ -345,6 +375,133 @@ Key log findings:
   62 tests, 0 failures.
 - After the comms-watchdog tuning, the sample app build passed:
   `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- For the visual-target-arrival fix, the new regression
+  `MissionAgentTests.testVisualTargetMissionStopsAfterArrival` first failed because the
+  mission navigated twice and called the brain 3 times after arrival, then passed after
+  simple direct visual-target arrival became terminal.
+- The first full `PhroverKitTests` run after that change caught a regression in
+  `MissionCognitionTests`: `go to the green chair ... then come back` stopped at the chair
+  instead of returning. The fix was narrowed so follow-up intents such as `come back`,
+  `return`, and `then` still continue through the brain after visual-target arrival.
+- After narrowing the arrival guard, focused `MissionCognitionTests` plus
+  `MissionAgentTests.testVisualTargetMissionStopsAfterArrival` passed:
+  5 tests, 0 failures.
+- After the final visual-target-arrival fix, full `PhroverKitTests` passed on the iOS
+  simulator: 63 tests, 0 failures.
+- After the final visual-target-arrival fix, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- For the slow stepped requested-object scan fix, the new regression
+  `MissionAgentTests.testScansSlowlyWhenTargetIsOutOfViewAndNoObjectsAreVisible` first
+  failed because no scan turn happened when detector output was empty, then passed after
+  empty detector frames waited briefly and triggered 30-degree scan steps.
+- After the slow stepped requested-object scan fix, full `PhroverKitTests` passed on the
+  iOS simulator: 64 tests, 0 failures.
+- After the slow stepped requested-object scan fix, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- For the camera/detector timing fix, the new regression
+  `MissionAgentTests.testWaitsForDetectorAfterScanTurnBeforeGivingUp` first failed because
+  the scan checked too early after rotation and missed a detector result that appeared
+  20 ms later, then passed after the scan waited and polled after each turn.
+- After the camera/detector timing fix, full `PhroverKitTests` passed on the iOS
+  simulator: 65 tests, 0 failures.
+- After the camera/detector timing fix, the sample app build passed:
+  `PhroverOperator` generic iOS build, `CODE_SIGNING_ALLOWED=NO`.
+- `git diff --check` passed after the camera/detector timing fix.
+- The July 9 image follow-up (`IMG_5154.jpg`) showed the command text
+  `Go to refrigerator`, but the live detector panel reported
+  `Visible: orange 98%, orange 96%` and `Clearance: 0.46 m`. The requested
+  refrigerator was not locked in the current frame, so driving toward any generic
+  opening would be unsafe and could head toward the wrong object.
+- For that requested-object lock fix, the MissionAgent behavior was changed so an
+  unresolved visual target does not fall back to driving toward an exploration
+  opening. It now keeps the visual command constrained to object-lock scanning and
+  only navigates after the requested label matches the visible detector result at
+  the configured confidence threshold.
+- The scan turn sequence was also corrected. The old relative turn sequence
+  `+30deg, -30deg` returned the rover to its starting heading instead of checking
+  the opposite side. The new sequence starts `+30deg, -60deg, +60deg...`, so the
+  camera actually samples both left and right of the original view in slow steps.
+- Verification for the requested-object lock fix:
+  - `swift test --filter MissionAgentTests` could not run in this environment because
+    the package-level SwiftPM build compiles iOS-only ARKit/FoundationModels sources
+    for macOS.
+  - `xcodebuild -project examples/PhroverOperator/PhroverOperator.xcodeproj -scheme PhroverOperator -destination generic/platform=iOS build`
+    passed.
+
+### July 10: Visual target drive stalls and remains `On it...`
+
+- The pulled device log showed that `Go to the refrigerator` initially matched a
+  refrigerator at 99% and produced a fixed world goal 4.51 m away.
+- The rover reduced the goal distance to about 1.92 m, then remained there for roughly
+  2.5 minutes while sending `left=0.10, right=-0.10`. All rover requests were acknowledged,
+  so this was not a Wi-Fi failure.
+- That path-following turn speed was below the configured 0.25 minimum needed to overcome
+  the WAVE ROVER drivetrain's static friction. The drive loop also had no no-progress
+  deadline, so `MissionAgent` waited indefinitely and the Talk status remained `On it...`.
+- Path-following in-place turns now enforce the configured 0.25 minimum wheel magnitude.
+- Navigation now fails with `Navigation stalled.` if a commanded drive does not reduce its
+  distance to the goal by at least 0.05 m within 2.5 seconds.
+- A stalled visual-target mission now invokes the existing stepped scan sequence
+  (`+30deg, -60deg, +60deg...`), waits for detector updates after each turn, and resumes
+  navigation from the newly projected target position when confidence is at least 90%.
+- If the scan is exhausted, the mission stops and returns to Ready instead of remaining
+  in `On it...`.
+- New runtime events are `nav_safety_stop reason=no_goal_progress`,
+  `mission_visual_navigation_recovery`, `mission_target_reacquired`, and
+  `mission_target_recovery_exhausted`.
+
+### July 10: Target-search rotation sweeps past the object
+
+- The pulled device log showed obstacle recovery rotating continuously at
+  `left=-0.25, right=0.25`. In one 100 ms observation interval, yaw changed by about
+  17 degrees. A 30-degree search step therefore exposed too few stable camera frames and
+  could overshoot, reverse, and oscillate around the requested heading.
+- The same log showed `mission_target_navigation_done` immediately after the blind
+  obstacle-recovery turn. The requested refrigerator was not detected again and no fresh
+  image point or world goal was calculated.
+- Camera search now uses a separate slow rotation mode. It applies the drivetrain's
+  required 0.25 wheel speed for an 80 ms pulse, sends stop, then waits 300 ms for ARKit and
+  Core ML to settle before the next pulse.
+- Scan turns use a 7-degree yaw tolerance. This prevents a small remaining heading error
+  from causing another full minimum-speed pulse and overshooting the scan heading.
+- A visual mission that stops on an obstacle now enters target reacquisition instead of
+  treating a blind 30-degree turn as completion. It waits for detector updates, rejects
+  matching detections below 90%, and only resumes after a matching detection at 90% or
+  greater is unprojected into a fresh world goal.
+- New scan telemetry includes `nav_rotate_tick mode=scan_pulse`,
+  `nav_scan_turn_settle`, and `mission_visual_navigation_recovery`.
+- Regression coverage:
+  `MissionAgentTests.testBlockedVisualNavigationSlowlyScansUntilConfidentTargetIsReacquired`
+  first failed because no slow scan or second navigation occurred. It passes after the
+  fix and verifies that an 89% match is ignored while a later 95% match restarts navigation
+  toward the newly calculated goal.
+- After the slow target-search rotation fix, full `PhroverKitTests` passed on the iOS
+  simulator: 67 tests, 0 failures.
+- After the fix, the `PhroverOperator` generic iOS device build passed. The build retains
+  the existing iOS 26 `UIScreen.main` deprecation and launch-configuration warnings.
+
+### July 10: Pulsed scan still makes full rotations
+
+- A second device log confirmed the 80 ms pulse and 300 ms settle commands were reaching
+  the rover, but the heading controller was turning in the wrong direction. For a requested
+  `+60deg` scan from `57deg` to `117deg`, the logical command
+  `left=-0.25, right=0.25` moved measured ARKit yaw to `50deg`, then `6deg`, then
+  `-36deg`. The error grew instead of shrinking and eventually wrapped around +/-180deg,
+  causing repeated full rotations and limited ARKit tracking.
+- The mismatch came from coordinate conventions: RoverNav uses mathematical CCW-positive
+  yaw, while the current ARKit `x/world-z` ground plane reports the opposite physical turn
+  sign for this WAVE ROVER mounting.
+- `RoverControl.sendNavigation` now swaps logical left/right wheel values only for
+  autonomous WAVE ROVER commands. Straight forward/reverse commands remain unchanged,
+  angular navigation commands now move measured ARKit yaw toward the requested heading,
+  and direct Drive-screen commands retain their physical left/right mapping.
+- The new payload regression
+  `RoverControlTests.testCommandMapsNavigationYawToWaveRoverWheelDirection` first failed
+  with the old unswapped values and passed after the hardware-boundary conversion.
+- `RoverControlTests.testManualCommandPreservesPhysicalWheelDirection` verifies the
+  conversion does not reverse the Drive screen's left/right controls.
+- After the turn-direction fix, full `PhroverKitTests` passed on the iOS simulator:
+  69 tests, 0 failures. The generic iOS device build also passed.
 
 ## Remaining Notes
 

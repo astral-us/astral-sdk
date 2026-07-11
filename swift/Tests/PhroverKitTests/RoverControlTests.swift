@@ -95,6 +95,46 @@ final class RoverControlTests: XCTestCase {
         XCTAssertEqual(StubURLProtocol.lastRequest?.value(forHTTPHeaderField: "Connection"), "close")
         XCTAssertEqual(StubURLProtocol.lastRequest?.cachePolicy, .reloadIgnoringLocalCacheData)
     }
+
+    func testCommandMapsNavigationYawToWaveRoverWheelDirection() async throws {
+        StubURLProtocol.results = [
+            .success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+                                              statusCode: 200,
+                                              httpVersion: nil,
+                                              headerFields: nil)!))
+        ]
+        let session = URLSession(configuration: .stubbed)
+        let control = RoverControl(session: session)
+
+        try await control.sendNavigation(.init(left: -0.25, right: 0.25))
+
+        let requestURL = try XCTUnwrap(StubURLProtocol.lastRequest?.url)
+        let json = try XCTUnwrap(URLComponents(url: requestURL, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "json" })?.value)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["L"] as? Double, 0.25)
+        XCTAssertEqual(payload["R"] as? Double, -0.25)
+    }
+
+    func testManualCommandPreservesPhysicalWheelDirection() async throws {
+        StubURLProtocol.results = [
+            .success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+                                              statusCode: 200,
+                                              httpVersion: nil,
+                                              headerFields: nil)!))
+        ]
+        let session = URLSession(configuration: .stubbed)
+        let control = RoverControl(session: session)
+
+        try await control.send(.init(left: -0.25, right: 0.25))
+
+        let requestURL = try XCTUnwrap(StubURLProtocol.lastRequest?.url)
+        let json = try XCTUnwrap(URLComponents(url: requestURL, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "json" })?.value)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["L"] as? Double, -0.25)
+        XCTAssertEqual(payload["R"] as? Double, 0.25)
+    }
 }
 
 private extension URLSessionConfiguration {

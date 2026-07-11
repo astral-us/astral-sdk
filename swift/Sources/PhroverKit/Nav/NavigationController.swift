@@ -14,6 +14,7 @@ import RoverNav
 @MainActor
 public final class NavigationController {
     public enum State: Equatable, Sendable { case idle, planning, driving, arrived, failed(String) }
+    private enum RotationMode { case continuous, scan }
 
     public private(set) var state: State = .idle
     public private(set) var path: [Vec2] = []
@@ -22,7 +23,9 @@ public final class NavigationController {
     private let control: RoverControl
     private let planner = AStarPlanner()
     private let pursuit = PursuitController(params: .init(
-        wheelBase: RoverConfig.wheelBase, goalTolerance: 0.2))
+        wheelBase: RoverConfig.wheelBase,
+        goalTolerance: 0.2,
+        minimumRotateWheelSpeed: RoverConfig.minimumRotateWheelSpeed))
     private let guardLayer = ObstacleGuard()
     private static let obstacleArrivalDistance = 0.65
 
@@ -69,7 +72,23 @@ public final class NavigationController {
         }
         let targetYaw = normalizeAngle(startYaw + angle)
         state = .driving
-        let task = Task { await performRotate(to: targetYaw) }
+        let task = Task { await performRotate(to: targetYaw, mode: .continuous) }
+        loop = task
+        await task.value
+    }
+
+    /// Rotate in short pulses for camera-based target search. Stopping between pulses
+    /// prevents a 30-degree scan step from sweeping past the object before detection can
+    /// process a stable frame.
+    public func rotateForScan(by angle: Double) async {
+        cancel()
+        guard let startYaw = ar.pose?.yaw else {
+            state = .failed("No ARKit pose yet — move the device to establish tracking.")
+            return
+        }
+        let targetYaw = normalizeAngle(startYaw + angle)
+        state = .driving
+        let task = Task { await performRotate(to: targetYaw, mode: .scan) }
         loop = task
         await task.value
     }
@@ -87,6 +106,7 @@ public final class NavigationController {
     private func drive(to goal: Vec2) async {
         var hasSentCommand = false
         var consecutiveCommandFailures = 0
+        var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
             guard let pose = ar.pose else { break }
 
@@ -135,6 +155,19 @@ public final class NavigationController {
                 state = .arrived
                 return
             }
+            let isCommanded = abs(out.command.left) > 0.01 || abs(out.command.right) > 0.01
+            if progressWatchdog.observe(distanceToGoal: pose.position.distance(to: goal),
+                                        now: now,
+                                        commanded: isCommanded) {
+                try? await control.stop()
+                state = .failed("Navigation stalled.")
+                RuntimeFileLog.append("nav_safety_stop", fields: [
+                    "reason": "no_goal_progress",
+                    "distance_to_goal": Self.formatMeters(pose.position.distance(to: goal)),
+                    "timeout": "2.50"
+                ])
+                return
+            }
             var telemetry = Self.driveTelemetryFields(pose: pose,
                                                        goal: goal,
                                                        command: out.command,
@@ -143,7 +176,7 @@ public final class NavigationController {
             telemetry["path_points"] = "\(path.count)"
             RuntimeFileLog.append("nav_drive_tick", fields: telemetry)
             do {
-                try await control.send(out.command)
+                try await control.sendNavigation(out.command)
                 consecutiveCommandFailures = 0
                 hasSentCommand = true
             } catch {
@@ -178,8 +211,8 @@ public final class NavigationController {
         return true
     }
 
-    private func performRotate(to targetYaw: Double) async {
-        let angularTolerance = 0.05 // rad
+    private func performRotate(to targetYaw: Double, mode: RotationMode) async {
+        let angularTolerance = mode == .scan ? RoverConfig.scanTurnYawTolerance : 0.05
         var hasSentCommand = false
         while !Task.isCancelled {
             guard let pose = ar.pose else { break }
@@ -231,11 +264,12 @@ public final class NavigationController {
                 "pose_yaw_deg": Self.formatDegrees(pose.yaw),
                 "target_yaw_deg": Self.formatDegrees(targetYaw),
                 "yaw_error_deg": Self.formatDegrees(error),
+                "mode": mode == .scan ? "scan_pulse" : "continuous",
                 "wheel_left": Self.formatMeters(cmd.left),
                 "wheel_right": Self.formatMeters(cmd.right)
             ])
             do {
-                try await control.send(cmd)
+                try await control.sendNavigation(cmd)
                 hasSentCommand = true
             } catch {
                 try? await control.stop()
@@ -246,7 +280,16 @@ public final class NavigationController {
                 ])
                 return
             }
-            try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            if mode == .scan {
+                try? await Task.sleep(for: .seconds(RoverConfig.scanTurnPulseDuration))
+                try? await control.stop()
+                RuntimeFileLog.append("nav_scan_turn_settle", fields: [
+                    "settle_seconds": String(format: "%.2f", RoverConfig.scanTurnSettleDuration)
+                ])
+                try? await Task.sleep(for: .seconds(RoverConfig.scanTurnSettleDuration))
+            } else {
+                try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            }
         }
         try? await control.stop()
     }

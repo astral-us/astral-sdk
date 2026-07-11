@@ -26,6 +26,17 @@ public actor RoverControl {
                             "R": cmd.right])
     }
 
+    /// Send a navigation command after converting RoverNav yaw to the mounted
+    /// WAVE ROVER's physical turn direction. Manual drive commands use `send(_:)`.
+    public func sendNavigation(_ cmd: WheelCommand) async throws {
+        // RoverNav uses mathematical CCW-positive yaw. ARKit's x/world-z ground plane
+        // reports the opposite physical turn sign, so swap wheel channels only at the
+        // WAVE ROVER boundary. Forward/reverse commands are unchanged by the swap.
+        try await sendJSON(["T": RoverConfig.Opcode.speedControl,
+                            "L": cmd.right,
+                            "R": cmd.left])
+    }
+
     /// Hard stop. Safe to call repeatedly; used by e-stop and the watchdog.
     public func stop() async throws {
         try await sendJSON(["T": RoverConfig.Opcode.emergencyStop])

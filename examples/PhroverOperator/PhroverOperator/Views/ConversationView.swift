@@ -24,11 +24,13 @@ struct ConversationView: View {
     @State private var detector: Detector?
 
     var body: some View {
-        VStack(spacing: 20) {
-            Text(statusLabel).font(.headline)
+        VStack(spacing: 18) {
+            if !statusLabel.isEmpty {
+                Text(statusLabel).font(.headline)
+            }
 
             LiveCameraDebugPanel(ar: ar, detector: detector)
-                .frame(maxWidth: 220)
+                .frame(maxWidth: 320)
 
             Text(speechIn.partialTranscript)
                 .foregroundStyle(.secondary)
@@ -38,8 +40,9 @@ struct ConversationView: View {
             VStack(spacing: 16) {
                 if agent != nil {
                     Text(phaseStatusLabel)
-                        .font(.body)
-                        .padding()
+                        .font(.subheadline)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
                         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
 
@@ -52,11 +55,14 @@ struct ConversationView: View {
                             .onEnded { _ in speechIn.finish() }
                     )
             }
-            .padding(.bottom, 96)
+            .offset(y: -36)
+            .padding(.bottom, 40)
 
             Spacer()
         }
-        .padding()
+        .padding(.horizontal)
+        .padding(.top, 44)
+        .padding(.bottom, 12)
         .task {
             authorized = await speechIn.requestAuthorization()
             let detector = await Detector()
@@ -77,7 +83,7 @@ struct ConversationView: View {
         case .listening: return "Listening…"
         case .processing: return "Processing speech…"
         case .unavailable: return "Speech recognition unavailable"
-        case .idle: return "Hold to talk"
+        case .idle: return ""
         }
     }
 
@@ -122,7 +128,7 @@ private struct LiveCameraDebugPanel: View {
                 if let previewImage {
                     Image(uiImage: previewImage)
                         .resizable()
-                        .scaledToFill()
+                        .scaledToFit()
                 } else {
                     ZStack {
                         Color.black.opacity(0.08)
@@ -132,7 +138,9 @@ private struct LiveCameraDebugPanel: View {
                     }
                 }
             }
-            .frame(height: 124)
+            .frame(maxWidth: .infinity)
+            .frame(height: 160)
+            .background(.black.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(alignment: .topLeading) {
                 Text("Live")
