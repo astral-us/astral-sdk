@@ -9,12 +9,17 @@ import RoverNav
 public protocol RoverMotion: AnyObject {
     var state: NavigationController.State { get }
     func navigate(to goal: Vec2)
+    func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double)
     func rotate(by angle: Double) async
     func rotateForScan(by angle: Double) async
     func cancel()
 }
 
 extension RoverMotion {
+    public func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) {
+        navigate(to: goal)
+    }
+
     public func rotateForScan(by angle: Double) async {
         await rotate(by: angle)
     }
@@ -354,7 +359,7 @@ public final class MissionAgent {
                                                                scanSteps: &visualTargetScanSteps) {
                     case .found(let scannedGoal):
                         visualTargetScanSteps = 0
-                        motion.navigate(to: scannedGoal)
+                        navigate(to: scannedGoal, for: effectiveTarget)
                         await waitForMotionToSettle()
                         guard isCurrentMission(missionID) else {
                             phase = .idle
@@ -391,7 +396,7 @@ public final class MissionAgent {
                     continue
                 }
                 visualTargetScanSteps = 0
-                motion.navigate(to: goal)
+                navigate(to: goal, for: effectiveTarget)
                 await waitForMotionToSettle()
                 if await recoverVisualNavigation(effectiveTarget,
                                                   missionID: missionID,
@@ -789,6 +794,15 @@ public final class MissionAgent {
         }
     }
 
+    private func navigate(to goal: Vec2, for target: NavigationTarget) {
+        if case .visualQuery = target {
+            motion.navigate(to: goal,
+                            stoppingAtForwardClearance: RoverConfig.visualTargetStopDistance)
+        } else {
+            motion.navigate(to: goal)
+        }
+    }
+
     private func finishMissionIfVisualTargetArrived(_ target: NavigationTarget,
                                                     missionID: Int,
                                                     missionUtterance: String) -> Bool {
@@ -832,7 +846,7 @@ public final class MissionAgent {
                 "goal_x": String(format: "%.2f", freshGoal.x),
                 "goal_y": String(format: "%.2f", freshGoal.y)
             ])
-            motion.navigate(to: freshGoal)
+            navigate(to: freshGoal, for: target)
             await waitForMotionToSettle()
             guard isCurrentMission(missionID) else {
                 phase = .idle

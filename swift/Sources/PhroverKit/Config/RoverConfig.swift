@@ -31,6 +31,16 @@ public enum RoverConfig {
     public static let scanTurnPulseDuration: TimeInterval = 0.08
     public static let scanTurnSettleDuration: TimeInterval = 0.30
     public static let scanTurnYawTolerance = 7.0 * Double.pi / 180.0
+    /// Stand-off distance for a confidently locked visual target.
+    public static let visualTargetStopDistance = 0.30
+    /// Brake before the desired stand-off to compensate for command latency and chassis coast.
+    public static let visualTargetBrakeLeadDistance = 0.10
+    /// Begin slowing the final approach early enough to avoid coasting through the stop distance.
+    public static let visualTargetSlowdownDistance = 0.60
+    /// Final-approach wheel cap; at the 10 Hz command rate this advances about 1.2 cm per tick.
+    public static let visualTargetApproachMaxWheelSpeed = 0.12
+    /// Only relax the normal obstacle threshold when the projected target is nearby.
+    public static let visualTargetApproachDistance = 1.20
 
     // MARK: - Safety
     /// If no successful command round-trip within this window, ObstacleGuard forces a stop.

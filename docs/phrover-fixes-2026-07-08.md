@@ -503,6 +503,46 @@ Key log findings:
 - After the turn-direction fix, full `PhroverKitTests` passed on the iOS simulator:
   69 tests, 0 failures. The generic iOS device build also passed.
 
+### July 10: Visual target stops before reaching the requested stand-off
+
+- The latest device log showed visual navigation stopping at `03:48:06Z` with
+  `forward_clearance=0.42 m` and `distance_to_goal=0.99 m`. The general obstacle guard's
+  0.45 m threshold marked the run as failed before the rover reached the requested object.
+- Recovery then entered a stepped target scan. LiDAR clearance fell to 0.21-0.23 m, but
+  scan rotation intentionally does not use the forward obstacle threshold, so the rover
+  did not recognize this as target arrival and continued until the spoken `Stop` command.
+- Visual-target navigation now carries a 0.30 m LiDAR stand-off distance from
+  `MissionAgent` into `NavigationController`.
+- The normal 0.45 m obstacle guard is relaxed only when the rover is within 1.20 m of the
+  projected visual goal. Ordinary waypoint, exploration, and manual navigation keep the
+  existing obstacle protection.
+- At a forward clearance of 0.30 m or less, the controller immediately sends stop, marks
+  navigation as arrived, and records `nav_target_reached` with clearance, goal distance,
+  and configured stop distance.
+- New regression coverage verifies that visual targets use the 0.30 m stand-off, that
+  arrival occurs at the threshold, and that the relaxed approach behavior cannot activate
+  when the projected target is farther than 1.20 m away.
+- A follow-up device log showed the 0.30 m branch was executing, but the rover approached
+  at about 0.35 m/s. Clearance changed from 0.33 m to 0.23 m during one 100 ms command
+  cycle, the stop request returned HTTP 200, and the chassis then coasted to about 0.17 m.
+  No drive requests were sent after `nav_target_reached`, so the remaining issue was
+  final-approach overshoot rather than a missing stop decision or failed WiFi request.
+- Locked visual-target navigation now caps proportional forward wheel commands at
+  0.12 m/s once clearance is 0.60 m or less. At the 10 Hz command rate, this limits the
+  nominal final advance to about 1.2 cm per cycle and gives the chassis time to settle near
+  the 0.30 m stand-off. In-place turn commands are not capped because they require the
+  existing minimum wheel speed to overcome drivetrain static friction.
+- `nav_drive_tick` now records `target_approach_slowed=true` whenever this final-approach
+  cap is active.
+- The next physical run confirmed slowdown was active, but a stop issued at 0.29 m still
+  settled at about 0.19 m. The app sent no later drive command and the `T=0` response was
+  HTTP 200, confirming approximately 0.10 m of combined command, sensor, and chassis
+  braking lag.
+- Visual-target arrival now applies that measured 0.10 m brake lead: a requested 0.30 m
+  stand-off sends stop at 0.40 m so the physical rover can settle near the requested
+  distance. `nav_target_reached` logs both `stop_distance` and `brake_trigger_distance`
+  for the next device validation.
+
 ## Remaining Notes
 
 - Older builds only wrote brain errors, not every spoken status message. That is why the

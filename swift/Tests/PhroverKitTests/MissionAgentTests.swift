@@ -46,6 +46,23 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(agent.phase, .idle)
     }
 
+    func testVisualTargetNavigationUsesThirtyCentimeterStopDistance() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "chair",
+                            confidence: 0.96,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("chair")), .done])
+        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { brain }
+
+        await agent.handle("go to the chair")
+
+        XCTAssertEqual(motion.navigateStopClearances, [0.30])
+    }
+
     func testStalledVisualNavigationScansAndResumesWithFreshTarget() async {
         let motion = FakeMotion()
         motion.navigateOutcomes = [.failed("Navigation stalled."), .arrived]
@@ -793,6 +810,7 @@ private final class BlockingBrain: RoverBrain {
 private final class FakeMotion: RoverMotion {
     var state: NavigationController.State = .idle
     private(set) var navigateCalls: [Vec2] = []
+    private(set) var navigateStopClearances: [Double] = []
     private(set) var rotateCalls: [Double] = []
     private(set) var scanRotateCalls: [Double] = []
     private(set) var cancelCallCount = 0
@@ -815,6 +833,11 @@ private final class FakeMotion: RoverMotion {
             try? await Task.sleep(for: .milliseconds(20))
             state = outcome
         }
+    }
+
+    func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) {
+        navigateStopClearances.append(clearance)
+        navigate(to: goal)
     }
 
     func rotate(by angle: Double) async {

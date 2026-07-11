@@ -24,6 +24,70 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertEqual(state, .failed("Obstacle ahead at 0.28 m."))
     }
 
+    func testVisualTargetApproachStopsAtThirtyCentimeters() {
+        XCTAssertEqual(
+            NavigationController.visualTargetApproachDecision(
+                distanceToGoal: 0.99,
+                forwardClearance: 0.29,
+                stopDistance: 0.30
+            ),
+            .arrived
+        )
+    }
+
+    func testVisualTargetApproachBrakesBeforeStandOffToCompensateForOvershoot() {
+        XCTAssertEqual(
+            NavigationController.visualTargetApproachDecision(
+                distanceToGoal: 0.99,
+                forwardClearance: 0.39,
+                stopDistance: 0.30
+            ),
+            .arrived
+        )
+    }
+
+    func testVisualTargetApproachRelaxesObstacleGuardOnlyNearProjectedGoal() {
+        XCTAssertEqual(
+            NavigationController.visualTargetApproachDecision(
+                distanceToGoal: 0.99,
+                forwardClearance: 0.41,
+                stopDistance: 0.30
+            ),
+            .approach
+        )
+        XCTAssertEqual(
+            NavigationController.visualTargetApproachDecision(
+                distanceToGoal: 1.21,
+                forwardClearance: 0.29,
+                stopDistance: 0.30
+            ),
+            .inactive
+        )
+    }
+
+    func testVisualTargetApproachSlowsForwardCommandBeforeStopDistance() {
+        let command = NavigationController.visualTargetApproachCommand(
+            WheelCommand(left: 0.35, right: 0.31),
+            forwardClearance: 0.45,
+            stopDistance: 0.30
+        )
+
+        XCTAssertEqual(command.left, RoverConfig.visualTargetApproachMaxWheelSpeed, accuracy: 0.001)
+        XCTAssertEqual(command.right, 0.106, accuracy: 0.001)
+    }
+
+    func testVisualTargetApproachKeepsCommandOutsideSlowdownDistance() {
+        let original = WheelCommand(left: 0.35, right: 0.31)
+
+        let command = NavigationController.visualTargetApproachCommand(
+            original,
+            forwardClearance: 0.61,
+            stopDistance: 0.30
+        )
+
+        XCTAssertEqual(command, original)
+    }
+
     func testCommandFailureStopsNavigationAsFailed() {
         let state = NavigationController.stateAfterCommandFailure(FakeCommandError.timedOut)
 

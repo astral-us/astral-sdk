@@ -14,6 +14,7 @@ import RoverNav
 @MainActor
 public final class NavigationController {
     public enum State: Equatable, Sendable { case idle, planning, driving, arrived, failed(String) }
+    enum VisualTargetApproachDecision: Equatable { case inactive, approach, arrived }
     private enum RotationMode { case continuous, scan }
 
     public private(set) var state: State = .idle
@@ -39,6 +40,15 @@ public final class NavigationController {
 
     /// Begin autonomously driving to a nav-plane goal.
     public func navigate(to goal: Vec2) {
+        startNavigation(to: goal, stoppingAtForwardClearance: nil)
+    }
+
+    /// Drive toward a locked visual target and stop at the requested LiDAR stand-off.
+    public func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) {
+        startNavigation(to: goal, stoppingAtForwardClearance: clearance)
+    }
+
+    private func startNavigation(to goal: Vec2, stoppingAtForwardClearance: Double?) {
         cancel()
         guard let start = ar.pose?.position else {
             state = .failed("No ARKit pose yet — move the device to establish tracking.")
@@ -53,10 +63,13 @@ public final class NavigationController {
             "goal_y": Self.formatMeters(goal.y),
             "pose_x": Self.formatMeters(start.x),
             "pose_y": Self.formatMeters(start.y),
-            "distance_to_goal": Self.formatMeters(start.distance(to: goal))
+            "distance_to_goal": Self.formatMeters(start.distance(to: goal)),
+            "target_stop_clearance": stoppingAtForwardClearance.map(Self.formatMeters) ?? "none"
         ])
         state = .driving
-        loop = Task { await drive(to: goal) }
+        loop = Task {
+            await drive(to: goal, stoppingAtForwardClearance: stoppingAtForwardClearance)
+        }
     }
 
     /// Rotate in place by `angle` radians (CCW positive, matching `Pose2D.yaw`) and wait
@@ -103,12 +116,32 @@ public final class NavigationController {
 
     // MARK: - Loop
 
-    private func drive(to goal: Vec2) async {
+    private func drive(to goal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?) async {
         var hasSentCommand = false
         var consecutiveCommandFailures = 0
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
             guard let pose = ar.pose else { break }
+            let distanceToGoal = pose.position.distance(to: goal)
+            let targetApproachDecision = targetStopDistance.map {
+                Self.visualTargetApproachDecision(distanceToGoal: distanceToGoal,
+                                                  forwardClearance: ar.forwardClearance,
+                                                  stopDistance: $0)
+            } ?? .inactive
+
+            if case .arrived = targetApproachDecision, let targetStopDistance {
+                try? await control.stop()
+                state = .arrived
+                RuntimeFileLog.append("nav_target_reached", fields: [
+                    "brake_trigger_distance": Self.formatMeters(
+                        targetStopDistance + RoverConfig.visualTargetBrakeLeadDistance
+                    ),
+                    "clearance": Self.formatMeters(ar.forwardClearance),
+                    "distance_to_goal": Self.formatMeters(distanceToGoal),
+                    "stop_distance": Self.formatMeters(targetStopDistance)
+                ])
+                return
+            }
 
             // Replan every ~1s to fold in newly meshed obstacles.
             replanCounter += 1
@@ -121,7 +154,8 @@ public final class NavigationController {
                                                lastAckAt: lastAck,
                                                now: now,
                                                feedback: nil,
-                                               requireFreshAck: hasSentCommand)
+                                               requireFreshAck: hasSentCommand,
+                                               checkForwardObstacle: targetApproachDecision == .inactive)
             switch decision {
             case .go:
                 break
@@ -155,28 +189,34 @@ public final class NavigationController {
                 state = .arrived
                 return
             }
-            let isCommanded = abs(out.command.left) > 0.01 || abs(out.command.right) > 0.01
-            if progressWatchdog.observe(distanceToGoal: pose.position.distance(to: goal),
+            let command = targetApproachDecision == .approach
+                ? Self.visualTargetApproachCommand(out.command,
+                                                   forwardClearance: ar.forwardClearance,
+                                                   stopDistance: targetStopDistance ?? 0)
+                : out.command
+            let isCommanded = abs(command.left) > 0.01 || abs(command.right) > 0.01
+            if progressWatchdog.observe(distanceToGoal: distanceToGoal,
                                         now: now,
                                         commanded: isCommanded) {
                 try? await control.stop()
                 state = .failed("Navigation stalled.")
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "no_goal_progress",
-                    "distance_to_goal": Self.formatMeters(pose.position.distance(to: goal)),
+                    "distance_to_goal": Self.formatMeters(distanceToGoal),
                     "timeout": "2.50"
                 ])
                 return
             }
             var telemetry = Self.driveTelemetryFields(pose: pose,
                                                        goal: goal,
-                                                       command: out.command,
+                                                       command: command,
                                                        consecutiveCommandFailures: consecutiveCommandFailures)
             telemetry["forward_clearance"] = Self.formatMeters(ar.forwardClearance)
             telemetry["path_points"] = "\(path.count)"
+            telemetry["target_approach_slowed"] = command == out.command ? "false" : "true"
             RuntimeFileLog.append("nav_drive_tick", fields: telemetry)
             do {
-                try await control.sendNavigation(out.command)
+                try await control.sendNavigation(command)
                 consecutiveCommandFailures = 0
                 hasSentCommand = true
             } catch {
@@ -184,7 +224,7 @@ public final class NavigationController {
                 RuntimeFileLog.append("nav_command_send_failed", fields: Self.driveTelemetryFields(
                     pose: pose,
                     goal: goal,
-                    command: out.command,
+                    command: command,
                     consecutiveCommandFailures: consecutiveCommandFailures
                 ).merging([
                     "error": error.localizedDescription,
@@ -299,6 +339,35 @@ public final class NavigationController {
             return .arrived
         }
         return .failed(obstacleMessage(clearance: clearance))
+    }
+
+    static func visualTargetApproachDecision(distanceToGoal: Double,
+                                             forwardClearance: Double,
+                                             stopDistance: Double) -> VisualTargetApproachDecision {
+        guard distanceToGoal <= RoverConfig.visualTargetApproachDistance else { return .inactive }
+        let brakeTriggerDistance = stopDistance + RoverConfig.visualTargetBrakeLeadDistance
+        guard forwardClearance.isFinite,
+              forwardClearance <= brakeTriggerDistance else {
+            return .approach
+        }
+        return .arrived
+    }
+
+    static func visualTargetApproachCommand(_ command: WheelCommand,
+                                            forwardClearance: Double,
+                                            stopDistance: Double) -> WheelCommand {
+        guard forwardClearance.isFinite,
+              forwardClearance > stopDistance + RoverConfig.visualTargetBrakeLeadDistance,
+              forwardClearance <= RoverConfig.visualTargetSlowdownDistance,
+              command.left >= 0,
+              command.right >= 0 else {
+            return command
+        }
+
+        let peak = max(command.left, command.right)
+        guard peak > RoverConfig.visualTargetApproachMaxWheelSpeed else { return command }
+        let scale = RoverConfig.visualTargetApproachMaxWheelSpeed / peak
+        return WheelCommand(left: command.left * scale, right: command.right * scale)
     }
 
     static func stateAfterCommandFailure(_ error: Error) -> State {
