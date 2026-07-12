@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import UIKit
 import RoverNav
 
 /// Motion surface `MissionAgent` drives. A separate protocol from the concrete
@@ -95,6 +96,44 @@ public protocol RoverVoice: AnyObject {
     func ask(_ question: String, timeout: TimeInterval) async -> String?
 }
 
+/// Battery surface `MissionAgent` reads — optional (nil if the platform doesn't expose
+/// one). A separate protocol from `RoverPerception` since it's orthogonal to vision/nav:
+/// self-model ("how much runway do I have left") doesn't need ARKit/detector plumbing to
+/// fake, and a brain that ignores battery entirely still works with `percent` always nil.
+@MainActor
+public protocol RoverBattery: AnyObject {
+    var percent: Double? { get }
+}
+
+/// Default `RoverBattery`: the iPhone's own battery level — the phone is the rover's
+/// brain, so its battery is what capability "self-model and calibrated uncertainty"
+/// reasons about (the WAVE ROVER chassis itself exposes no battery telemetry today).
+@MainActor
+public final class DeviceBattery: RoverBattery {
+    public init() {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+    }
+
+    public var percent: Double? {
+        let level = UIDevice.current.batteryLevel
+        return level < 0 ? nil : Double(level) * 100.0
+    }
+}
+
+/// Team-mesh surface `MissionAgent` reads/writes — optional (nil for a solo mission). A
+/// separate protocol from the others since it's about *other rovers*, not this one's own
+/// sensing/motion/speech: capability "collaboration" (shared intent, market allocation,
+/// survivor robustness) is the brain's own reasoning over `currentTeamContext()`, using
+/// `broadcastClaim` to act on it — `MissionAgent` only relays, same as `RoverBattery`.
+@MainActor
+public protocol RoverTeamRadio: AnyObject {
+    /// Current known team state (rooms + who's claimed/alive), or `nil` if unavailable
+    /// this tick (e.g. mesh not yet joined).
+    func currentTeamContext() -> TeamContext?
+    /// Announce a claim on a room/area to the rest of the team.
+    func broadcastClaim(_ roomId: String)
+}
+
 /// Default `RoverVoice`: on-device TTS/STT.
 @MainActor
 public final class SpeechRoverVoice: RoverVoice {
@@ -141,11 +180,24 @@ public final class MissionAgent {
     private let motion: RoverMotion
     private let perception: RoverPerception
     private let voice: RoverVoice
+    private let battery: RoverBattery?
+    private let teamRadio: RoverTeamRadio?
     private let askTimeout: TimeInterval
     private let currentBrain: () -> RoverBrain?
 
     private var lastAnswerWasInconclusive = false
     private var nextCandidateNumber = 1
+    /// Ring buffer of "action → outcome" lines fed to the brain as `recentActions` (see
+    /// `makeContext`) so it can notice it's repeating itself — persists across `handle()`
+    /// calls within one mission agent, same as `memory`, so a multi-turn mission ("search,
+    /// then go back to the ladder") keeps continuity.
+    private var recentActionLines: [String] = []
+    private let recentActionsLimit = 8
+    private var lastDecision: RoverDecision?
+    /// Consecutive ticks where the decision matched the previous one, pose barely moved,
+    /// and nothing new was remembered — the signal a scripted loop (not the brain) would
+    /// catch instantly but an LLM given only the current frame cannot.
+    private var consecutiveNoOpTicks = 0
     /// A frontier within this distance of a known candidate is the same opening.
     private let candidateMatchRadius = 1.0
     /// Getting this close to a candidate marks it visited.
@@ -158,12 +210,16 @@ public final class MissionAgent {
     public init(motion: RoverMotion,
                 perception: RoverPerception,
                 voice: RoverVoice,
+                battery: RoverBattery? = nil,
+                teamRadio: RoverTeamRadio? = nil,
                 askTimeout: TimeInterval = 8,
                 maxTicksPerUtterance: Int = 25,
                 currentBrain: @escaping () -> RoverBrain?) {
         self.motion = motion
         self.perception = perception
         self.voice = voice
+        self.battery = battery
+        self.teamRadio = teamRadio
         self.askTimeout = askTimeout
         self.maxTicksPerUtterance = maxTicksPerUtterance
         self.currentBrain = currentBrain
@@ -188,11 +244,13 @@ public final class MissionAgent {
         for _ in 0..<maxTicksPerUtterance {
             guard let brain = currentBrain() else {
                 voice.speak("Sorry, I can't think right now.")
-                break
+                return
             }
 
             phase = .thinking
+            let rememberedCountBefore = memory.rememberedObjects.count
             updateWorldModel()
+            let newObjects = memory.rememberedObjects.count - rememberedCountBefore
             let ctx = makeContext(utterance: nextUtterance)
             nextUtterance = nil
 
@@ -201,30 +259,51 @@ public final class MissionAgent {
                 output = try await brain.nextAction(ctx)
             } catch {
                 voice.speak("Sorry, I'm having trouble thinking right now.")
-                break
+                return
             }
             if let updated = output.updatedPlan, !updated.isEmpty { plan = updated }
 
             phase = .acting
-            switch output.decision {
+            let decision = output.decision
+            let poseBefore = perception.pose?.position
+            var outcome = ""
+
+            switch decision {
             case .navigate(let target):
                 guard let goal = resolve(target) else {
                     voice.speak("I couldn't quite figure out where that is.")
+                    if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
+                                   outcome: "navigate → couldn't resolve target") {
+                        phase = .idle
+                        return
+                    }
                     continue
                 }
                 motion.navigate(to: goal)
                 await waitForMotionToSettle()
+                outcome = describeMotionOutcome(label: "navigate", poseBefore: poseBefore)
 
             case .explore(let candidateId):
                 guard let candidate = explorationCandidates.first(where: { $0.id == candidateId }) else {
                     voice.speak("I'm not sure which opening that is anymore.")
+                    if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
+                                   outcome: "explore(\(candidateId)) → unknown opening id") {
+                        phase = .idle
+                        return
+                    }
                     continue
                 }
                 motion.navigate(to: candidate.worldPoint)
                 await waitForMotionToSettle()
+                outcome = describeMotionOutcome(label: "explore(\(candidateId))", poseBefore: poseBefore)
 
             case .lookAround(let angle):
                 await motion.rotate(by: angle)
+                let poseAfter = perception.pose?.position
+                let stayedPut = distance(poseBefore, poseAfter) < 0.05
+                outcome = "lookAround(\(fmt(angle))) → " + (stayedPut
+                    ? (newObjects > 0 ? "pose unchanged, saw \(newObjects) new thing(s)" : "pose unchanged, nothing new seen")
+                    : "pose changed")
 
             case .ask(let question):
                 phase = .waitingForAnswer
@@ -232,12 +311,19 @@ public final class MissionAgent {
                     lastAnswerWasInconclusive = false
                     if let pose = perception.pose { memory.record(utterance: reply, at: pose) }
                     nextUtterance = reply
+                    outcome = "ask(\"\(question)\") → replied: \"\(reply)\""
                 } else {
                     lastAnswerWasInconclusive = true
+                    outcome = "ask(\"\(question)\") → no reply"
                 }
 
             case .say(let text):
                 voice.speak(text)
+                outcome = "say(\"\(text)\") → (no motion)"
+
+            case .claimRoom(let roomId):
+                teamRadio?.broadcastClaim(roomId)
+                outcome = "claimRoom(\(roomId)) → broadcast"
 
             case .stop:
                 motion.cancel()
@@ -248,8 +334,87 @@ public final class MissionAgent {
                 phase = .idle
                 return
             }
+
+            if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects, outcome: outcome) {
+                phase = .idle
+                return
+            }
         }
+
+        voice.speak("I've used up the time I had for this and want to check in rather than keep going. "
+            + wrapUpFindings())
         phase = .idle
+    }
+
+    /// Updates action-history/no-op bookkeeping for one executed tick. Returns `true` if
+    /// the bounded fallback fired and the mission loop should end now.
+    @discardableResult
+    private func recordTick(decision: RoverDecision, poseBefore: Vec2?, newObjects: Int, outcome: String) -> Bool {
+        let poseAfter = perception.pose?.position
+        let isNoOp = decision == lastDecision && distance(poseBefore, poseAfter) < 0.05 && newObjects == 0
+        consecutiveNoOpTicks = isNoOp ? consecutiveNoOpTicks + 1 : 0
+        lastDecision = decision
+        appendRecentAction(outcome)
+        if consecutiveNoOpTicks >= 2 {
+            appendRecentAction(noOpWarningLine(consecutiveNoOpTicks))
+        }
+        if consecutiveNoOpTicks >= 5 {
+            fireHeuristicFallback()
+            return true
+        }
+        return false
+    }
+
+    private func appendRecentAction(_ line: String) {
+        recentActionLines.append(line)
+        if recentActionLines.count > recentActionsLimit {
+            recentActionLines.removeFirst(recentActionLines.count - recentActionsLimit)
+        }
+    }
+
+    private func noOpWarningLine(_ count: Int) -> String {
+        "WARNING: your last \(count) actions were identical and produced no new information — " +
+        "repeating again will not help. Pick a different action: explore an unexplored opening, " +
+        "navigate somewhere new, or report your findings and finish with done."
+    }
+
+    /// Bounded fallback for a brain that keeps looping despite the escalating warnings —
+    /// this is also the real IRL battery-preservation behavior (end the search rather than
+    /// drain the pack for nothing), not just a test guard. Logged loudly (a plain stdout
+    /// marker, not `EventLog` — that class lives in the test target only) so takes where it
+    /// fired are identifiable; prefer retakes where the model exits on its own.
+    private func fireHeuristicFallback() {
+        print("HEURISTIC_FALLBACK_FIRED")
+        voice.speak("I'm not finding anything new — ending the search. " + wrapUpFindings())
+    }
+
+    private func wrapUpFindings() -> String {
+        let labels = memory.rememberedObjects.map { $0.label }
+        return labels.isEmpty ? "I didn't find anything notable." : "Found: \(labels.joined(separator: ", "))."
+    }
+
+    private func distance(_ a: Vec2?, _ b: Vec2?) -> Double {
+        guard let a, let b else { return .greatestFiniteMagnitude }
+        return a.distance(to: b)
+    }
+
+    private func fmt(_ v: Double) -> String { String(format: "%.2f", v) }
+
+    private func describeMotionOutcome(label: String, poseBefore: Vec2?) -> String {
+        let poseAfter = perception.pose?.position
+        if case .failed(let reason) = motion.state {
+            return "\(label) → FAILED: \(reason)"
+        }
+        if motion.state == .arrived, let p = poseAfter {
+            return "\(label) → arrived at (\(fmt(p.x)), \(fmt(p.y)))"
+        }
+        if distance(poseBefore, poseAfter) < 0.05 {
+            return "\(label) → pose unchanged, no progress"
+        }
+        if let p = poseAfter {
+            return "\(label) → moved to (\(fmt(p.x)), \(fmt(p.y)))"
+        }
+        return "\(label) → moved"
     }
 
     /// Once per tick, before thinking: fold what perception sees *right now* into
@@ -325,6 +490,9 @@ public final class MissionAgent {
                        memory: memory,
                        explorationCandidates: explorationCandidates,
                        plan: plan,
-                       lastAnswerWasInconclusive: lastAnswerWasInconclusive)
+                       lastAnswerWasInconclusive: lastAnswerWasInconclusive,
+                       batteryPercent: battery?.percent,
+                       teamContext: teamRadio?.currentTeamContext(),
+                       recentActions: recentActionLines)
     }
 }

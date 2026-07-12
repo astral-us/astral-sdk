@@ -65,5 +65,17 @@ let package = Package(
             ],
             path: "swift/Sources/PhroverCloud"
         ),
+
+        // Drives the real MissionAgent against the Godot Depot sim (eco/drone/sim/godot/,
+        // env_depot.gd + phrover_manager.gd) over its TCP IPC — see
+        // eco/rover/sim/depot_client.py for the Python-side counterpart and
+        // eco/.claude-plans or the design doc for the op/response shapes. Needs a Godot
+        // process already running (GODOT_IPC env, default 127.0.0.1:9999); the harness
+        // (eco/rover/sim/depot_harness.py) is responsible for launching it. Separate from
+        // PhroverKitLiveProbes: this exercises the sim seams (RoverMotion/RoverPerception/
+        // RoverVoice), not the real ARKit/cloud stack.
+        .testTarget(name: "PhroverSimTests",
+                    dependencies: ["PhroverKit", "PhroverCloud", "RoverNav"],
+                    path: "swift/Tests/PhroverSimTests"),
     ]
 )
