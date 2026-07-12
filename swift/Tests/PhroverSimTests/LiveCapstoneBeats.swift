@@ -70,6 +70,20 @@ final class LiveCapstoneBeats: XCTestCase {
         print("=== person-crossing: \(nearMisses.count) near-miss events, \(collisions.count) collisions "
             + "(\(personCollisions.count) with person, \(wallCollisions) wall/prop) ===")
         XCTAssertTrue(personCollisions.isEmpty, "rover made contact with the person")
+
+        // Numeric trajectory check — a passing collision count alone doesn't prove the
+        // rover actually did anything: a take that quietly retreated out the depot's south
+        // exterior door (the "Yard", see env_depot.gd's WALLS/DOOR_PANELS["Y"], gap at
+        // y≈-0.1..0.1) looked identical to a clean pass by collision count and by a coarse
+        // video-frame sample alike — confirmed the hard way. pose_trace events (~1/s,
+        // always logged in phrover_manager.gd) give an actual y-position history to check
+        // against, independent of collision counting or eyeballing the video.
+        let poseTrace = godotEvents.filter { ($0["kind"] as? String) == "pose_trace" }
+        let ys = poseTrace.compactMap { ($0["data"] as? [String: Any])?["y"] as? Double }
+        let minY = ys.min() ?? Self.startPose.y
+        let maxY = ys.max() ?? Self.startPose.y
+        print("=== person-crossing: pose trace y range [\(minY), \(maxY)] over \(ys.count) samples ===")
+        XCTAssertGreaterThan(minY, 0.5, "rover approached/exited the depot's south exterior door (retreated the wrong way) instead of proceeding past the person")
     }
 
     // MARK: - #3 planning with commitment (replan around a blocked door)
