@@ -25,22 +25,37 @@ final class GodotLink: @unchecked Sendable {
         let resolvedHost = host ?? env["GODOT_HOST"] ?? "127.0.0.1"
         let resolvedPort = port ?? UInt16(env["GODOT_PORT"] ?? "") ?? 9999
 
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
-        guard sock >= 0 else { throw LinkError.socketFailed }
+        // Godot prints "IPC ready" (which godot_launcher.py's launch_depot() blocks on)
+        // as soon as its listen socket is up, but that doesn't guarantee this process's
+        // very first connect() lands in the accept backlog instantly — confirmed live: a
+        // multi-beat run_live_beats.py session had one beat's connection refused in 0.004s
+        // (an immediate ECONNREFUSED, not a hang) right after a fresh Godot relaunch, while
+        // the frame-grabber's separate connection to the same port succeeded around the
+        // same time. A single one-shot connect() attempt is too fragile against that
+        // startup race; retry with a short backoff before giving up for real.
+        var lastResult: Int32 = -1
+        var sock: Int32 = -1
+        for attempt in 0..<20 {
+            sock = socket(AF_INET, SOCK_STREAM, 0)
+            guard sock >= 0 else { throw LinkError.socketFailed }
 
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_port = resolvedPort.bigEndian
-        addr.sin_addr.s_addr = inet_addr(resolvedHost)
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_port = resolvedPort.bigEndian
+            addr.sin_addr.s_addr = inet_addr(resolvedHost)
 
-        let result = withUnsafePointer(to: &addr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            lastResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
             }
-        }
-        guard result == 0 else {
+            if lastResult == 0 { break }
             close(sock)
+            sock = -1
+            if attempt < 19 { usleep(300_000) }  // 300ms
+        }
+        guard lastResult == 0, sock >= 0 else {
             throw LinkError.connectFailed
         }
         self.fd = sock
