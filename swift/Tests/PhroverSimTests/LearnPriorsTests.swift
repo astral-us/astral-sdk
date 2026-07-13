@@ -161,7 +161,7 @@ final class LearnPriorsTests: XCTestCase {
 /// time-to-find directly from what the sim actually reported was visible, independent of
 /// whether/when the brain itself chose to mention it.
 @MainActor
-private final class InstrumentedPerception: RoverPerception {
+final class InstrumentedPerception: RoverPerception {
     private let inner: RoverPerception
     private let events: EventLog
 
