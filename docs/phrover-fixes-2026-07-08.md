@@ -543,6 +543,245 @@ Key log findings:
   distance. `nav_target_reached` logs both `stop_distance` and `brake_trigger_distance`
   for the next device validation.
 
+## Current Implementation Diagrams
+
+The diagrams below describe the implemented Phrover voice-to-motion path on branch
+`fix/speech-recognition` after commit `03f4f1b`.
+
+### Component Diagram
+
+```mermaid
+flowchart TD
+    User["Operator"] --> UI["Talk Screen<br/>Live camera + status"]
+    UI --> Speech["SpeechIn<br/>Apple on-device speech recognition"]
+    Speech --> Agent["MissionAgent<br/>Mission state and target lock"]
+
+    Agent --> Brain{"Brain selection"}
+    Brain -->|"Cloud configured and online"| Cloud["CloudBrain<br/>POST /rover/act"]
+    Brain -->|"Offline or cloud failure"| Local["OnDeviceBrain<br/>Apple Foundation Models"]
+
+    Camera["iPhone RGB camera"] --> AR["ARSessionManager"]
+    LiDAR["iPhone LiDAR"] --> AR
+    AR -->|"Pose, RGB frame, depth, mesh, clearance"| Context["Mission context"]
+    AR --> Detector["RoverYOLO<br/>Vision + Core ML"]
+    Detector --> Context
+    Context --> Agent
+    Agent --> Memory["MissionMemory<br/>Plan, locations, visible objects"]
+
+    Agent -->|"Target visible at 90%+"| Ground["Target grounding<br/>Image point + LiDAR depth to world point"]
+    Agent -->|"Target unavailable"| Scan["Target search<br/>Wait 1s, pulse-turn +/-30 degrees,<br/>settle, detect again"]
+    Scan --> Detector
+    Ground --> Nav["NavigationController"]
+
+    Nav --> Costmap["CostmapBuilder<br/>AR mesh obstacles"]
+    Costmap --> Planner["AStarPlanner"]
+    Planner --> Pursuit["PursuitController<br/>Wheel commands"]
+    AR --> Safety["ObstacleGuard<br/>Clearance + comms watchdog"]
+    Safety --> Nav
+    Pursuit --> Nav
+
+    Nav -->|"GET /js?json={T:1,L,R}<br/>3 attempts"| Control["RoverControl"]
+    Control --> WiFi["Rover Wi-Fi<br/>192.168.4.1"]
+    WiFi --> ESP32["WAVE ROVER ESP32"]
+    ESP32 --> Motors["Left and right motors"]
+
+    Nav -->|"Slow below 0.60 m<br/>Stop command at 0.40 m<br/>Desired settled distance 0.30 m"| Stop["T:0 emergency stop"]
+    Stop --> Control
+
+    Agent --> Log["Documents/phrover-runtime.log"]
+    Nav --> Log
+    Control --> Log
+    AR --> Log
+```
+
+### Component Ownership Diagram
+
+```mermaid
+flowchart TD
+    subgraph App["PhroverOperator App"]
+        AppEntry["PhroverOperatorApp<br/>Dependency composition"]
+        TalkUI["ConversationView<br/>Talk screen"]
+        CameraPanel["LiveCameraDebugPanel<br/>Preview and status"]
+        DriveUI["DriveView / NavigateView"]
+    end
+
+    subgraph SDK["Astral SDK"]
+        direction TB
+        SpeechIn["SpeechIn"]
+        SpeechOut["SpeechOut"]
+        Agent["MissionAgent"]
+        BrainAdapter["HybridBrain / OnDeviceBrain / CloudBrain"]
+        Memory["MissionMemory"]
+        ARManager["ARSessionManager"]
+        Detector["Detector + RoverYOLO model"]
+        Nav["NavigationController"]
+        Mapping["CostmapBuilder"]
+        Planner["AStarPlanner"]
+        Safety["ObstacleGuard"]
+        Pursuit["PursuitController"]
+        Control["RoverControl"]
+        RuntimeLog["RuntimeFileLog"]
+    end
+
+    subgraph Apple["Apple Intelligence and iOS Frameworks"]
+        direction TB
+        FoundationModels["Apple Intelligence<br/>Foundation Models / SystemLanguageModel"]
+        SpeechFramework["Speech framework<br/>SFSpeechRecognizer"]
+        AVFoundation["AVFoundation<br/>Audio capture"]
+        ARKit["ARKit<br/>World tracking, scene depth, mesh"]
+        VisionCoreML["Vision + Core ML<br/>Object detection runtime"]
+    end
+
+    subgraph Phone["iPhone Hardware"]
+        direction TB
+        Microphone["Microphone"]
+        RGBCamera["RGB camera"]
+        LiDAR["LiDAR scanner"]
+        Compute["CPU + Neural Engine"]
+        PhoneWiFi["Wi-Fi radio"]
+        Documents["Local Documents storage"]
+    end
+
+    subgraph Rover["Phrover Hardware"]
+        direction TB
+        ESP32["WAVE ROVER ESP32<br/>HTTP command server"]
+        RoverIMU["Rover IMU / feedback"]
+        MotorDriver["Motor controller"]
+        Motors["Left and right motors"]
+        Chassis["Wheels and chassis"]
+    end
+
+    subgraph External["Optional External Service"]
+        CloudAPI["Configured /rover/act API"]
+    end
+
+    AppEntry --> TalkUI
+    AppEntry --> DriveUI
+    TalkUI --> CameraPanel
+    TalkUI --> SpeechIn
+    TalkUI --> Agent
+    CameraPanel --> ARManager
+    CameraPanel --> Detector
+
+    Microphone --> AVFoundation
+    AVFoundation --> SpeechIn
+    SpeechIn --> SpeechFramework
+    SpeechFramework --> SpeechIn
+    SpeechIn --> Agent
+    Agent --> SpeechOut
+
+    Agent --> BrainAdapter
+    BrainAdapter --> FoundationModels
+    BrainAdapter --> CloudAPI
+    Agent --> Memory
+
+    RGBCamera --> ARKit
+    LiDAR --> ARKit
+    ARKit --> ARManager
+    ARManager --> Detector
+    Detector --> VisionCoreML
+    VisionCoreML --> Compute
+    ARManager --> Agent
+    Detector --> Agent
+
+    Agent --> Nav
+    ARManager --> Nav
+    Nav --> Mapping
+    Mapping --> Planner
+    Planner --> Pursuit
+    Safety --> Nav
+    Pursuit --> Nav
+    Nav --> Control
+
+    Control --> PhoneWiFi
+    PhoneWiFi --> ESP32
+    ESP32 --> RoverIMU
+    ESP32 --> MotorDriver
+    MotorDriver --> Motors
+    Motors --> Chassis
+
+    Agent --> RuntimeLog
+    ARManager --> RuntimeLog
+    Nav --> RuntimeLog
+    Control --> RuntimeLog
+    RuntimeLog --> Documents
+```
+
+Only Foundation Models/SystemLanguageModel is an Apple Intelligence component. Speech,
+AVFoundation, ARKit, Vision, and Core ML are Apple-provided iOS frameworks. The classes
+that call those frameworks, including `SpeechIn`, `ARSessionManager`, and `Detector`, are
+implemented in the Astral SDK.
+
+### Voice Target Navigation Sequence
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as Talk Screen
+    participant Speech as SpeechIn
+    participant Agent as MissionAgent
+    participant Brain as Hybrid/OnDevice Brain
+    participant Detect as RoverYOLO Detector
+    participant AR as ARSessionManager
+    participant Nav as NavigationController
+    participant Rover as WAVE ROVER
+
+    User->>UI: Hold microphone and say "Go to the table"
+    UI->>Speech: Capture audio
+    Speech-->>Agent: Final transcript
+
+    alt Command is "stop"
+        Agent->>Nav: cancel()
+        Nav->>Rover: T:0
+    else Navigation command
+        Agent->>Brain: Transcript + frame + objects + pose + memory
+        Brain-->>Agent: navigate(visualQuery("table"))
+        Agent->>Agent: Lock target query "table"
+
+        Agent->>Detect: Detect current RGB frame
+        Detect-->>Agent: Labels, confidence, bounding boxes
+
+        alt Table matched at confidence >= 90%
+            Agent->>AR: Unproject bounding-box center
+            AR-->>Agent: World target using LiDAR depth
+        else Target not detected
+            loop Up to 12 scan steps
+                Agent->>Agent: Wait and poll detector for 1 second
+                Agent->>Nav: Pulse-turn 30 degrees left/right
+                Nav->>Rover: Short wheel command
+                Nav->>Rover: Stop and settle
+                Agent->>Detect: Detect stable frame again
+            end
+        end
+
+        Agent->>Nav: Navigate to grounded target, stop at 0.30 m
+        Nav->>AR: Read pose, mesh, and forward clearance
+        Nav->>Nav: Build costmap and A* path
+
+        loop Every 0.1 seconds
+            Nav->>AR: Update pose and clearance
+            Nav->>Nav: Safety and progress checks
+            Nav->>Rover: T:1, left/right wheel speeds
+            Rover-->>Nav: HTTP 2xx acknowledgment
+
+            alt Clearance <= 0.60 m
+                Nav->>Rover: Limit wheel speed to 0.12 m/s
+            end
+        end
+
+        alt Clearance <= 0.40 m
+            Note over Nav,Rover: 10 cm braking lead for 30 cm settled stand-off
+            Nav->>Rover: T:0
+            Nav-->>Agent: arrived
+            Agent-->>UI: Ready
+        else Obstacle, link failure, or no progress
+            Nav->>Rover: T:0
+            Nav-->>Agent: failed
+            Agent->>Agent: Reacquire target or controlled recovery
+        end
+    end
+```
+
 ## Remaining Notes
 
 - Older builds only wrote brain errors, not every spoken status message. That is why the
