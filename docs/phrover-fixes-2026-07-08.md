@@ -8,7 +8,7 @@ appear as July 8, 2026 UTC.
 
 - Branch: `fix/speech-recognition`
 - Base before this workstream: `main` at `c2e8cf5`
-- Latest fix commit: `39e6bba Reset on-device brain session per decision`
+- Latest behavior fix commit: `0c27586 Fix visual target stopping distance`
 - Latest uncommitted update: runtime mission logging, rover command failure handling,
   app-start feedback enablement, wider LiDAR clearance sampling, requested-object scan
   locking, rover command retry handling, a less brittle comms watchdog, and post-turn
@@ -180,19 +180,19 @@ Key log findings:
 
 | Issue | Evidence / Symptom | Fix | Commit |
 | --- | --- | --- | --- |
-| Speech recognition crashed due to Swift concurrency queue isolation. | LLDB showed `_dispatch_assert_queue_fail` in `SpeechIn.requestAuthorization` and audio tap callbacks. | Moved speech authorization/audio callbacks onto the expected actor-safe path. | `d9db314 Fix speech recognition concurrency crashes` |
-| App signing failed with invalid Speech Recognition entitlement. | Xcode reported `com.apple.developer.speech-recognition not found and could not be included in profile`. | Removed the invalid entitlement so the app can be signed with the available profile. | `e4c6891 Remove invalid speech signing entitlement` |
-| Direct voice drive commands did not consistently send the expected rover commands. | Voice command path recognized simple commands but did not reliably drive the rover. | Added direct command handling for drive-style commands. | `dc37063 Fix direct voice drive commands` |
-| Interpreted voice rotation did not turn correctly. | User saw `Turn left` but the rover did not rotate as expected. | Added rotation command handling and tests for left/right wheel directions. | `35b8e39 Fix interpreted voice rotation` |
-| Talk screen status stayed `ready` even while a command was being processed. | UI showed the command text but did not show that the brain was thinking or acting. | Wired mission phase changes into the conversation UI so status can show processing state. | `0073059 Show voice command processing status` |
-| Speech recognition could start handling a command before recognition fully finished. | Voice flow could overlap speech capture and command handling. | Changed `SpeechIn` and `ConversationView` so command handling begins after final recognition. | `43b1756 Finish speech recognition before handling command` |
-| If the requested object was not visible, the rover did nothing useful. | User expected requests like chair/table to search if not detected. | Added mission behavior to explore known frontiers or rotate in place when a visual target cannot be grounded. | `1773ed5 Search when requested object is not visible` |
-| Brain failures were hard to diagnose after testing on the iPhone. | There was no durable app-side brain error file to pull from the phone. | Added `BrainErrorFileLog` writing detailed context to `Documents/phrover-brain-errors.log`. | `0839d1f Log brain errors to app documents` |
-| Stop voice command did not work while the brain was unavailable or busy. | Stop could still require a valid pose/brain path, so it could be blocked by the same failure. | Made emergency stop bypass missing pose and brain errors, directly canceling motion. | `482a0dc Bypass brain for voice emergency stop` |
-| Multiple voice commands could enter the brain at the same time. | FoundationModels logged `Attempted to call respond(to:) a second time before the model finished responding`. | Added mission-generation tracking so only one normal mission is handled at once, while stop invalidates the in-flight mission. | `f86c85e Fix voice command and navigation safety handling` |
-| LiDAR obstacle handling could keep the rover in a driving loop. | When LiDAR detected an obstacle, the code sent `stop()` but then slept and continued the loop. The app stayed busy instead of becoming ready. | On obstacle, the navigation loop now stops and exits. If the obstacle is near the target, state becomes `.arrived`; if it is a wall/early obstacle, state becomes `.failed(...)`. | `f86c85e Fix voice command and navigation safety handling` |
-| Cancel did not always return nav state to ready/idle. | `NavigationController.cancel()` stopped motors but did not update `state`. | `cancel()` now sets navigation state to `.idle`. | `f86c85e Fix voice command and navigation safety handling` |
-| On-device brain eventually failed with `Exceeded model context window size`. | Pulled logs at `2026-07-08T05:25:11Z` through `05:27:13Z` showed the context-window error. | `OnDeviceBrain` now creates a fresh FoundationModels session/responder for every decision instead of reusing one growing session. | `39e6bba Reset on-device brain session per decision` |
+| Speech recognition crashed due to Swift concurrency queue isolation. | LLDB showed `_dispatch_assert_queue_fail` in `SpeechIn.requestAuthorization` and audio tap callbacks. | Moved speech authorization/audio callbacks onto the expected actor-safe path. | `8302b0e Fix speech recognition concurrency crashes` |
+| App signing failed with invalid Speech Recognition entitlement. | Xcode reported `com.apple.developer.speech-recognition not found and could not be included in profile`. | Removed the invalid entitlement so the app can be signed with the available profile. | `aaf6a8b Remove invalid speech signing entitlement` |
+| Direct voice drive commands did not consistently send the expected rover commands. | Voice command path recognized simple commands but did not reliably drive the rover. | Added direct command handling for drive-style commands. | `dbba3d0 Fix direct voice drive commands` |
+| Interpreted voice rotation did not turn correctly. | User saw `Turn left` but the rover did not rotate as expected. | Added rotation command handling and tests for left/right wheel directions. | `45781fd Fix interpreted voice rotation` |
+| Talk screen status stayed `ready` even while a command was being processed. | UI showed the command text but did not show that the brain was thinking or acting. | Wired mission phase changes into the conversation UI so status can show processing state. | `8928a89 Show voice command processing status` |
+| Speech recognition could start handling a command before recognition fully finished. | Voice flow could overlap speech capture and command handling. | Changed `SpeechIn` and `ConversationView` so command handling begins after final recognition. | `ea6158a Finish speech recognition before handling command` |
+| If the requested object was not visible, the rover did nothing useful. | User expected requests like chair/table to search if not detected. | Added mission behavior to explore known frontiers or rotate in place when a visual target cannot be grounded. | `4e5da34 Search when requested object is not visible` |
+| Brain failures were hard to diagnose after testing on the iPhone. | There was no durable app-side brain error file to pull from the phone. | Added `BrainErrorFileLog` writing detailed context to `Documents/phrover-brain-errors.log`. | `1c74c5f Log brain errors to app documents` |
+| Stop voice command did not work while the brain was unavailable or busy. | Stop could still require a valid pose/brain path, so it could be blocked by the same failure. | Made emergency stop bypass missing pose and brain errors, directly canceling motion. | `00be62a Bypass brain for voice emergency stop` |
+| Multiple voice commands could enter the brain at the same time. | FoundationModels logged `Attempted to call respond(to:) a second time before the model finished responding`. | Added mission-generation tracking so only one normal mission is handled at once, while stop invalidates the in-flight mission. | `b7b6b0e Fix voice command and navigation safety handling` |
+| LiDAR obstacle handling could keep the rover in a driving loop. | When LiDAR detected an obstacle, the code sent `stop()` but then slept and continued the loop. The app stayed busy instead of becoming ready. | On obstacle, the navigation loop now stops and exits. If the obstacle is near the target, state becomes `.arrived`; if it is a wall/early obstacle, state becomes `.failed(...)`. | `b7b6b0e Fix voice command and navigation safety handling` |
+| Cancel did not always return nav state to ready/idle. | `NavigationController.cancel()` stopped motors but did not update `state`. | `cancel()` now sets navigation state to `.idle`. | `b7b6b0e Fix voice command and navigation safety handling` |
+| On-device brain eventually failed with `Exceeded model context window size`. | Pulled logs at `2026-07-08T05:25:11Z` through `05:27:13Z` showed the context-window error. | `OnDeviceBrain` now creates a fresh FoundationModels session/responder for every decision instead of reusing one growing session. | `2bb0913 Reset on-device brain session per decision` |
 | Talk could blink between `Thinking...` and `On it...` without anything happening. | The navigation loop used `try? await control.send(...)`, so rover HTTP failures were swallowed and nav could remain `.driving` forever. | Command send failures now stop the rover best-effort, set nav state to `.failed("Rover command failed: ...")`, exit the motion loop, and write `nav_command_failed` to the runtime log. | Uncommitted |
 | Talk could behave differently after switching to Drive view. | `DriveView` enabled rover feedback flow, but Talk/Navigate could run before that view was opened. | App startup now enables feedback flow once and records `feedback_flow_enabled` or `feedback_flow_failed` in `Documents/phrover-runtime.log`. | Uncommitted |
 | Forward clearance could display incorrectly and miss walls. | The previous LiDAR safety value sampled only the center 20% of the depth map and used raw `sceneDepth`. A wall slightly off the phone's center line could be missed. | AR now requests `smoothedSceneDepth` when available, prefers it over raw depth, samples a wider driving corridor, and logs `forward_clearance` about once per second. | Uncommitted |
@@ -224,17 +224,17 @@ Key log findings:
 
 | Commit | Local Time | Summary |
 | --- | --- | --- |
-| `d9db314` | 2026-07-07 11:15:44 PDT | Fix speech recognition concurrency crashes |
-| `e4c6891` | 2026-07-07 12:27:57 PDT | Remove invalid speech signing entitlement |
-| `dc37063` | 2026-07-07 13:01:23 PDT | Fix direct voice drive commands |
-| `35b8e39` | 2026-07-07 13:10:54 PDT | Fix interpreted voice rotation |
-| `0073059` | 2026-07-07 13:44:15 PDT | Show voice command processing status |
-| `43b1756` | 2026-07-07 13:56:40 PDT | Finish speech recognition before handling command |
-| `1773ed5` | 2026-07-07 14:42:59 PDT | Search when requested object is not visible |
-| `0839d1f` | 2026-07-07 15:10:55 PDT | Log brain errors to app documents |
-| `482a0dc` | 2026-07-07 17:28:13 PDT | Bypass brain for voice emergency stop |
-| `f86c85e` | 2026-07-07 22:21:03 PDT | Fix voice command and navigation safety handling |
-| `39e6bba` | 2026-07-07 22:37:21 PDT | Reset on-device brain session per decision |
+| `8302b0e` | 2026-07-07 11:15:44 PDT | Fix speech recognition concurrency crashes |
+| `aaf6a8b` | 2026-07-07 12:27:57 PDT | Remove invalid speech signing entitlement |
+| `dbba3d0` | 2026-07-07 13:01:23 PDT | Fix direct voice drive commands |
+| `45781fd` | 2026-07-07 13:10:54 PDT | Fix interpreted voice rotation |
+| `8928a89` | 2026-07-07 13:44:15 PDT | Show voice command processing status |
+| `ea6158a` | 2026-07-07 13:56:40 PDT | Finish speech recognition before handling command |
+| `4e5da34` | 2026-07-07 14:42:59 PDT | Search when requested object is not visible |
+| `1c74c5f` | 2026-07-07 15:10:55 PDT | Log brain errors to app documents |
+| `00be62a` | 2026-07-07 17:28:13 PDT | Bypass brain for voice emergency stop |
+| `b7b6b0e` | 2026-07-07 22:21:03 PDT | Fix voice command and navigation safety handling |
+| `2bb0913` | 2026-07-07 22:37:21 PDT | Reset on-device brain session per decision |
 
 ## Verification Run During The Workstream
 
@@ -546,7 +546,7 @@ Key log findings:
 ## Current Implementation Diagrams
 
 The diagrams below describe the implemented Phrover voice-to-motion path on branch
-`fix/speech-recognition` after commit `03f4f1b`.
+`fix/speech-recognition` after the visual-target stopping-distance work.
 
 ### Component Diagram
 
