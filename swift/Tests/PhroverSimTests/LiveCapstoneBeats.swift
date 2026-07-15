@@ -69,6 +69,9 @@ final class LiveCapstoneBeats: XCTestCase {
         let wallCollisions = collisions.count - personCollisions.count
         print("=== person-crossing: \(nearMisses.count) near-miss events, \(collisions.count) collisions "
             + "(\(personCollisions.count) with person, \(wallCollisions) wall/prop) ===")
+        for event in personCollisions {
+            print("=== person-collision detail: \(event["data"] ?? "?") at t=\(event["t"] ?? "?") ===")
+        }
         XCTAssertTrue(personCollisions.isEmpty, "rover made contact with the person")
 
         // Numeric trajectory check — a passing collision count alone doesn't prove the
@@ -84,6 +87,14 @@ final class LiveCapstoneBeats: XCTestCase {
         let maxY = ys.max() ?? Self.startPose.y
         print("=== person-crossing: pose trace y range [\(minY), \(maxY)] over \(ys.count) samples ===")
         XCTAssertGreaterThan(minY, 0.5, "rover approached/exited the depot's south exterior door (retreated the wrong way) instead of proceeding past the person")
+        // minY alone is not sufficient: it only proves the rover didn't retreat, not that
+        // it made real forward progress. Confirmed live — a take passed this exact check
+        // while never getting anywhere near the person at all (guard-stopped on every
+        // attempted navigate/explore target, pose_trace topping out at y=2.93, nowhere
+        // close to the person's y≈4 patrol line per env_depot.gd's PERSON_WAYPOINTS) and
+        // was wrongly declared a pass. "Crossing" requires actually reaching meaningfully
+        // past the patrol line, not just failing to retreat below the start.
+        XCTAssertGreaterThan(maxY, 4.5, "rover never actually got past the person — furthest north it reached was \(maxY), short of the person's y≈4 patrol line")
     }
 
     // MARK: - #3 planning with commitment (replan around a blocked door)
@@ -419,6 +430,11 @@ final class LiveCapstoneBeats: XCTestCase {
         print("=== goal-directed exploration: per-opening attempt counts \(attemptCounts) ===")
         XCTAssertTrue(overRepeated.isEmpty, "an opening was explored 3+ times — wandering, not goal-directed: \(overRepeated)")
         XCTAssertFalse(doneEvents.isEmpty, "mission never reached a final .done decision")
+        // "No repeats" and "reached done" are both vacuously true if the rover explored
+        // NOTHING at all (e.g. every attempt got guard-stopped and it gave up immediately)
+        // — the same class of gap found in testPersonCrossingLive's minY-only check. This
+        // test's whole point is exploration behavior, so assert some actually happened.
+        XCTAssertFalse(exploreDecisions.isEmpty, "mission never attempted a single explore — nothing to demonstrate")
     }
 
     // MARK: - #7 asking for help under genuine ambiguity

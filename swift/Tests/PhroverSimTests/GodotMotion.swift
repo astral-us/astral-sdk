@@ -115,15 +115,37 @@ final class GodotMotion: RoverMotion {
         // every time and never accumulating 30 ticks, hanging the mission indefinitely.
         // Confirmed live (49-minute and 5-minute stalls, both on the first `explore` in a
         // person-crossing mission) and reproduced with a free Godot-IPC-only repro.
+        //
+        // person_stop_active exemption: the person-safety governor's own natural-release
+        // path can legitimately need 20+ seconds of being held before a real crossing
+        // opportunity opens (see phrover_manager.gd's PERSON_OVERRIDE_MAX_SECONDS/
+        // PERSON_OVERRIDE_GRACE_SECONDS history — confirmed live via a free repro that a
+        // safe crossing needs one governor cycle of ~26s, sometimes several, to actually
+        // clear a moving person's patrol line). That's an order of magnitude longer than
+        // this detector's ~3s window, so without an exemption this fires and calls the
+        // whole crossing "failed" almost immediately after the governor first engages —
+        // long before the SAME governor cycle that would have let it through ever
+        // completes. Confirmed live this was the actual cause of testPersonCrossingLive
+        // never getting anywhere near the person (`maxY` topping out around 2.9-3.3):
+        // the mission-level no-op counter (MissionAgent.swift) then abandons the whole
+        // mission after just a handful of these fast, spurious "failed" navigate attempts.
+        // Only exempt while person_stop_active is true, not permanently — a rover that's
+        // ACTUALLY stuck for an unrelated reason (wall, unreachable goal) still needs this
+        // detector at full strength.
         var lastProgressDistToGoal: Double?
         var ticksSinceProgress = 0
         let maxTicksSinceProgress = 30  // ~3s at the 0.1s tick interval
 
         while !Task.isCancelled {
-            guard let pose = fetchPose() else { break }
+            guard let sample = fetchState() else { break }
+            let pose = sample.pose
 
             let distToGoal = pose.position.distance(to: goal)
-            if let last = lastProgressDistToGoal, last - distToGoal < 0.05 {
+            if sample.personStopActive {
+                // Held for a known, expected-to-clear reason — don't let it count against
+                // the stall budget, but don't manufacture "progress" either.
+                lastProgressDistToGoal = distToGoal
+            } else if let last = lastProgressDistToGoal, last - distToGoal < 0.05 {
                 ticksSinceProgress += 1
                 if ticksSinceProgress >= maxTicksSinceProgress {
                     link.call(["op": "phrover_stop", "id": rid])
@@ -224,11 +246,20 @@ final class GodotMotion: RoverMotion {
     }
 
     private func fetchPose() -> Pose2D? {
+        fetchState()?.pose
+    }
+
+    /// Pose plus `person_stop_active` (phrover_manager.gd's person-safety governor holding
+    /// the rover for a moving obstacle right now) in one IPC round-trip — the stall
+    /// detector in `drive()` needs both from the same instant, not two separate calls that
+    /// could straddle a tick and disagree.
+    private func fetchState() -> (pose: Pose2D, personStopActive: Bool)? {
         let r = link.call(["op": "phrover_state", "id": rid])
         guard r["ok"] as? Bool == true,
               let pose = godotDoubleArray(r["pose"]), pose.count == 3
         else { return nil }
-        return Pose2D(position: Vec2(pose[0], pose[1]), yaw: pose[2])
+        let personStopActive = r["person_stop_active"] as? Bool ?? false
+        return (Pose2D(position: Vec2(pose[0], pose[1]), yaw: pose[2]), personStopActive)
     }
 
     /// Inverse of `DifferentialDrive.wheels(v:w:wheelBase:maxWheelSpeed:)` — PursuitController
