@@ -398,6 +398,72 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(agent.phase, .idle)
     }
 
+    func testFailedScanTurnStopsWithoutTryingAnotherTurn() async {
+        let motion = FakeMotion()
+        motion.scanRotateOutcome = .failed("Rover command link lost.")
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "book",
+                            confidence: 0.95,
+                            normalizedPoint: CGPoint(x: 0.4, y: 0.6))
+        ]
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.navigate(.visualQuery("chair")), .done])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 visualTargetScanDelay: 0,
+                                 maxVisualTargetScanSteps: 3,
+                                 currentBrain: { brain })
+
+        await agent.handle("go to the chair")
+
+        XCTAssertEqual(motion.scanRotateCalls.count, 1)
+        XCTAssertEqual(voice.spoken, ["Rover command link lost."])
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testCancelledMissionDoesNotOverwriteReplacementMissionPhase() async {
+        let motion = FakeMotion()
+        motion.rotateDelay = 0.05
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "book",
+                            confidence: 0.95,
+                            normalizedPoint: CGPoint(x: 0.4, y: 0.6))
+        ]
+        let voice = FakeVoice()
+        let firstBrain = FakeBrain(script: [.navigate(.visualQuery("chair")), .done])
+        let replacementBrain = BlockingBrain()
+        var useReplacementBrain = false
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 visualTargetScanDelay: 0,
+                                 maxVisualTargetScanSteps: 3,
+                                 currentBrain: {
+                                     useReplacementBrain
+                                         ? replacementBrain as RoverBrain
+                                         : firstBrain as RoverBrain
+                                 })
+
+        let firstMission = Task { @MainActor in await agent.handle("go to the chair") }
+        while motion.rotateCalls.isEmpty {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        await agent.handle("stop")
+
+        useReplacementBrain = true
+        let replacementMission = Task { @MainActor in await agent.handle("go to the table") }
+        await replacementBrain.waitUntilEntered()
+        await firstMission.value
+
+        XCTAssertEqual(agent.phase, .thinking)
+
+        replacementBrain.finishAll(with: .done)
+        await replacementMission.value
+    }
+
     func testFridgeAliasMatchesRefrigeratorAndDirectionIsDefined() {
         let objects = [
             PerceivedObject(label: "refrigerator",
@@ -820,6 +886,7 @@ private final class FakeMotion: RoverMotion {
     var navigateOutcomes: [NavigationController.State] = []
     var rotateNeverCompletes = false
     var rotateDelay: TimeInterval = 0
+    var scanRotateOutcome: NavigationController.State?
     var onNavigate: ((Int) -> Void)?
     var onRotate: ((Double) -> Void)?
     var onScanRotate: ((Double) -> Void)?
@@ -860,6 +927,9 @@ private final class FakeMotion: RoverMotion {
         scanRotateCalls.append(angle)
         onScanRotate?(angle)
         await rotate(by: angle)
+        if let scanRotateOutcome {
+            state = scanRotateOutcome
+        }
     }
 
     func cancel() {
