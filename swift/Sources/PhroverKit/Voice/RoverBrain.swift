@@ -136,9 +136,49 @@ public enum RoverDecision: Equatable, Sendable {
     case ask(String)
     /// Speak, with no expectation of a reply.
     case say(String)
+    /// Claim a room/area (by id, from `MissionContext.teamContext.rooms`) for a
+    /// multi-rover team mission — broadcast to teammates over the mesh via
+    /// `MissionAgent`'s `RoverTeamRadio`. Capability "collaboration": shared intent and
+    /// market allocation are the brain's own reasoning over `teamContext`, not a fixed
+    /// protocol the app runs on the brain's behalf.
+    case claimRoom(String)
     case stop
     /// The mission is satisfied; stop and go idle.
     case done
+}
+
+/// A single rover or area a multi-rover team can claim, and the team's current knowledge
+/// of who has claimed what and who's still responding. Present in `MissionContext` only
+/// for team missions; `nil` for a solo rover.
+public struct TeamContext: Equatable {
+    public struct Room: Equatable {
+        public var id: String
+        public var worldPoint: Vec2
+        public init(id: String, worldPoint: Vec2) {
+            self.id = id
+            self.worldPoint = worldPoint
+        }
+    }
+    public struct Teammate: Equatable {
+        public var id: String
+        public var alive: Bool
+        public var claimedRoomIds: [String]
+        public init(id: String, alive: Bool, claimedRoomIds: [String]) {
+            self.id = id
+            self.alive = alive
+            self.claimedRoomIds = claimedRoomIds
+        }
+    }
+
+    public var myId: String
+    public var rooms: [Room]
+    public var teammates: [Teammate]
+
+    public init(myId: String, rooms: [Room], teammates: [Teammate]) {
+        self.myId = myId
+        self.rooms = rooms
+        self.teammates = teammates
+    }
 }
 
 /// What a brain returns each tick: the action, plus an optional rewrite of the mission
@@ -181,6 +221,21 @@ public struct MissionContext: Sendable {
     /// Set when a prior `.ask` produced no usable reply (timeout, or "I don't know") — lets
     /// a brain proceed best-effort instead of repeating the same question.
     public var lastAnswerWasInconclusive: Bool
+    /// Percent, 0-100. `nil` if the platform doesn't expose a battery (or hasn't reported
+    /// yet) — a brain that wants capability "self-model and calibrated uncertainty"
+    /// (comparing remaining range against return distance) needs this; most brains can
+    /// simply ignore it.
+    public var batteryPercent: Double?
+    /// Present only for a multi-rover team mission (capability "collaboration"): the
+    /// claimable rooms and the team's current knowledge of who has claimed what and
+    /// who's still responding. `nil` for a solo mission.
+    public var teamContext: TeamContext?
+    /// Human-readable "action → outcome" lines, oldest first, for the last few ticks
+    /// (see `MissionAgent`'s ring buffer) — lets a brain notice it's repeating itself or
+    /// failed to follow through on a narrated intention, which nothing else in the
+    /// context conveys (a single tick's snapshot looks identical whether it's the first
+    /// attempt or the fortieth).
+    public var recentActions: [String]
 
     public init(utterance: String? = nil,
                 frameJPEG: Data? = nil,
@@ -190,7 +245,10 @@ public struct MissionContext: Sendable {
                 memory: MissionMemory = MissionMemory(),
                 explorationCandidates: [ExplorationCandidate] = [],
                 plan: String? = nil,
-                lastAnswerWasInconclusive: Bool = false) {
+                lastAnswerWasInconclusive: Bool = false,
+                batteryPercent: Double? = nil,
+                teamContext: TeamContext? = nil,
+                recentActions: [String] = []) {
         self.utterance = utterance
         self.frameJPEG = frameJPEG
         self.visibleObjects = visibleObjects
@@ -200,6 +258,9 @@ public struct MissionContext: Sendable {
         self.explorationCandidates = explorationCandidates
         self.plan = plan
         self.lastAnswerWasInconclusive = lastAnswerWasInconclusive
+        self.batteryPercent = batteryPercent
+        self.teamContext = teamContext
+        self.recentActions = recentActions
     }
 }
 
