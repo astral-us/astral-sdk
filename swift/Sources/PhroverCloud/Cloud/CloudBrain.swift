@@ -74,6 +74,13 @@ private struct ActRequest: Encodable {
     struct WireCandidate: Encodable {
         let id: String; let x: Double; let y: Double; let widthMeters: Double; let status: String
     }
+    struct WireTeamRoom: Encodable { let id: String; let x: Double; let y: Double }
+    struct WireTeammate: Encodable { let id: String; let alive: Bool; let claimedRoomIds: [String] }
+    struct WireTeamContext: Encodable {
+        let myId: String
+        let rooms: [WireTeamRoom]
+        let teammates: [WireTeammate]
+    }
 
     let utterance: String?
     let frameJPEGBase64: String?
@@ -84,6 +91,9 @@ private struct ActRequest: Encodable {
     let explorationCandidates: [WireCandidate]
     let plan: String?
     let lastAnswerWasInconclusive: Bool
+    let teamContext: WireTeamContext?
+    let batteryPercent: Double?
+    let recentActions: [String]
 
     init(_ context: MissionContext) {
         utterance = context.utterance
@@ -107,6 +117,14 @@ private struct ActRequest: Encodable {
         }
         plan = context.plan
         lastAnswerWasInconclusive = context.lastAnswerWasInconclusive
+        teamContext = context.teamContext.map { tc in
+            WireTeamContext(
+                myId: tc.myId,
+                rooms: tc.rooms.map { WireTeamRoom(id: $0.id, x: $0.worldPoint.x, y: $0.worldPoint.y) },
+                teammates: tc.teammates.map { WireTeammate(id: $0.id, alive: $0.alive, claimedRoomIds: $0.claimedRoomIds) })
+        }
+        batteryPercent = context.batteryPercent
+        recentActions = context.recentActions
     }
 
     private static func wireNavState(_ state: NavigationController.State) -> String {
@@ -144,6 +162,12 @@ private struct ActResponse: Decodable {
         case "explore":
             guard let candidateId, !candidateId.isEmpty else { return nil }
             return .explore(candidateId: candidateId)
+        case "claimRoom":
+            // Reuses the same `candidateId` wire field as explore — both are just "an id
+            // from a list the request offered" (rooms vs. openings), no need for a
+            // second field crossing the same JSON boundary.
+            guard let candidateId, !candidateId.isEmpty else { return nil }
+            return .claimRoom(candidateId)
         case "lookAround":
             return .lookAround(angle: angle ?? .pi / 2)
         case "ask":

@@ -111,6 +111,9 @@ public final class NavigationController {
         loop?.cancel()
         loop = nil
         Task { try? await control.stop() }
+        // Without this, an external cancel (e.g. a hard-stop bypassing the brain) leaves
+        // `state` at `.driving` forever, so anything polling `state == .driving` to know
+        // when motion has settled never returns.
         state = .idle
     }
 

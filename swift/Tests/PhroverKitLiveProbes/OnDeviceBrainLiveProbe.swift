@@ -91,6 +91,8 @@ final class OnDeviceBrainLiveProbe: XCTestCase {
                 }
             case .lookAround, .say:
                 break // no state change
+            case .claimRoom(let roomId):
+                print("     (claimRoom \(roomId) — no team context in this single-rover probe)")
             case .ask(let question):
                 print("     asked: \"\(question)\" — replying \"I'm not sure, sorry.\"")
                 let reply = "I'm not sure, sorry."
