@@ -19,7 +19,6 @@ struct ConversationView: View {
     @State private var speechIn = SpeechIn()
     @State private var speechOut = SpeechOut()
     @State private var agent: MissionAgent?
-    @State private var missionPhase: MissionAgent.Phase = .idle
     @State private var authorized = false
     @State private var detector: Detector?
 
@@ -71,9 +70,7 @@ struct ConversationView: View {
             let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
             let onDevice = OnDeviceBrain()
             let brain: RoverBrain = cloudBrain.map { HybridBrain(cloud: $0, onDevice: onDevice) } ?? onDevice
-            agent = MissionAgent(motion: nav, perception: perception, voice: voice, phaseDidChange: { phase in
-                missionPhase = phase
-            }) { brain }
+            agent = MissionAgent(motion: nav, perception: perception, voice: voice, currentBrain: { brain })
         }
     }
 
@@ -101,14 +98,13 @@ struct ConversationView: View {
             return speechIn.partialTranscript.isEmpty ? "Listening…" : "Processing speech…"
         }
         if speechIn.state == .processing { return "Thinking…" }
-        return phaseLabel(missionPhase)
+        return phaseLabel(agent?.phase ?? .idle)
     }
 
     private func startListening() {
         guard authorized, speechIn.state != .listening else { return }
         try? speechIn.start { utterance in
             Task { @MainActor in
-                missionPhase = .thinking
                 await agent?.handle(utterance)
             }
         }

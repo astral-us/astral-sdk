@@ -150,8 +150,8 @@ public enum RoverDecision: Equatable, Sendable {
 /// A single rover or area a multi-rover team can claim, and the team's current knowledge
 /// of who has claimed what and who's still responding. Present in `MissionContext` only
 /// for team missions; `nil` for a solo rover.
-public struct TeamContext: Equatable {
-    public struct Room: Equatable {
+public struct TeamContext: Equatable, Sendable {
+    public struct Room: Equatable, Sendable {
         public var id: String
         public var worldPoint: Vec2
         public init(id: String, worldPoint: Vec2) {
@@ -159,7 +159,7 @@ public struct TeamContext: Equatable {
             self.worldPoint = worldPoint
         }
     }
-    public struct Teammate: Equatable {
+    public struct Teammate: Equatable, Sendable {
         public var id: String
         public var alive: Bool
         public var claimedRoomIds: [String]
