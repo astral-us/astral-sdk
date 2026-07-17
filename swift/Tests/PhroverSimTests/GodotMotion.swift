@@ -149,7 +149,21 @@ final class GodotMotion: RoverMotion {
                 ticksSinceProgress += 1
                 if ticksSinceProgress >= maxTicksSinceProgress {
                     link.call(["op": "phrover_stop", "id": rid])
-                    state = .failed("no progress for \(maxTicksSinceProgress) ticks — likely guard-stopped short of the goal")
+                    // Wording matters here, not just cosmetically: MissionAgent's
+                    // `isBlockedHeading` recovery classifier pattern-matches "Obstacle
+                    // ahead" (the real NavigationController's exact obstacle-stop message)
+                    // to decide whether a stalled `.failed` state is worth a rotate-and-
+                    // retry recovery vs. treated as fatal. A stall this detector catches is
+                    // functionally the same situation a real obstacle-stop is (rover can't
+                    // reach the goal on the current heading) even though it's detected via
+                    // lack of positional progress rather than live proximity — matching the
+                    // real vocabulary lets the mission agent's existing recovery path
+                    // (rotate ~30°, then let the brain retry) engage instead of ending the
+                    // mission on the very first stall, which is what a mismatched message
+                    // caused after merging in the hardened MissionAgent (confirmed:
+                    // testReplansAroundBlockedDoor went from passing to failing in ~20s
+                    // until this was fixed).
+                    state = .failed("Obstacle ahead — no progress for \(maxTicksSinceProgress) ticks, likely guard-stopped short of the goal.")
                     return
                 }
             } else {

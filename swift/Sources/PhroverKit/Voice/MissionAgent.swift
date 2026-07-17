@@ -334,6 +334,11 @@ public final class MissionAgent {
         let missionUtterance = firstUtterance ?? ""
         var lockedVisualQuery: String?
         var visualTargetScanSteps = 0
+        // Distinguishes "the brain itself failed" (missing/timed out/errored) from
+        // genuinely exhausting every tick without the brain ever stopping — only the
+        // latter should get the "used up my time" wrap-up; the brain-failure paths
+        // already spoke their own message and shouldn't pile a second one on top.
+        var brainFailed = false
 
         for tick in 0..<maxTicksPerUtterance {
             guard isCurrentMission(missionID) else {
@@ -346,8 +351,8 @@ public final class MissionAgent {
                     "mission": "\(missionID)",
                     "reason": "missing_brain"
                 ])
-                phase = .idle
-                return
+                brainFailed = true
+                break
             }
 
             phase = .thinking
@@ -378,8 +383,8 @@ public final class MissionAgent {
                     "mission": "\(missionID)",
                     "timeout": String(format: "%.2f", brainDecisionTimeout)
                 ])
-                phase = .idle
-                return
+                brainFailed = true
+                break
             } catch {
                 guard isCurrentMission(missionID) else {
                     RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
@@ -391,8 +396,8 @@ public final class MissionAgent {
                     "mission": "\(missionID)",
                     "error": error.localizedDescription
                 ])
-                phase = .idle
-                return
+                brainFailed = true
+                break
             }
             guard isCurrentMission(missionID) else {
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
@@ -548,8 +553,10 @@ public final class MissionAgent {
             }
         }
 
-        voice.speak("I've used up the time I had for this and want to check in rather than keep going. "
-            + wrapUpFindings())
+        if !brainFailed {
+            voice.speak("I've used up the time I had for this and want to check in rather than keep going. "
+                + wrapUpFindings())
+        }
         phase = .idle
         RuntimeFileLog.append("mission_finished", fields: ["mission": "\(missionID)"])
     }
