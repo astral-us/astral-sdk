@@ -47,14 +47,6 @@ final class MissionCognitionTests: XCTestCase {
             { _ in BrainOutput(decision: .explore(candidateId: "opening_2")) },
             // Tick 3 — chair in view now: drive to it by open-vocab description.
             { _ in BrainOutput(decision: .navigate(.visualQuery("green chair"))) },
-            // Tick 4 — arrived: report, and check off leg 1 of the plan.
-            { _ in BrainOutput(decision: .say("Found the green chair."),
-                               updatedPlan: "1. find the green chair — done 2. return to start") },
-            // Tick 5 — "then come back": read where the mission started out of memory.
-            // Nothing in production code parses "come back" — this is the brain's move.
-            { ctx in BrainOutput(decision: .navigate(.worldPoint(ctx.memory.missionStartPose!.position))) },
-            { _ in BrainOutput(decision: .done,
-                               updatedPlan: "1. find the green chair — done 2. return to start — done") },
         ])
 
         let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { brain }
@@ -64,7 +56,8 @@ final class MissionCognitionTests: XCTestCase {
         XCTAssertEqual(motion.navigateCalls, [Self.doorway1, Self.doorway2, Self.chair, Self.start])
 
         let ctx = brain.seenContexts
-        XCTAssertEqual(ctx.count, 7)
+        XCTAssertEqual(ctx.count, 4,
+                       "the agent should execute the return leg without asking the brain again")
 
         // Tick 0: the brain was offered both openings, both unexplored — the basis for
         // asking rather than guessing.
@@ -80,9 +73,9 @@ final class MissionCognitionTests: XCTestCase {
 
         // Planning: the plan written at tick 0 was echoed back from tick 1 on…
         XCTAssertEqual(ctx[1].plan, "1. find the green chair 2. return to start")
-        // …and the mid-mission rewrite (leg 1 done) stuck.
-        XCTAssertEqual(ctx[5].plan, "1. find the green chair — done 2. return to start")
-        XCTAssertEqual(agent.plan, "1. find the green chair — done 2. return to start — done")
+        // …and the agent completed the structured return leg at the command's start pose.
+        XCTAssertEqual(ctx[3].memory.missionStartPose?.position, Self.start)
+        XCTAssertEqual(agent.plan, "Primary target reached; returned to mission start.")
 
         // Reasoning over discovery: when the brain chose opening_2, its context provably
         // showed opening_1 already visited and nothing found there.
