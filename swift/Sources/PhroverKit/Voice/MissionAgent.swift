@@ -321,8 +321,18 @@ public final class MissionAgent {
             }
         }
 
-        memory.record(utterance: trimmedUtterance, at: pose)
+        plan = nil
+        recentActionLines.removeAll(keepingCapacity: true)
+        lastDecision = nil
+        consecutiveNoOpTicks = 0
+        memory.beginMission(utterance: trimmedUtterance, at: pose)
         lastAnswerWasInconclusive = false
+        RuntimeFileLog.append("mission_started", fields: [
+            "mission": "\(missionID)",
+            "start_x": String(format: "%.2f", pose.position.x),
+            "start_y": String(format: "%.2f", pose.position.y),
+            "return_requested": Self.hasReturnIntent(trimmedUtterance) ? "true" : "false"
+        ])
         await runLoop(firstUtterance: trimmedUtterance, missionID: missionID)
     }
 
@@ -406,7 +416,13 @@ public final class MissionAgent {
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return
             }
-            if let updated = output.updatedPlan, !updated.isEmpty { plan = updated }
+            if let updated = output.updatedPlan, !updated.isEmpty {
+                plan = updated
+                RuntimeFileLog.append("mission_plan_updated", fields: [
+                    "mission": "\(missionID)",
+                    "plan": updated
+                ])
+            }
             RuntimeFileLog.append("mission_decision", fields: [
                 "mission": "\(missionID)",
                 "tick": "\(tick)",
@@ -444,12 +460,26 @@ public final class MissionAgent {
                         }
                         if await recoverOrStopMissionIfMotionFailed(missionID: missionID,
                                                                     recoverFromBlockedHeading: true) { return }
-                        phase = .idle
-                        RuntimeFileLog.append("mission_target_navigation_done", fields: [
-                            "mission": "\(missionID)",
-                            "target": targetDescription(effectiveTarget)
-                        ])
-                        return
+                        if await completeReturnLegIfNeeded(after: effectiveTarget,
+                                                           missionID: missionID,
+                                                           missionUtterance: missionUtterance,
+                                                           lockedVisualQuery: &lockedVisualQuery) {
+                            return
+                        }
+                        if finishMissionIfVisualTargetArrived(effectiveTarget,
+                                                              missionID: missionID,
+                                                              missionUtterance: missionUtterance) {
+                            return
+                        }
+                        outcome = describeMotionOutcome(label: "navigate", poseBefore: poseBefore)
+                        if recordTick(decision: decision,
+                                      poseBefore: poseBefore,
+                                      newObjects: newObjects,
+                                      outcome: outcome) {
+                            phase = .idle
+                            return
+                        }
+                        continue
                     case .cancelled:
                         phase = .idle
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
@@ -481,6 +511,12 @@ public final class MissionAgent {
                 }
                 if await recoverOrStopMissionIfMotionFailed(missionID: missionID,
                                                             recoverFromBlockedHeading: true) { return }
+                if await completeReturnLegIfNeeded(after: effectiveTarget,
+                                                   missionID: missionID,
+                                                   missionUtterance: missionUtterance,
+                                                   lockedVisualQuery: &lockedVisualQuery) {
+                    return
+                }
                 if finishMissionIfVisualTargetArrived(effectiveTarget,
                                                        missionID: missionID,
                                                        missionUtterance: missionUtterance) {
@@ -993,6 +1029,162 @@ public final class MissionAgent {
         return true
     }
 
+    private func completeReturnLegIfNeeded(after target: NavigationTarget,
+                                           missionID: Int,
+                                           missionUtterance: String,
+                                           lockedVisualQuery: inout String?) async -> Bool {
+        guard case .arrived = motion.state,
+              case .visualQuery = target,
+              Self.hasReturnIntent(missionUtterance),
+              let start = memory.missionStartPose else {
+            return false
+        }
+
+        lockedVisualQuery = nil
+        RuntimeFileLog.append("mission_leg_completed", fields: [
+            "mission": "\(missionID)",
+            "leg": "primary_target",
+            "target": targetDescription(target)
+        ])
+        RuntimeFileLog.append("mission_return_started", fields: [
+            "mission": "\(missionID)",
+            "goal_x": String(format: "%.2f", start.position.x),
+            "goal_y": String(format: "%.2f", start.position.y)
+        ])
+
+        guard await alignHeadingForReturn(to: start.position, missionID: missionID) else {
+            return true
+        }
+        guard await navigateReturn(to: start.position, missionID: missionID) else { return true }
+
+        phase = .idle
+        plan = "Primary target reached; returned to mission start."
+        RuntimeFileLog.append("mission_return_completed", fields: [
+            "mission": "\(missionID)",
+            "goal_x": String(format: "%.2f", start.position.x),
+            "goal_y": String(format: "%.2f", start.position.y)
+        ])
+        return true
+    }
+
+    private func alignHeadingForReturn(to goal: Vec2, missionID: Int) async -> Bool {
+        guard let pose = perception.pose else {
+            failReturnMission(missionID: missionID,
+                              reason: "I lost my position before I could return.")
+            return false
+        }
+
+        let offset = goal - pose.position
+        guard offset.length > 0.05 else { return true }
+
+        let targetYaw = atan2(offset.y, offset.x)
+        var remaining = normalizeAngle(targetYaw - pose.yaw)
+        let maximumStep = max(abs(blockedHeadingRecoveryAngle), .pi / 180)
+        var step = 0
+
+        RuntimeFileLog.append("mission_return_alignment_started", fields: [
+            "mission": "\(missionID)",
+            "current_yaw_deg": String(format: "%.0f", pose.yaw * 180 / .pi),
+            "target_yaw_deg": String(format: "%.0f", targetYaw * 180 / .pi),
+            "turn_deg": String(format: "%.0f", remaining * 180 / .pi)
+        ])
+
+        while abs(remaining) > .pi / 180 {
+            guard isCurrentMission(missionID) else {
+                phase = .idle
+                RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                return false
+            }
+
+            let angle = min(abs(remaining), maximumStep) * (remaining < 0 ? -1 : 1)
+            step += 1
+            RuntimeFileLog.append("mission_return_alignment_step", fields: [
+                "mission": "\(missionID)",
+                "step": "\(step)",
+                "angle_deg": String(format: "%.0f", angle * 180 / .pi)
+            ])
+            await motion.rotateForScan(by: angle)
+
+            if case .failed(let reason) = motion.state {
+                failReturnMission(missionID: missionID, reason: reason)
+                return false
+            }
+            remaining -= angle
+        }
+
+        RuntimeFileLog.append("mission_return_alignment_completed", fields: [
+            "mission": "\(missionID)",
+            "steps": "\(step)"
+        ])
+        return true
+    }
+
+    private func navigateReturn(to goal: Vec2, missionID: Int) async -> Bool {
+        let maximumAttempts = 2
+
+        for attempt in 1...maximumAttempts {
+            RuntimeFileLog.append("mission_return_navigation_attempt", fields: [
+                "mission": "\(missionID)",
+                "attempt": "\(attempt)",
+                "max": "\(maximumAttempts)"
+            ])
+            motion.navigate(to: goal)
+            await waitForMotionToSettle()
+
+            guard isCurrentMission(missionID) else {
+                phase = .idle
+                RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                return false
+            }
+
+            if case .arrived = motion.state { return true }
+
+            if case .failed(let reason) = motion.state,
+               Self.isBlockedHeading(reason),
+               attempt < maximumAttempts {
+                RuntimeFileLog.append("mission_return_recovery", fields: [
+                    "mission": "\(missionID)",
+                    "attempt": "\(attempt)",
+                    "reason": reason,
+                    "recovery": recoveryDescription
+                ])
+                await rotateForBlockedHeadingRecovery(missionID: missionID)
+                if case .failed(let recoveryReason) = motion.state {
+                    failReturnMission(missionID: missionID, reason: recoveryReason)
+                    return false
+                }
+                continue
+            }
+
+            let reason: String
+            if case .failed(let failureReason) = motion.state {
+                reason = failureReason
+            } else {
+                reason = "Return navigation stopped before reaching the start."
+            }
+            failReturnMission(missionID: missionID, reason: reason)
+            return false
+        }
+
+        failReturnMission(missionID: missionID,
+                          reason: "I couldn't find a clear route back to the start.")
+        return false
+    }
+
+    private func failReturnMission(missionID: Int, reason: String) {
+        motion.cancel()
+        voice.speak(reason)
+        phase = .idle
+        RuntimeFileLog.append("mission_motion_failed", fields: [
+            "mission": "\(missionID)",
+            "reason": reason
+        ])
+        RuntimeFileLog.append("mission_return_failed", fields: [
+            "mission": "\(missionID)",
+            "reason": reason
+        ])
+    }
+
     private func recoverVisualNavigation(_ target: NavigationTarget,
                                          missionID: Int,
                                          scanSteps: inout Int,
@@ -1055,12 +1247,26 @@ public final class MissionAgent {
 
     private static func hasFollowUpIntent(_ text: String) -> Bool {
         let lowercased = text.lowercased()
-        return lowercased.contains("come back")
-            || lowercased.contains("go back")
-            || lowercased.contains("and back")
-            || lowercased.contains("return")
+        return hasReturnIntent(lowercased)
             || lowercased.contains(" then ")
             || lowercased.hasPrefix("then ")
+    }
+
+    private static func hasReturnIntent(_ text: String) -> Bool {
+        let lowercased = text.lowercased()
+        let trimmed = lowercased.trimmingCharacters(in: .whitespacesAndNewlines)
+        return lowercased.contains("come back")
+            || lowercased.contains("and back")
+            || lowercased.contains("then go back")
+            || lowercased.contains("and go back")
+            || lowercased.contains("then return")
+            || lowercased.contains("and return")
+            || lowercased.contains("return to start")
+            || lowercased.contains("return to the start")
+            || lowercased.contains("return here")
+            || lowercased.contains("return home")
+            || trimmed == "go back"
+            || trimmed == "return"
     }
 
     private func waitForMotionToSettle() async {

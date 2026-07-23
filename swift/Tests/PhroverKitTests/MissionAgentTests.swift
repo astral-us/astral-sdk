@@ -46,6 +46,154 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(agent.phase, .idle)
     }
 
+    func testVisualTargetReturnMissionUsesCurrentCommandStartPose() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.34, y: 0.5))
+        ]
+        motion.onNavigate = { _ in
+            perception.pose = Pose2D(position: motion.navigateCalls.last!, yaw: 0)
+        }
+        let brain = FakeBrain(script: [
+            .navigate(.visualQuery("the refrigerator")),
+            .navigate(.visualQuery("the refrigerator")),
+            .navigate(.visualQuery("the green refrigerator")),
+        ])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: FakeVoice(),
+                                 currentBrain: { brain })
+
+        perception.unprojectResult = Vec2(1, 2)
+        await agent.handle("go to refrigerator")
+
+        let secondMissionStart = perception.pose!.position
+        perception.unprojectResult = Vec2(4, 5)
+        await agent.handle("go to refrigerator and come back")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1, 2), Vec2(4, 5), secondMissionStart])
+        XCTAssertEqual(brain.seenContexts.count, 2,
+                       "the return leg should not ask the brain to search for the refrigerator again")
+        XCTAssertEqual(brain.seenContexts[1].memory.missionStartPose?.position, secondMissionStart)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testVisualTargetReturnMissionTurnsTowardStartBeforeNavigatingBack() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.unprojectResult = Vec2(1, 0)
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(1, 0), yaw: 0)
+        }
+        let brain = FakeBrain(script: [.navigate(.visualQuery("the refrigerator"))])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: FakeVoice(),
+                                 currentBrain: { brain })
+
+        await agent.handle("go to refrigerator and come back")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1, 0), .zero])
+        XCTAssertFalse(motion.scanRotateCalls.isEmpty)
+        XCTAssertEqual(motion.scanRotateCalls.reduce(0, +), .pi, accuracy: 0.001)
+        XCTAssertTrue(motion.scanRotateCalls.allSatisfy { abs($0) <= .pi / 6 + 0.001 })
+    }
+
+    func testVisualTargetReturnMissionRetriesAfterBlockedHeading() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.unprojectResult = Vec2(1, 0)
+        motion.navigateOutcomes = [
+            .arrived,
+            .failed("Obstacle ahead at 0.40 m."),
+            .arrived,
+        ]
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(1, 0), yaw: .pi)
+        }
+        let brain = FakeBrain(script: [.navigate(.visualQuery("the refrigerator"))])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: FakeVoice(),
+                                 currentBrain: { brain })
+
+        await agent.handle("go to refrigerator and come back")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1, 0), .zero, .zero])
+        XCTAssertEqual(motion.scanRotateCalls, [.pi / 6])
+        XCTAssertEqual(agent.plan, "Primary target reached; returned to mission start.")
+    }
+
+    func testReturnToVisualTargetDoesNotCreateRoundTrip() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.34, y: 0.5))
+        ]
+        let brain = FakeBrain(script: [
+            .navigate(.visualQuery("the refrigerator")),
+            .done,
+        ])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: FakeVoice(),
+                                 currentBrain: { brain })
+
+        await agent.handle("return to refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [perception.unprojectResult])
+        XCTAssertEqual(brain.seenContexts.count, 1)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testNewCommandClearsPlanAndRecentActionsButPreservesRememberedObjects() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "chair",
+                            confidence: 0.96,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        let brain = OutputBrain(outputs: [
+            BrainOutput(decision: .say("I see it."), updatedPlan: "old mission plan"),
+            BrainOutput(decision: .done),
+            BrainOutput(decision: .done),
+        ])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: FakeVoice(),
+                                 currentBrain: { brain })
+
+        await agent.handle("remember the chair")
+        XCTAssertEqual(agent.plan, "old mission plan")
+
+        perception.pose = Pose2D(position: Vec2(3, 4), yaw: 0)
+        await agent.handle("new mission")
+
+        let secondMissionContext = brain.seenContexts[2]
+        XCTAssertNil(secondMissionContext.plan)
+        XCTAssertTrue(secondMissionContext.recentActions.isEmpty)
+        XCTAssertEqual(secondMissionContext.memory.missionStartPose?.position, Vec2(3, 4))
+        XCTAssertTrue(secondMissionContext.memory.rememberedObjects.contains { $0.label == "chair" })
+    }
+
     func testVisualTargetNavigationUsesThirtyCentimeterStopDistance() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -764,6 +912,19 @@ private final class FakeBrain: RoverBrain {
     func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         seenContexts.append(context)
         return BrainOutput(decision: script.isEmpty ? .done : script.removeFirst())
+    }
+}
+
+@MainActor
+private final class OutputBrain: RoverBrain {
+    private var outputs: [BrainOutput]
+    private(set) var seenContexts: [MissionContext] = []
+
+    init(outputs: [BrainOutput]) { self.outputs = outputs }
+
+    func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        seenContexts.append(context)
+        return outputs.isEmpty ? BrainOutput(decision: .done) : outputs.removeFirst()
     }
 }
 

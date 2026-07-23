@@ -19,10 +19,20 @@ public final class HybridBrain: RoverBrain {
     }
 
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
-        guard isOnline() else { return try await onDevice.nextAction(context) }
+        guard isOnline() else {
+            RuntimeFileLog.append("mission_brain_selected", fields: ["brain": "on_device", "reason": "offline"])
+            return try await onDevice.nextAction(context)
+        }
         do {
-            return try await cloud.nextAction(context)
+            let output = try await cloud.nextAction(context)
+            RuntimeFileLog.append("mission_brain_selected", fields: ["brain": "cloud"])
+            return output
         } catch {
+            RuntimeFileLog.append("mission_brain_selected", fields: [
+                "brain": "on_device",
+                "reason": "cloud_failed",
+                "error": error.localizedDescription
+            ])
             return try await onDevice.nextAction(context)
         }
     }

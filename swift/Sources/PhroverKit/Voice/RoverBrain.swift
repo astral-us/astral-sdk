@@ -62,6 +62,14 @@ public struct MissionMemory: Sendable {
 
     public init() {}
 
+    /// Starts a new operator command while retaining long-term conversation and object
+    /// memory. Return-style instructions must use the pose where this command began, not
+    /// the first pose observed during the lifetime of the app's `MissionAgent`.
+    public mutating func beginMission(utterance: String, at pose: Pose2D) {
+        missionStartPose = pose
+        turns.append(Turn(utterance: utterance, pose: pose))
+    }
+
     public mutating func record(utterance: String, at pose: Pose2D) {
         if missionStartPose == nil { missionStartPose = pose }
         turns.append(Turn(utterance: utterance, pose: pose))
