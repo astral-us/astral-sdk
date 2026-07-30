@@ -51,9 +51,24 @@ The tracker exposes:
 - reliability state and a concrete unreliability reason;
 - reset for a new scan step.
 
-Projection onto gravity makes the measurement independent of the phone’s fixed mounting orientation and avoids Euler-yaw singularities. Samples with non-monotonic timestamps, excessive gaps, unavailable gravity, or non-finite values are rejected. A rejected sample cannot silently advance scan completion.
+Projection onto gravity makes the measurement independent of the phone’s fixed mounting orientation and avoids Euler-yaw singularities. The signed rover rate is `dot(rotationRate, normalizedGravity)`: Core Motion gravity points down, matching the positive direction of the existing AR ground-plane yaw convention. Samples with non-monotonic timestamps, excessive gaps, unavailable gravity, or non-finite values are rejected. A rejected sample cannot silently advance scan completion.
 
 `ARSessionManager` owns Core Motion lifecycle and the tracker. Navigation consumes a relative scan-heading interface rather than `CMAttitude.yaw`. Raw attitude yaw is not a fallback.
+
+Initial reliability constants are explicit and configuration-backed:
+
+- device-motion update interval: 1/60 second;
+- maximum integration gap: 0.10 seconds;
+- maximum heading sample age: 0.15 seconds;
+- accepted gravity magnitude: 0.8–1.2 g;
+- requested scan step: 30 degrees with the existing 7-degree completion tolerance;
+- minimum pulse duration: 0.02 seconds;
+- settle duration: 0.75 seconds;
+- maximum pulses per step: 8;
+- unexpected scan translation: 0.10 meters;
+- maximum settled AR/inertial rotation disagreement: 15 degrees.
+
+Values may be tightened after trace-backed physical calibration, but changing them requires updated tests and telemetry evidence.
 
 ### Scan controller
 
@@ -81,8 +96,8 @@ During a scan, invalidation is based on:
 - session-generation change;
 - tracking loss or failure to recover after settling;
 - unavailable or stale pose;
-- unexpected translation beyond the configured bound;
-- material disagreement between settled AR rotation and reliable inertial rotation.
+- unexpected translation beyond 0.10 meters;
+- settled AR rotation differing from reliable inertial rotation by more than 15 degrees.
 
 A normal commanded yaw larger than the old 20-degree threshold is accepted when direction and magnitude are consistent with relative inertial rotation. Outside commanded scans, existing pose-safety behavior remains unchanged.
 
