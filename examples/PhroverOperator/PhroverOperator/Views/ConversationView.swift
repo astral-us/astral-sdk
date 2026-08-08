@@ -14,14 +14,17 @@ import UIKit
 struct ConversationView: View {
     let ar: ARSessionManager
     let nav: NavigationController
+    let topology: SessionRoomTopology
     let cloudBrain: CloudBrain?
+    let doorwayEvidenceProvider: CloudDoorwayEvidenceProvider?
 
     @State private var speechIn = SpeechIn()
     @State private var speechOut = SpeechOut()
     @State private var agent: MissionAgent?
     @State private var missionPhase: MissionAgent.Phase = .idle
+    @State private var lastCommand = LastCommandState()
     @State private var authorized = false
-    @State private var detector: Detector?
+    @State private var navigationDebug = NavigationDebugSummary()
 
     var body: some View {
         VStack(spacing: 18) {
@@ -29,13 +32,34 @@ struct ConversationView: View {
                 Text(statusLabel).font(.headline)
             }
 
-            LiveCameraDebugPanel(ar: ar, detector: detector)
+            LiveCameraDebugPanel(ar: ar, summary: navigationDebug)
                 .frame(maxWidth: 320)
 
             Text(speechIn.partialTranscript)
                 .foregroundStyle(.secondary)
                 .frame(minHeight: 40)
                 .multilineTextAlignment(.center)
+
+            if let record = lastCommand.record {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(record.command)
+                        .font(.headline)
+                        .accessibilityIdentifier("last-command-text")
+                    Text(record.status.rawValue)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(statusColor(record.status))
+                        .accessibilityIdentifier("last-command-status")
+                    Text(record.message)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("last-command-message")
+                }
+                .frame(maxWidth: 320, alignment: .leading)
+                .padding(14)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("last-command-card")
+            }
 
             VStack(spacing: 16) {
                 if agent != nil {
@@ -66,14 +90,26 @@ struct ConversationView: View {
         .task {
             authorized = await speechIn.requestAuthorization()
             let detector = await Detector()
-            self.detector = detector
             let perception = ARPerceptionSource(ar: ar, detector: detector)
             let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
             let onDevice = OnDeviceBrain()
             let brain: RoverBrain = cloudBrain.map { HybridBrain(cloud: $0, onDevice: onDevice) } ?? onDevice
-            agent = MissionAgent(motion: nav, perception: perception, voice: voice, phaseDidChange: { phase in
-                missionPhase = phase
-            }) { brain }
+            agent = MissionAgent(
+                motion: nav,
+                perception: perception,
+                voice: voice,
+                roomTopology: topology,
+                doorwayEvidenceProvider: doorwayEvidenceProvider,
+                phaseDidChange: { phase in
+                    missionPhase = phase
+                },
+                roomTransitionStateDidChange: { state in
+                    navigationDebug.apply(state)
+                },
+                commandStatusDidChange: { status in
+                    lastCommand.reduce(status)
+                }
+            ) { brain }
         }
     }
 
@@ -100,27 +136,43 @@ struct ConversationView: View {
         if speechIn.state == .listening {
             return speechIn.partialTranscript.isEmpty ? "Listening…" : "Processing speech…"
         }
-        if speechIn.state == .processing { return "Thinking…" }
+        if speechIn.state == .processing { return "Processing speech…" }
         return phaseLabel(missionPhase)
     }
 
+    private func statusColor(_ status: LastCommandState.DisplayStatus) -> Color {
+        switch status {
+        case .listening, .recognized, .working: return .accentColor
+        case .succeeded: return .green
+        case .failed: return .red
+        case .cancelled: return .secondary
+        }
+    }
+
     private func startListening() {
-        guard authorized, speechIn.state != .listening else { return }
-        try? speechIn.start { utterance in
-            Task { @MainActor in
-                missionPhase = .thinking
-                await agent?.handle(utterance)
+        guard authorized, agent != nil, speechIn.state != .listening else { return }
+        do {
+            try speechIn.start(onEvent: { event in
+                lastCommand.reduce(event)
+            }) { captureID, utterance in
+                lastCommand.finalizeCapture(captureID)
+                Task { @MainActor in
+                    await agent?.handle(utterance)
+                }
             }
+        } catch {
+            RuntimeFileLog.append("speech_capture_ui_error", fields: [
+                "error": String(describing: error)
+            ])
         }
     }
 }
 
 private struct LiveCameraDebugPanel: View {
     let ar: ARSessionManager
-    let detector: Detector?
+    let summary: NavigationDebugSummary
 
     @State private var previewImage: UIImage?
-    @State private var visibleObjects: [PerceivedObject] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -154,14 +206,16 @@ private struct LiveCameraDebugPanel: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Tracking: \(trackingLabel)")
                 Text(String(format: "Clearance: %.2f m", ar.forwardClearance))
-                Text("Detector: \(detectorStatus)")
-                Text("Visible: \(PerceptionDebugSummary.visibleObjects(visibleObjects))")
+                Text("Openings: \(summary.openingsText)")
+                Text("Doorway candidates: \(summary.doorwayCandidatesText)")
+                Text("Target: \(summary.targetText)")
+                Text("Transition: \(summary.transitionText)")
                     .lineLimit(2)
             }
             .font(.system(.caption2, design: .monospaced))
             .foregroundStyle(.secondary)
         }
-        .task(id: detector != nil) {
+        .task {
             await refreshLoop()
         }
     }
@@ -173,11 +227,6 @@ private struct LiveCameraDebugPanel: View {
         case .notAvailable: return "none"
         @unknown default: return "?"
         }
-    }
-
-    private var detectorStatus: String {
-        guard let detector else { return "loading" }
-        return detector.isLoaded ? "loaded" : "unavailable"
     }
 
     @MainActor
@@ -192,22 +241,9 @@ private struct LiveCameraDebugPanel: View {
     private func refresh() {
         guard let buffer = ar.latestPixelBuffer else {
             previewImage = nil
-            visibleObjects = []
             return
         }
-
         previewImage = Self.previewImage(from: buffer)
-
-        guard let detector else {
-            visibleObjects = []
-            return
-        }
-
-        visibleObjects = detector.detect(buffer).map {
-            PerceivedObject(label: $0.label,
-                            confidence: $0.confidence,
-                            normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
-        }
     }
 
     private static func previewImage(from pixelBuffer: CVPixelBuffer) -> UIImage? {

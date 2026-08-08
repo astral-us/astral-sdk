@@ -54,8 +54,15 @@ public struct MissionMemory: Sendable {
 
     public private(set) var turns: [Turn] = []
     public private(set) var rememberedObjects: [RememberedObject] = []
+    private var currentMissionTurnStart = 0
     /// Where the rover was when the very first utterance of the mission was recorded.
     public private(set) var missionStartPose: Pose2D?
+
+    /// Conversation recorded since the current operator command began. Brains use this
+    /// view for current-mission grounding while `turns` remains available for recall.
+    public var currentMissionTurns: ArraySlice<Turn> {
+        turns.dropFirst(currentMissionTurnStart)
+    }
 
     /// Same label within this distance = the same physical object (updated, not duplicated).
     static let objectMergeRadius = 0.75
@@ -67,6 +74,7 @@ public struct MissionMemory: Sendable {
     /// the first pose observed during the lifetime of the app's `MissionAgent`.
     public mutating func beginMission(utterance: String, at pose: Pose2D) {
         missionStartPose = pose
+        currentMissionTurnStart = turns.count
         turns.append(Turn(utterance: utterance, pose: pose))
     }
 

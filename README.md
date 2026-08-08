@@ -114,6 +114,26 @@ try await control.send(WheelCommand(left: 0.2, right: 0.2))
 try await control.stop()
 ```
 
+### Test
+
+The regular `RoverNavTests`, `PhroverKitTests`, and `PhroverCloudTests` suites run on
+the first available iOS 26+ iPhone simulator through the committed `PhroverSDKTests`
+scheme:
+
+```bash
+scripts/test-swift-sdk.sh
+```
+
+Pass additional `xcodebuild` arguments to focus the gate, or print the selected simulator
+identifier for another command:
+
+```bash
+scripts/test-swift-sdk.sh -only-testing:RoverNavTests/FrontierFinderTests
+scripts/test-swift-sdk.sh --print-udid
+```
+
+`RoverNav` also has a host-platform compile smoke test: `swift build --target RoverNav`.
+
 ### Hardware compatibility
 
 - **Chassis**: Waveshare WAVE ROVER (or any base speaking the same Waveshare JSON

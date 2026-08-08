@@ -22,15 +22,50 @@ public enum RoverConfig {
     // MARK: - Physical parameters (WAVE ROVER)
     public static let wheelBase = 0.13         // m, track width (left↔right)
     public static let maxWheelSpeed = 0.5      // m/s per Waveshare closed-loop range on encoder bases; base rover is open-loop
+    // Measured mount values must be confirmed before physical acceptance.
+    static let cameraMountCalibration = CameraMountCalibration(
+        cameraHeight: 0.55,
+        forwardOffset: 0,
+        lateralOffset: 0,
+        headingAlignment: 0
+    )
+    static let collisionGeometry = RoverCollisionGeometry(
+        length: 0.30,
+        width: 0.25,
+        minimumCollisionHeight: 0.04,
+        maximumCollisionHeight: 0.50,
+        lateralSafetyMargin: 0.08
+    )
     /// Minimum in-place turn command that reliably overcomes WAVE ROVER static friction.
     /// The autonomous rotate loop may compute a smaller speed from yaw error, but values
     /// below this can make interpreted voice turns appear to do nothing.
     public static let minimumRotateWheelSpeed = 0.25
+    public static let relativeHeadingUpdateInterval: TimeInterval = 1.0 / 60.0
+    public static let relativeHeadingMaximumIntegrationGap: TimeInterval = 0.10
+    public static let relativeHeadingMaximumSampleAge: TimeInterval = 0.15
+    public static let relativeHeadingAcceptedGravityMagnitude = 0.8...1.2
     /// Search turns pulse the motors instead of spinning continuously. The pause gives
     /// ARKit pose and Core ML detection a stable camera frame between heading changes.
-    public static let scanTurnPulseDuration: TimeInterval = 0.08
-    public static let scanTurnSettleDuration: TimeInterval = 0.30
+    public static let scanTurnPulseDuration: TimeInterval = 0.02
+    public static let scanTurnSettleDuration: TimeInterval = 0.75
     public static let scanTurnYawTolerance = 7.0 * Double.pi / 180.0
+    public static let scanMinimumProgressYaw = 2.0 * Double.pi / 180.0
+    public static let scanFramePollInterval: TimeInterval = 0.05
+    public static let scanFrameFreshnessTimeout: TimeInterval = 1.5
+    public static let scanDepthRecoveryPollInterval: TimeInterval = 0.05
+    public static let scanDepthRecoveryTimeout: TimeInterval = 0.75
+    public static let scanPoseJumpTranslation = 0.10
+    public static let scanHeadingAgreementTolerance = 15.0 * Double.pi / 180.0
+    public static let scanTurnMaxPulseCount = 8
+    /// Upper bound for a scan that consumes every pulse and waits for a fresh frame each time.
+    public static let maximumScanTurnDuration =
+        Double(scanTurnMaxPulseCount)
+        * (scanTurnPulseDuration + scanTurnSettleDuration + scanFrameFreshnessTimeout)
+    /// Mission recovery must not cancel a scan before the navigation controller's own bound.
+    public static let blockedHeadingRecoveryTimeout = maximumScanTurnDuration + 2.0
+    public static let navigationTrackingFreshness: TimeInterval = 0.5
+    public static let navigationTrackingPollInterval: TimeInterval = 0.05
+    public static let navigationTrackingRecoveryTimeout: TimeInterval = 1.5
     /// Stand-off distance for a confidently locked visual target.
     public static let visualTargetStopDistance = 0.30
     /// Brake before the desired stand-off to compensate for command latency and chassis coast.

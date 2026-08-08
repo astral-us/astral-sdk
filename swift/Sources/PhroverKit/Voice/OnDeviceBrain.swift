@@ -89,7 +89,57 @@ public final class OnDeviceBrain: RoverBrain {
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         guard isAvailable else { throw RoverBrainError.unavailable }
         let prompt = promptText(context)
-        return try await makeResponder().nextAction(prompt: prompt, context: context)
+        let output = try await makeResponder().nextAction(prompt: prompt, context: context)
+        return Self.grounded(output, context: context)
+    }
+
+    private static func grounded(_ output: BrainOutput, context: MissionContext) -> BrainOutput {
+        guard case .navigate(.visualQuery(let query)) = output.decision,
+              !visualQueryIsGrounded(query, context: context) else {
+            return output
+        }
+
+        let fallback: RoverDecision
+        if let opening = context.explorationCandidates.first(where: { $0.status == .unexplored }) {
+            fallback = .explore(candidateId: opening.id)
+        } else {
+            fallback = .lookAround(angle: .pi / 6)
+        }
+        RuntimeFileLog.append("mission_brain_target_rejected", fields: [
+            "query": query,
+            "fallback": String(describing: fallback),
+            "reason": "not_grounded_in_current_mission",
+        ])
+        return BrainOutput(decision: fallback)
+    }
+
+    private static func visualQueryIsGrounded(_ query: String, context: MissionContext) -> Bool {
+        let missionText = (
+            context.memory.currentMissionTurns.map(\.utterance)
+            + [context.utterance, context.plan].compactMap { $0 }
+        ).joined(separator: " ")
+        let missionTokens = Set(visualIntentTokens(missionText))
+        let queryTokens = visualIntentTokens(query)
+        return !queryTokens.isEmpty && queryTokens.allSatisfy(missionTokens.contains)
+    }
+
+    private static func visualIntentTokens(_ value: String) -> [String] {
+        let stopWords: Set<String> = [
+            "a", "an", "and", "at", "find", "for", "go", "here", "in", "look", "of", "on",
+            "other", "please", "room", "see", "that", "the", "there", "this", "to", "toward",
+            "towards",
+        ]
+        return value
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty && !stopWords.contains($0) }
+            .map { token in
+                switch token {
+                case "fridge": "refrigerator"
+                case "couch": "sofa"
+                default: token
+                }
+            }
     }
 
     private static let instructions = """
@@ -141,8 +191,8 @@ public final class OnDeviceBrain: RoverBrain {
                                   $0.id, $0.worldPoint.x, $0.worldPoint.y, $0.widthMeters, $0.status.rawValue) }
                     .joined(separator: "; "))
         }
-        if !context.memory.turns.isEmpty {
-            lines.append("Recent conversation: " + context.memory.turns.suffix(5)
+        if !context.memory.currentMissionTurns.isEmpty {
+            lines.append("Current mission conversation: " + context.memory.currentMissionTurns.suffix(5)
                 .map { "\"\($0.utterance)\"" }.joined(separator: "; "))
         }
         if context.lastAnswerWasInconclusive {

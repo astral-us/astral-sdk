@@ -3,6 +3,18 @@ import CoreGraphics
 import UIKit
 import RoverNav
 
+public struct NavigationGoalAssessment: Equatable, Sendable {
+    public let goal: Vec2
+    public let isReachable: Bool
+    public let pathDistance: Double
+
+    public init(goal: Vec2, isReachable: Bool, pathDistance: Double) {
+        self.goal = goal
+        self.isReachable = isReachable
+        self.pathDistance = pathDistance
+    }
+}
+
 /// Motion surface `MissionAgent` drives. A separate protocol from the concrete
 /// `NavigationController` (rather than depending on it directly) so the mission loop can be
 /// tested without a live ARKit session.
@@ -13,6 +25,8 @@ public protocol RoverMotion: AnyObject {
     func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double)
     func rotate(by angle: Double) async
     func rotateForScan(by angle: Double) async
+    func assessGoal(_ goal: Vec2) -> NavigationGoalAssessment
+    func stopAndWait() async
     func cancel()
 }
 
@@ -24,6 +38,14 @@ extension RoverMotion {
     public func rotateForScan(by angle: Double) async {
         await rotate(by: angle)
     }
+
+    public func assessGoal(_ goal: Vec2) -> NavigationGoalAssessment {
+        NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: 0)
+    }
+
+    public func stopAndWait() async {
+        cancel()
+    }
 }
 
 extension NavigationController: RoverMotion {}
@@ -34,6 +56,10 @@ extension NavigationController: RoverMotion {}
 @MainActor
 public protocol RoverPerception: AnyObject {
     var pose: Pose2D? { get }
+    var latestObservation: PoseObservation? { get }
+    /// Monotonic camera-frame sequence, when the perception source can provide one.
+    /// `nil` keeps non-camera and test implementations backward compatible.
+    var frameSequence: UInt64? { get }
     func detectObjects() -> [PerceivedObject]
     func unproject(normalizedPoint: CGPoint) -> Vec2?
     func capturedFrameJPEG() -> Data?
@@ -47,6 +73,9 @@ public protocol RoverPerception: AnyObject {
 }
 
 extension RoverPerception {
+    public var latestObservation: PoseObservation? { nil }
+    public var frameSequence: UInt64? { nil }
+
     /// Default grounding: case-insensitive substring match against `detectObjects()`
     /// labels, picking the highest-confidence match. No attribute/color understanding —
     /// "green chair" matches the same as "chair". Override for anything smarter.
@@ -73,6 +102,8 @@ public final class ARPerceptionSource: RoverPerception {
     }
 
     public var pose: Pose2D? { ar.pose }
+    public var latestObservation: PoseObservation? { ar.latestObservation }
+    public var frameSequence: UInt64? { ar.frameSequence }
 
     public func detectObjects() -> [PerceivedObject] {
         guard let detector, let buffer = ar.latestPixelBuffer else { return [] }
@@ -204,6 +235,9 @@ public final class MissionAgent {
     private let voice: RoverVoice
     private let battery: RoverBattery?
     private let teamRadio: RoverTeamRadio?
+    private let roomTopology: RoomTopologyManaging?
+    private let doorwayEvidenceProvider: DoorwayEvidenceProviding?
+    private let roomTransitionPollInterval: TimeInterval
     private let askTimeout: TimeInterval
     private let brainDecisionTimeout: TimeInterval
     private let blockedHeadingRecoveryAngle: Double
@@ -213,13 +247,20 @@ public final class MissionAgent {
     private let visualTargetScanDelay: TimeInterval
     private let maxVisualTargetScanSteps: Int
     private let phaseDidChange: ((Phase) -> Void)?
+    private let roomTransitionStateDidChange: ((RoomTransitionDebugState) -> Void)?
+    private let roomTransitionTelemetry: RoomTopologyTelemetrySink
+    private let commandStatusDidChange: ((MissionCommandStatus) -> Void)?
     private let currentBrain: () -> RoverBrain?
     private let brainErrorLogger: (Error, MissionContext) -> Void
 
+    private var roomTransitionDebugState: RoomTransitionDebugState = .idle
     private var lastAnswerWasInconclusive = false
     private var nextCandidateNumber = 1
     private var isHandlingMission = false
     private var missionGeneration = 0
+    private var nextCommandID: MissionCommandID = 0
+    private var commandByMissionID: [Int: (id: MissionCommandID, text: String)] = [:]
+    private var terminalCommandIDs: Set<MissionCommandID> = []
     /// Ring buffer of "action → outcome" lines fed to the brain as `recentActions` (see
     /// `makeContext`) so it can notice it's repeating itself — persists across `handle()`
     /// calls within one mission agent, same as `memory`, so a multi-turn mission ("search,
@@ -249,12 +290,20 @@ public final class MissionAgent {
                 brainDecisionTimeout: TimeInterval = 12,
                 maxTicksPerUtterance: Int = 25,
                 blockedHeadingRecoveryAngle: Double = .pi / 6,
-                blockedHeadingRecoveryTimeout: TimeInterval = 1.2,
+                blockedHeadingRecoveryTimeout: TimeInterval = RoverConfig.blockedHeadingRecoveryTimeout,
                 visualTargetConfidenceThreshold: Float = 0.90,
                 visualTargetScanAngle: Double = .pi / 6,
                 visualTargetScanDelay: TimeInterval = 1,
                 maxVisualTargetScanSteps: Int = 12,
+                roomTopology: RoomTopologyManaging? = nil,
+                doorwayEvidenceProvider: DoorwayEvidenceProviding? = nil,
+                roomTransitionPollInterval: TimeInterval = 0.05,
                 phaseDidChange: ((Phase) -> Void)? = nil,
+                roomTransitionStateDidChange: ((RoomTransitionDebugState) -> Void)? = nil,
+                roomTransitionTelemetry: @escaping RoomTopologyTelemetrySink = { event, fields in
+                    RuntimeFileLog.append(event, fields: fields)
+                },
+                commandStatusDidChange: ((MissionCommandStatus) -> Void)? = nil,
                 brainErrorLogger: @escaping (Error, MissionContext) -> Void = { error, context in
                     BrainErrorFileLog.append(error: error, context: context)
                 },
@@ -264,6 +313,9 @@ public final class MissionAgent {
         self.voice = voice
         self.battery = battery
         self.teamRadio = teamRadio
+        self.roomTopology = roomTopology
+        self.doorwayEvidenceProvider = doorwayEvidenceProvider
+        self.roomTransitionPollInterval = roomTransitionPollInterval
         self.askTimeout = askTimeout
         self.brainDecisionTimeout = brainDecisionTimeout
         self.maxTicksPerUtterance = maxTicksPerUtterance
@@ -274,6 +326,9 @@ public final class MissionAgent {
         self.visualTargetScanDelay = visualTargetScanDelay
         self.maxVisualTargetScanSteps = maxVisualTargetScanSteps
         self.phaseDidChange = phaseDidChange
+        self.roomTransitionStateDidChange = roomTransitionStateDidChange
+        self.roomTransitionTelemetry = roomTransitionTelemetry
+        self.commandStatusDidChange = commandStatusDidChange
         self.brainErrorLogger = brainErrorLogger
         self.currentBrain = currentBrain
     }
@@ -287,21 +342,42 @@ public final class MissionAgent {
             return
         }
 
+        nextCommandID += 1
+        let commandID = nextCommandID
+        commandStatusDidChange?(.recognized(id: commandID, command: trimmedUtterance))
+
         RuntimeFileLog.append("voice_command_received", fields: ["utterance": trimmedUtterance])
         if isEmergencyStopUtterance(trimmedUtterance) {
+            commandStatusDidChange?(.working(id: commandID, command: trimmedUtterance))
             missionGeneration += 1
             isHandlingMission = false
             phase = .acting
-            motion.cancel()
+            await motion.stopAndWait()
+            roomTopology?.abandonTransition()
+            publishRoomTransitionState(.idle)
             phase = .idle
             RuntimeFileLog.append("voice_command_stop", fields: ["utterance": trimmedUtterance])
+            publishTerminal(.cancelled(id: commandID, command: trimmedUtterance))
             return
         }
 
         guard !isHandlingMission else {
             voice.speak("I'm still working on the previous command. Say stop if you want me to cancel it.")
             RuntimeFileLog.append("voice_command_busy", fields: ["utterance": trimmedUtterance])
+            publishTerminal(
+                .failed(
+                    id: commandID,
+                    command: trimmedUtterance,
+                    message: "I’m still working on the previous command."
+                )
+            )
             return
+        }
+        if motion.state != .idle {
+            RuntimeFileLog.append("mission_motion_state_reset", fields: [
+                "previous_state": motion.state.description
+            ])
+            await motion.stopAndWait()
         }
         guard let pose = perception.pose else {
             voice.speak("I don't have my bearings yet — give me a moment to look around.")
@@ -309,12 +385,17 @@ public final class MissionAgent {
                 "utterance": trimmedUtterance,
                 "reason": "missing_pose"
             ])
+            publishTerminal(
+                .failed(id: commandID, command: trimmedUtterance, message: "I don’t have my bearings yet.")
+            )
             return
         }
 
         isHandlingMission = true
         missionGeneration += 1
         let missionID = missionGeneration
+        commandByMissionID[missionID] = (commandID, trimmedUtterance)
+        commandStatusDidChange?(.working(id: commandID, command: trimmedUtterance))
         defer {
             if missionGeneration == missionID {
                 isHandlingMission = false
@@ -333,7 +414,447 @@ public final class MissionAgent {
             "start_y": String(format: "%.2f", pose.position.y),
             "return_requested": Self.hasReturnIntent(trimmedUtterance) ? "true" : "false"
         ])
-        await runLoop(firstUtterance: trimmedUtterance, missionID: missionID)
+        publishRoomTransitionState(.idle)
+        if RoomTransitionIntent.matches(trimmedUtterance) {
+            await runRoomTransitionMission(missionID: missionID)
+        } else {
+            await runLoop(firstUtterance: trimmedUtterance, missionID: missionID)
+        }
+        if !terminalCommandIDs.contains(commandID) {
+            if !isCurrentMission(missionID) || Task.isCancelled {
+                publishTerminal(.cancelled(id: commandID, command: trimmedUtterance))
+            } else if case .failed(let reason) = motion.state {
+                publishTerminal(
+                    .failed(id: commandID, command: trimmedUtterance, message: reason)
+                )
+            } else {
+                publishTerminal(
+                    .succeeded(
+                        id: commandID,
+                        command: trimmedUtterance,
+                        message: "Command completed."
+                    )
+                )
+            }
+        }
+        commandByMissionID[missionID] = nil
+    }
+
+    private func publishTerminal(_ status: MissionCommandStatus) {
+        guard status.isTerminal, terminalCommandIDs.insert(status.id).inserted else { return }
+        commandStatusDidChange?(status)
+    }
+
+    private func publishMissionTerminal(
+        _ makeStatus: (MissionCommandID, String) -> MissionCommandStatus,
+        missionID: Int
+    ) {
+        guard let command = commandByMissionID[missionID] else { return }
+        publishTerminal(makeStatus(command.id, command.text))
+    }
+
+    private func publishRoomTransitionState(_ state: RoomTransitionDebugState) {
+        guard state != roomTransitionDebugState else { return }
+        roomTransitionDebugState = state
+        roomTransitionStateDidChange?(state)
+    }
+
+    private func runRoomTransitionMission(missionID: Int) async {
+        guard let roomTopology else {
+            finishRoomTransitionExhausted(missionID: missionID)
+            return
+        }
+
+        let totalScanSteps = 12
+        let sessionGeneration = roomTopology.snapshot.sessionGeneration
+        let missionFields: [String: String] = [
+            "mission_id": String(missionID),
+            "session_generation": sessionGeneration.map(String.init) ?? "none",
+        ]
+        var excludedCandidateIDs: Set<DoorwayCandidateID> = []
+        var remainingScanSteps = totalScanSteps
+        var candidateAttempts = 0
+
+        while isCurrentMission(missionID), !Task.isCancelled, candidateAttempts < 3 {
+            let scanStep = totalScanSteps - remainingScanSteps
+            let frontiers = perception.explorationFrontiers()
+            guard let referencePose = perception.pose else {
+                finishRoomTransitionFailed(
+                    "missing_pose",
+                    message: "I don’t have my bearings yet.",
+                    missionID: missionID,
+                    sessionGeneration: sessionGeneration
+                )
+                return
+            }
+            let candidates = roomTopology.refreshCandidates(
+                from: frontiers,
+                referencePose: referencePose
+            )
+            roomTransitionTelemetry("room_transition_scan_step", missionFields.merging([
+                "scan_step": String(scanStep),
+                "total_scan_steps": String(totalScanSteps),
+                "frontier_count": String(frontiers.count),
+                "candidate_count": String(candidates.count),
+                "excluded_candidate_count": String(excludedCandidateIDs.count),
+            ]) { _, new in new })
+            publishRoomTransitionState(.scanning(
+                step: scanStep,
+                total: totalScanSteps,
+                openingCount: frontiers.count,
+                candidateCount: candidates.count
+            ))
+            let assessments = candidates.map { candidate in
+                let goal = candidate.beyondPlaneGoal()
+                let assessment = motion.assessGoal(goal)
+                return DoorwayCandidateAssessment(
+                    candidateID: candidate.id,
+                    isReachable: assessment.isReachable,
+                    beyondPlaneGoal: assessment.goal,
+                    pathDistance: assessment.pathDistance
+                )
+            }
+            var visualBoosts: [DoorwayCandidateID: Double] = [:]
+            if let doorwayEvidenceProvider,
+               let frame = perception.capturedFrameJPEG(),
+               !candidates.isEmpty {
+                visualBoosts = await doorwayEvidenceProvider.boostValues(
+                    forFrame: frame,
+                    candidates: candidates
+                )
+            }
+            let ranked = roomTopology.rankedCandidates(
+                assessments: assessments,
+                visualBoosts: visualBoosts,
+                excluding: excludedCandidateIDs
+            )
+            for (rank, item) in ranked.enumerated() {
+                roomTransitionTelemetry("doorway_candidate_assessed", missionFields.merging([
+                    "scan_step": String(scanStep),
+                    "candidate_id": item.candidate.id.rawValue,
+                    "goal_x": String(format: "%.2f", item.assessment.beyondPlaneGoal.x),
+                    "goal_y": String(format: "%.2f", item.assessment.beyondPlaneGoal.y),
+                    "reachable": String(item.assessment.isReachable),
+                    "path_distance": String(format: "%.2f", item.assessment.pathDistance),
+                    "rank": String(rank + 1),
+                ]) { _, new in new })
+            }
+
+            let selected = ranked.first { $0.assessment.isReachable }
+            if selected == nil {
+                for item in ranked {
+                    excludedCandidateIDs.insert(item.candidate.id)
+                    roomTransitionTelemetry("doorway_candidate_unreachable", missionFields.merging([
+                        "scan_step": String(scanStep),
+                        "candidate_id": item.candidate.id.rawValue,
+                    ]) { _, new in new })
+                    publishRoomTransitionState(.candidateFound(
+                        id: item.candidate.id,
+                        reachable: false
+                    ))
+                    publishRoomTransitionState(.unreachable(id: item.candidate.id))
+                }
+            }
+            guard var selected else {
+                let reason: String
+                if frontiers.isEmpty {
+                    reason = "no_openings"
+                } else if candidates.isEmpty {
+                    reason = "no_admitted_candidates"
+                } else if !ranked.isEmpty {
+                    reason = "no_reachable_candidates"
+                } else {
+                    reason = "no_ranked_candidates"
+                }
+                roomTransitionTelemetry("room_transition_scan_continued", missionFields.merging([
+                    "scan_step": String(scanStep),
+                    "reason": reason,
+                    "remaining_scan_steps": String(remainingScanSteps),
+                ]) { _, new in new })
+                guard remainingScanSteps > 0 else { break }
+                remainingScanSteps -= 1
+                phase = .acting
+                await motion.rotateForScan(by: .pi / 6)
+                if case .failed(let reason) = motion.state {
+                    finishRoomTransitionFailed(
+                        reason,
+                        message: reason,
+                        missionID: missionID,
+                        sessionGeneration: sessionGeneration,
+                        fields: ["scan_step": String(scanStep)]
+                    )
+                    return
+                }
+                continue
+            }
+
+            candidateAttempts += 1
+            excludedCandidateIDs.insert(selected.candidate.id)
+            roomTransitionTelemetry("doorway_candidate_selected", missionFields.merging([
+                "scan_step": String(scanStep),
+                "candidate_id": selected.candidate.id.rawValue,
+                "reachable": "true",
+                "goal_x": String(format: "%.2f", selected.assessment.beyondPlaneGoal.x),
+                "goal_y": String(format: "%.2f", selected.assessment.beyondPlaneGoal.y),
+            ]) { _, new in new })
+            publishRoomTransitionState(.candidateFound(
+                id: selected.candidate.id,
+                reachable: true
+            ))
+            guard let approachPose = perception.pose else {
+                finishRoomTransitionFailed(
+                    "missing_pose",
+                    message: "I don’t have my bearings yet.",
+                    missionID: missionID,
+                    sessionGeneration: sessionGeneration,
+                    fields: ["candidate_id": selected.candidate.id.rawValue]
+                )
+                return
+            }
+            var startResult = roomTopology.beginTransition(
+                candidateID: selected.candidate.id,
+                approachPose: approachPose
+            )
+            if case .correctedOrientation(let correctedCandidate) = startResult {
+                let correctedGoal = correctedCandidate.beyondPlaneGoal()
+                let correctedAssessment = motion.assessGoal(correctedGoal)
+                roomTransitionTelemetry("room_transition_goal_reassessed", missionFields.merging([
+                    "candidate_id": correctedCandidate.id.rawValue,
+                    "goal_x": String(format: "%.2f", correctedGoal.x),
+                    "goal_y": String(format: "%.2f", correctedGoal.y),
+                    "reachable": String(correctedAssessment.isReachable),
+                ]) { _, new in new })
+                guard correctedAssessment.isReachable else {
+                    publishRoomTransitionFailure(
+                        "corrected_goal_unreachable",
+                        missionID: missionID,
+                        sessionGeneration: sessionGeneration,
+                        fields: ["candidate_id": correctedCandidate.id.rawValue]
+                    )
+                    continue
+                }
+                selected = RankedDoorwayCandidate(
+                    candidate: correctedCandidate,
+                    assessment: DoorwayCandidateAssessment(
+                        candidateID: correctedCandidate.id,
+                        isReachable: true,
+                        beyondPlaneGoal: correctedAssessment.goal,
+                        pathDistance: correctedAssessment.pathDistance
+                    ),
+                    visualBoost: selected.visualBoost
+                )
+                startResult = roomTopology.beginTransition(
+                    candidateID: correctedCandidate.id,
+                    approachPose: approachPose
+                )
+            }
+            guard startResult == .started else {
+                let reason: String
+                if case .rejected(let rejection) = startResult {
+                    reason = rejection.rawValue
+                } else {
+                    reason = "orientation_changed_repeatedly"
+                }
+                publishRoomTransitionFailure(
+                    reason,
+                    missionID: missionID,
+                    sessionGeneration: sessionGeneration,
+                    fields: ["candidate_id": selected.candidate.id.rawValue]
+                )
+                continue
+            }
+
+            roomTransitionTelemetry("room_transition_approach_started", missionFields.merging([
+                "candidate_id": selected.candidate.id.rawValue,
+                "goal_x": String(format: "%.2f", selected.assessment.beyondPlaneGoal.x),
+                "goal_y": String(format: "%.2f", selected.assessment.beyondPlaneGoal.y),
+            ]) { _, new in new })
+            publishRoomTransitionState(.approaching(id: selected.candidate.id))
+            phase = .acting
+            motion.navigate(to: selected.assessment.beyondPlaneGoal)
+            var lastFrameSequence: UInt64?
+            var trackingRecoveryDeadline: Date?
+            while isCurrentMission(missionID), !Task.isCancelled {
+                if let observation = perception.latestObservation,
+                   observation.sessionGeneration == roomTopology.snapshot.sessionGeneration,
+                   lastFrameSequence.map({ observation.frameSequence > $0 }) ?? true {
+                    lastFrameSequence = observation.frameSequence
+                    if observation.trackingQuality != .normal {
+                        if trackingRecoveryDeadline == nil {
+                            await motion.stopAndWait()
+                            trackingRecoveryDeadline = Date().addingTimeInterval(
+                                RoverConfig.scanFrameFreshnessTimeout
+                            )
+                        }
+                        continue
+                    }
+                    if trackingRecoveryDeadline != nil {
+                        trackingRecoveryDeadline = nil
+                        publishRoomTransitionState(.approaching(id: selected.candidate.id))
+                        motion.navigate(to: selected.assessment.beyondPlaneGoal)
+                    }
+                    if roomTopology.observeTransition(observation.transitionObservation)
+                        == .readyForConfirmation {
+                        roomTransitionTelemetry(
+                            "room_transition_crossing_confirmation_started",
+                            missionFields.merging([
+                                "candidate_id": selected.candidate.id.rawValue,
+                                "frame_sequence": String(observation.frameSequence),
+                            ]) { _, new in new }
+                        )
+                        publishRoomTransitionState(.confirmingCrossing(id: selected.candidate.id))
+                        await motion.stopAndWait()
+                        guard isCurrentMission(missionID), !Task.isCancelled else {
+                            roomTopology.abandonTransition()
+                            publishRoomTransitionState(.idle)
+                            return
+                        }
+                        if let roomID = roomTopology.confirmTransition(),
+                           let doorwayID = roomTopology.snapshot.doorways.first(where: {
+                               $0.candidateID == selected.candidate.id
+                           })?.id {
+                            roomTransitionTelemetry("room_transition_mission_completed", missionFields.merging([
+                                "candidate_id": selected.candidate.id.rawValue,
+                                "doorway_id": doorwayID.rawValue,
+                                "room_id": roomID.rawValue,
+                            ]) { _, new in new })
+                            publishRoomTransitionState(.completed(
+                                doorwayID: doorwayID,
+                                roomID: roomID
+                            ))
+                            publishMissionTerminal(
+                                { .succeeded(id: $0, command: $1, message: "Entered another room.") },
+                                missionID: missionID
+                            )
+                            phase = .idle
+                            return
+                        }
+                        publishRoomTransitionFailure(
+                            "crossing_confirmation_failed",
+                            missionID: missionID,
+                            sessionGeneration: sessionGeneration,
+                            fields: ["candidate_id": selected.candidate.id.rawValue]
+                        )
+                        break
+                    }
+                }
+
+                if let trackingRecoveryDeadline {
+                    if Date() >= trackingRecoveryDeadline {
+                        roomTopology.rejectTransition(reason: "tracking_unavailable")
+                        publishRoomTransitionFailure(
+                            "tracking_unavailable",
+                            missionID: missionID,
+                            sessionGeneration: sessionGeneration,
+                            fields: ["candidate_id": selected.candidate.id.rawValue]
+                        )
+                        break
+                    }
+                    if roomTransitionPollInterval > 0 {
+                        try? await Task.sleep(for: .seconds(roomTransitionPollInterval))
+                    } else {
+                        await Task.yield()
+                    }
+                    continue
+                }
+                if case .failed(let reason) = motion.state {
+                    await motion.stopAndWait()
+                    roomTopology.rejectTransition(reason: reason)
+                    publishRoomTransitionFailure(
+                        reason,
+                        missionID: missionID,
+                        sessionGeneration: sessionGeneration,
+                        fields: ["candidate_id": selected.candidate.id.rawValue]
+                    )
+                    break
+                }
+                if motion.state == .arrived || motion.state == .idle {
+                    roomTopology.rejectTransition(reason: "crossing_not_confirmed")
+                    publishRoomTransitionFailure(
+                        "crossing_not_confirmed",
+                        missionID: missionID,
+                        sessionGeneration: sessionGeneration,
+                        fields: ["candidate_id": selected.candidate.id.rawValue]
+                    )
+                    break
+                }
+                if roomTransitionPollInterval > 0 {
+                    try? await Task.sleep(for: .seconds(roomTransitionPollInterval))
+                } else {
+                    await Task.yield()
+                }
+            }
+        }
+
+        if !isCurrentMission(missionID) || Task.isCancelled {
+            motion.cancel()
+            roomTopology.abandonTransition()
+            publishRoomTransitionState(.idle)
+            phase = .idle
+            return
+        }
+        await motion.stopAndWait()
+        roomTopology.abandonTransition()
+        finishRoomTransitionExhausted(
+            missionID: missionID,
+            sessionGeneration: sessionGeneration,
+            fields: [
+                "candidate_attempts": String(candidateAttempts),
+                "scan_steps_used": String(totalScanSteps - remainingScanSteps),
+            ]
+        )
+    }
+
+    private func publishRoomTransitionFailure(
+        _ reason: String,
+        missionID: Int,
+        sessionGeneration: UInt64? = nil,
+        fields: [String: String] = [:]
+    ) {
+        publishRoomTransitionState(.failed(reason: reason))
+        roomTransitionTelemetry("room_transition_failed", fields.merging([
+            "reason": reason,
+            "mission_id": String(missionID),
+            "session_generation": sessionGeneration.map(String.init) ?? "none",
+        ]) { _, new in new })
+    }
+
+    private func finishRoomTransitionFailed(
+        _ reason: String,
+        message: String,
+        missionID: Int,
+        sessionGeneration: UInt64? = nil,
+        fields: [String: String] = [:]
+    ) {
+        publishRoomTransitionFailure(
+            reason,
+            missionID: missionID,
+            sessionGeneration: sessionGeneration,
+            fields: fields
+        )
+        publishMissionTerminal(
+            { .failed(id: $0, command: $1, message: message) },
+            missionID: missionID
+        )
+        phase = .idle
+    }
+
+    private func finishRoomTransitionExhausted(
+        missionID: Int,
+        sessionGeneration: UInt64? = nil,
+        fields: [String: String] = [:]
+    ) {
+        publishRoomTransitionState(.exhausted)
+        roomTransitionTelemetry("room_transition_exhausted", fields.merging([
+            "mission_id": String(missionID),
+            "session_generation": sessionGeneration.map(String.init) ?? "none",
+        ]) { _, new in new })
+        voice.speak("I couldn’t find a safe route into another room.")
+        publishMissionTerminal(
+            { .failed(id: $0, command: $1, message: "I couldn’t find a safe route into another room.") },
+            missionID: missionID
+        )
+        phase = .idle
     }
 
     // MARK: - Loop
@@ -357,6 +878,10 @@ public final class MissionAgent {
             }
             guard let brain = currentBrain() else {
                 voice.speak("Sorry, I can't think right now.")
+                publishMissionTerminal(
+                    { .failed(id: $0, command: $1, message: "Sorry, I can’t think right now.") },
+                    missionID: missionID
+                )
                 RuntimeFileLog.append("mission_failed", fields: [
                     "mission": "\(missionID)",
                     "reason": "missing_brain"
@@ -390,6 +915,10 @@ public final class MissionAgent {
                     return
                 }
                 voice.speak("Sorry, I'm having trouble thinking right now.")
+                publishMissionTerminal(
+                    { .failed(id: $0, command: $1, message: "Sorry, I’m having trouble thinking right now.") },
+                    missionID: missionID
+                )
                 RuntimeFileLog.append("mission_brain_timeout", fields: [
                     "mission": "\(missionID)",
                     "timeout": String(format: "%.2f", brainDecisionTimeout)
@@ -404,6 +933,10 @@ public final class MissionAgent {
                 }
                 brainErrorLogger(error, ctx)
                 voice.speak("Sorry, I'm having trouble thinking right now.")
+                publishMissionTerminal(
+                    { .failed(id: $0, command: $1, message: "Sorry, I’m having trouble thinking right now.") },
+                    missionID: missionID
+                )
                 RuntimeFileLog.append("mission_brain_error", fields: [
                     "mission": "\(missionID)",
                     "error": error.localizedDescription
@@ -485,7 +1018,47 @@ public final class MissionAgent {
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                         return
                     case .notFound:
-                        break
+                        updateWorldModel()
+                        if let candidate = nextUnexploredCandidate() {
+                            RuntimeFileLog.append("mission_target_frontier_selected", fields: [
+                                "mission": "\(missionID)",
+                                "target": lockedVisualQuery ?? missionUtterance,
+                                "candidate": candidate.id,
+                                "width": String(format: "%.2f", candidate.widthMeters),
+                                "goal_x": String(format: "%.2f", candidate.worldPoint.x),
+                                "goal_y": String(format: "%.2f", candidate.worldPoint.y),
+                            ])
+                            visualTargetScanSteps = 0
+                            motion.navigate(to: candidate.worldPoint)
+                            await waitForMotionToSettle()
+                            let reachedCandidate = motion.state == .arrived
+                            if await recoverOrStopMissionIfMotionFailed(
+                                missionID: missionID,
+                                recoverFromBlockedHeading: true,
+                                blockedCandidateId: candidate.id
+                            ) {
+                                return
+                            }
+                            if reachedCandidate {
+                                markExplorationCandidateVisited(
+                                    candidate.id,
+                                    reason: "searched frontier for \(lockedVisualQuery ?? missionUtterance)",
+                                    event: "mission_exploration_candidate_visited"
+                                )
+                            }
+                            outcome = describeMotionOutcome(
+                                label: "search(\(candidate.id))",
+                                poseBefore: poseBefore
+                            )
+                            if recordTick(decision: decision,
+                                          poseBefore: poseBefore,
+                                          newObjects: newObjects,
+                                          outcome: outcome) {
+                                phase = .idle
+                                return
+                            }
+                            continue
+                        }
                     }
                     guard isCurrentMission(missionID) else {
                         phase = .idle
@@ -525,7 +1098,7 @@ public final class MissionAgent {
                 outcome = describeMotionOutcome(label: "navigate", poseBefore: poseBefore)
 
             case .explore(let candidateId):
-                guard let candidate = explorationCandidates.first(where: { $0.id == candidateId }) else {
+                guard let requestedCandidate = explorationCandidates.first(where: { $0.id == candidateId }) else {
                     voice.speak("I'm not sure which opening that is anymore.")
                     if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
                                    outcome: "explore(\(candidateId)) → unknown opening id") {
@@ -534,12 +1107,34 @@ public final class MissionAgent {
                     }
                     continue
                 }
+                let candidate: ExplorationCandidate
+                if requestedCandidate.status == .visited {
+                    guard let unexplored = nextUnexploredCandidate() else {
+                        RuntimeFileLog.append("mission_exploration_candidate_rejected", fields: [
+                            "candidate": candidateId,
+                            "reason": "already_visited",
+                            "fallback": "scan_30deg",
+                        ])
+                        await motion.rotateForScan(by: blockedHeadingRecoveryAngle)
+                        if await recoverOrStopMissionIfMotionFailed(missionID: missionID) { return }
+                        outcome = "explore(\(candidateId)) → already visited; scanned instead"
+                        break
+                    }
+                    candidate = unexplored
+                    RuntimeFileLog.append("mission_exploration_candidate_rerouted", fields: [
+                        "requested": candidateId,
+                        "selected": candidate.id,
+                        "reason": "requested_candidate_visited",
+                    ])
+                } else {
+                    candidate = requestedCandidate
+                }
                 motion.navigate(to: candidate.worldPoint)
                 await waitForMotionToSettle()
                 if await recoverOrStopMissionIfMotionFailed(missionID: missionID,
                                                             recoverFromBlockedHeading: true,
-                                                            blockedCandidateId: candidateId) { return }
-                outcome = describeMotionOutcome(label: "explore(\(candidateId))", poseBefore: poseBefore)
+                                                            blockedCandidateId: candidate.id) { return }
+                outcome = describeMotionOutcome(label: "explore(\(candidate.id))", poseBefore: poseBefore)
 
             case .lookAround(let angle):
                 await motion.rotate(by: angle)
@@ -889,10 +1484,13 @@ public final class MissionAgent {
                 "max": "\(maxVisualTargetScanSteps)",
                 "angle": String(format: "%.0fdeg", angle * 180 / .pi)
             ])
+            let frameBeforeTurn = perception.frameSequence
             await motion.rotateForScan(by: angle)
             guard isCurrentMission(missionID) else { return .cancelled }
 
-            switch await waitForVisualTarget(query: query, missionID: missionID) {
+            switch await waitForVisualTarget(query: query,
+                                             missionID: missionID,
+                                             newerThanFrame: frameBeforeTurn) {
             case .found(let goal):
                 return .found(goal)
             case .cancelled:
@@ -917,9 +1515,12 @@ public final class MissionAgent {
         case cancelled
     }
 
-    private func waitForVisualTarget(query: String, missionID: Int) async -> VisualTargetWaitResult {
+    private func waitForVisualTarget(query: String,
+                                     missionID: Int,
+                                     newerThanFrame frameBaseline: UInt64? = nil) async -> VisualTargetWaitResult {
         if visualTargetScanDelay <= 0 {
             guard isCurrentMission(missionID) else { return .cancelled }
+            guard hasFreshPerceptionFrame(newerThan: frameBaseline) else { return .timedOut }
             let objects = perception.detectObjects()
             guard !objects.isEmpty else { return .timedOut }
             if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
@@ -931,8 +1532,22 @@ public final class MissionAgent {
 
         let deadline = Date().addingTimeInterval(visualTargetScanDelay)
         var sawVisibleObjects = false
+        var didLogFreshFrameWait = false
         while Date() < deadline {
             guard isCurrentMission(missionID) else { return .cancelled }
+            guard hasFreshPerceptionFrame(newerThan: frameBaseline) else {
+                if !didLogFreshFrameWait {
+                    RuntimeFileLog.append("mission_target_scan_wait_fresh_frame", fields: [
+                        "mission": "\(missionID)",
+                        "target": query,
+                        "baseline": frameBaseline.map(String.init) ?? "none",
+                        "current": perception.frameSequence.map(String.init) ?? "unavailable"
+                    ])
+                    didLogFreshFrameWait = true
+                }
+                try? await Task.sleep(for: .seconds(visualTargetPollInterval()))
+                continue
+            }
             let objects = perception.detectObjects()
             guard !objects.isEmpty else {
                 try? await Task.sleep(for: .seconds(visualTargetPollInterval()))
@@ -966,6 +1581,11 @@ public final class MissionAgent {
         return .timedOut
     }
 
+    private func hasFreshPerceptionFrame(newerThan baseline: UInt64?) -> Bool {
+        guard let baseline, let current = perception.frameSequence else { return true }
+        return current > baseline
+    }
+
     private func visualTargetPollInterval() -> TimeInterval {
         min(0.2, max(0.01, visualTargetScanDelay / 5))
     }
@@ -997,12 +1617,13 @@ public final class MissionAgent {
 
     private func visualTargetScanAngle(forScanStep step: Int) -> Double {
         guard step > 0 else { return 0 }
-        if step == 1 { return visualTargetScanAngle }
-        if step.isMultiple(of: 2) {
-            return -visualTargetScanAngle * 2
-        } else {
-            return visualTargetScanAngle * 2
-        }
+        return visualTargetScanAngle
+    }
+
+    private func nextUnexploredCandidate() -> ExplorationCandidate? {
+        explorationCandidates
+            .filter { $0.status == .unexplored }
+            .max { $0.widthMeters < $1.widthMeters }
     }
 
     private func navigate(to goal: Vec2, for target: NavigationTarget) {
@@ -1308,10 +1929,14 @@ public final class MissionAgent {
         return true
     }
 
-    private func markExplorationCandidateVisited(_ id: String, reason: String) {
+    private func markExplorationCandidateVisited(
+        _ id: String,
+        reason: String,
+        event: String = "mission_exploration_candidate_blocked"
+    ) {
         guard let index = explorationCandidates.firstIndex(where: { $0.id == id }) else { return }
         explorationCandidates[index].status = .visited
-        RuntimeFileLog.append("mission_exploration_candidate_blocked", fields: [
+        RuntimeFileLog.append(event, fields: [
             "candidate": id,
             "reason": reason,
             "status": ExplorationCandidate.Status.visited.rawValue
@@ -1325,12 +1950,26 @@ public final class MissionAgent {
     private func rotateForBlockedHeadingRecovery(missionID: Int) async {
         let angle = blockedHeadingRecoveryAngle
         let timeout = blockedHeadingRecoveryTimeout
+        let initialState = motion.state
         let rotation = Task { @MainActor in
             await motion.rotateForScan(by: angle)
         }
 
-        try? await Task.sleep(for: .seconds(timeout))
-        if motion.state == .driving {
+        let deadline = Date().addingTimeInterval(timeout)
+        var sawDriving = false
+        while Date() < deadline {
+            let currentState = motion.state
+            if currentState == .driving {
+                sawDriving = true
+            } else if currentState == .arrived
+                        || (sawDriving && currentState == .idle)
+                        || (currentState != initialState && currentState != .idle) {
+                break
+            }
+            try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+        }
+
+        if motion.state == .driving || motion.state == initialState {
             RuntimeFileLog.append("mission_blocked_heading_recovery_timeout", fields: [
                 "mission": "\(missionID)",
                 "recovery": recoveryDescription,

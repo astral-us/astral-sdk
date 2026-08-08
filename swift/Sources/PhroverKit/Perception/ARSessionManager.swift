@@ -1,5 +1,6 @@
 import Foundation
 import ARKit
+import CoreMotion
 import RoverNav
 
 /// Owns the ARKit session and is the rover's **primary odometry + mapping** source
@@ -13,15 +14,73 @@ import RoverNav
 @MainActor
 public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate {
     public let session = ARSession()
+    private let motionManager = CMMotionManager()
+    private let relativeHeadingOperationQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "us.astral.phrover.relative-heading"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInteractive
+        return queue
+    }()
 
     public private(set) var pose: Pose2D?
     public private(set) var meshAnchors: [ARMeshAnchor] = []
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
     public private(set) var forwardClearance: Double = .infinity
+    private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot?
+    public private(set) var depthSnapshotVersion: UInt64 = 0
+    public var depthSnapshotTimestamp: TimeInterval? { latestDepthSafetySnapshot?.timestamp }
     public private(set) var trackingState: ARCamera.TrackingState = .notAvailable
 
     /// Latest RGB frame, for `Detector` to run inference on.
     public private(set) var latestPixelBuffer: CVPixelBuffer?
+    /// Monotonic camera-frame counter used to prevent perception from reusing a frame
+    /// captured before a scan turn completed.
+    public private(set) var frameSequence: UInt64 = 0
+    public private(set) var latestObservation: PoseObservation?
+    public private(set) var sessionGeneration: UInt64 = 0
+    public var observationHandler: ((PoseObservation) -> Void)?
+    public var onReset: ((UInt64) -> Void)?
+    private var acceptsObservations = false
+    private var lastObservationTimestamp: TimeInterval?
+    nonisolated private let relativeHeadingStore = RelativeHeadingTrackerStore()
+    private var loggedRelativeHeadingReliability: RelativeHeadingReliability = .unreliable(.notStarted)
+    private let relativeHeadingTelemetry: RoomTopologyTelemetrySink
+    /// Gyroscope-fused rover heading. Unlike ARKit world yaw, this does not jump when
+    /// visual tracking relocalizes, so scan turns use it for relative-angle completion.
+    func beginRelativeHeadingMeasurement() {
+        relativeHeadingStore.beginMeasurement()
+        loggedRelativeHeadingReliability = .unreliable(.notStarted)
+        relativeHeadingTelemetry("relative_heading_measurement_started", [:])
+    }
+
+    func endRelativeHeadingMeasurement() {
+        relativeHeadingStore.endMeasurement()
+        loggedRelativeHeadingReliability = .unreliable(.notStarted)
+        relativeHeadingTelemetry("relative_heading_measurement_ended", [:])
+    }
+
+    @discardableResult
+    func ingestRelativeHeadingSample(_ sample: RelativeHeadingSample) -> Bool {
+        guard let result = relativeHeadingStore.ingest(sample) else { return false }
+        reportRelativeHeadingIngest(result, timestamp: sample.timestamp)
+        return result.accepted
+    }
+
+    func relativeHeadingMeasurement(
+        at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> RelativeHeadingMeasurement {
+        let measurement = relativeHeadingStore.measurement(at: timestamp)
+        if measurement.reliability != loggedRelativeHeadingReliability {
+            reportRelativeHeadingReliabilityTransition(to: measurement.reliability)
+        }
+        return measurement
+    }
+
+    /// Scan turns only consume pose samples while ARKit has a reliable world transform.
+    public var isTrackingNormal: Bool {
+        latestObservation?.trackingQuality == .normal
+    }
     /// Latest camera (intrinsics + transform + raw sensor `imageResolution`), retained so
     /// `unproject(normalizedPoint:)` can back-project a detection into the world.
     public private(set) var latestCamera: ARCamera?
@@ -30,11 +89,144 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     private var lastClearanceLogAt = Date.distantPast
 
     public override init() {
+        relativeHeadingTelemetry = { event, fields in
+            RuntimeFileLog.append(event, fields: fields)
+        }
         super.init()
         session.delegate = self
     }
 
+    init(relativeHeadingTelemetry: @escaping RoomTopologyTelemetrySink) {
+        self.relativeHeadingTelemetry = relativeHeadingTelemetry
+        super.init()
+        session.delegate = self
+    }
+
+    private func invalidateRelativeHeadingMeasurement(
+        reason: RelativeHeadingReliability.UnreliableReason
+    ) {
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        let result = relativeHeadingStore.invalidate(reason: reason, at: timestamp)
+        guard result.wasActive else {
+            loggedRelativeHeadingReliability = .unreliable(.notStarted)
+            return
+        }
+        relativeHeadingTelemetry(
+            "relative_heading_measurement_invalidated",
+            fieldsForRelativeHeading(
+                result.measurement,
+                timestamp: timestamp
+            )
+        )
+        reportRelativeHeadingReliabilityTransition(to: result.measurement.reliability)
+    }
+
+    private func reportRelativeHeadingIngest(
+        _ result: RelativeHeadingIngestResult,
+        timestamp: TimeInterval
+    ) {
+        let measurement = result.measurement
+        guard measurement.reliability != loggedRelativeHeadingReliability else { return }
+        relativeHeadingTelemetry(
+            result.accepted ? "relative_heading_sample_accepted" : "relative_heading_sample_rejected",
+            fieldsForRelativeHeading(measurement, timestamp: timestamp)
+        )
+        reportRelativeHeadingReliabilityTransition(to: measurement.reliability)
+    }
+
+    nonisolated private func ingestRelativeHeadingMotionSample(_ sample: RelativeHeadingSample) {
+        guard let result = relativeHeadingStore.ingest(sample) else { return }
+        Task { @MainActor [weak self] in
+            self?.reportRelativeHeadingIngest(result, timestamp: sample.timestamp)
+        }
+    }
+
+    private func reportRelativeHeadingReliabilityTransition(
+        to reliability: RelativeHeadingReliability
+    ) {
+        let previous = Self.relativeHeadingReliabilityDescription(loggedRelativeHeadingReliability)
+        let current = Self.relativeHeadingReliabilityDescription(reliability)
+        loggedRelativeHeadingReliability = reliability
+        relativeHeadingTelemetry("relative_heading_reliability_changed", [
+            "from": previous,
+            "to": current,
+        ])
+    }
+
+    private func fieldsForRelativeHeading(
+        _ measurement: RelativeHeadingMeasurement,
+        timestamp: TimeInterval
+    ) -> [String: String] {
+        [
+            "timestamp": String(format: "%.3f", timestamp),
+            "accumulated_angle": String(format: "%.4f", measurement.accumulatedAngle),
+            "sample_age": measurement.sampleAge.map { String(format: "%.3f", $0) } ?? "none",
+            "reliability": Self.relativeHeadingReliabilityDescription(measurement.reliability),
+        ]
+    }
+
+    private static func relativeHeadingReliabilityDescription(
+        _ reliability: RelativeHeadingReliability
+    ) -> String {
+        switch reliability {
+        case .reliable:
+            return "reliable"
+        case .unreliable(let reason):
+            return reason.rawValue
+        }
+    }
+
     public func start() {
+        resetTracking(generation: sessionGeneration + 1)
+    }
+
+    public func resetTracking(generation: UInt64) {
+        resetTracking(generation: generation, runSession: true)
+    }
+
+    func resetTracking(generation: UInt64, runSession: Bool) {
+        acceptsObservations = false
+        sessionGeneration = generation
+        pose = nil
+        meshAnchors.removeAll()
+        forwardClearance = .infinity
+        latestDepthSafetySnapshot = nil
+        trackingState = .notAvailable
+        latestPixelBuffer = nil
+        frameSequence = 0
+        latestObservation = nil
+        lastObservationTimestamp = nil
+        invalidateRelativeHeadingMeasurement(reason: .sessionGenerationChanged)
+        latestCamera = nil
+        latestDepthMap = nil
+        onReset?(generation)
+
+        if motionManager.isDeviceMotionAvailable, !motionManager.isDeviceMotionActive {
+            motionManager.deviceMotionUpdateInterval = RoverConfig.relativeHeadingUpdateInterval
+            motionManager.startDeviceMotionUpdates(
+                using: .xArbitraryZVertical,
+                to: relativeHeadingOperationQueue
+            ) { [weak self] motion, _ in
+                guard let motion else { return }
+                self?.ingestRelativeHeadingMotionSample(RelativeHeadingSample(
+                    timestamp: motion.timestamp,
+                    rotationRate: SIMD3(
+                        motion.rotationRate.x,
+                        motion.rotationRate.y,
+                        motion.rotationRate.z
+                    ),
+                    gravity: SIMD3(
+                        motion.gravity.x,
+                        motion.gravity.y,
+                        motion.gravity.z
+                    )
+                ))
+            }
+        }
+        guard runSession else {
+            acceptsObservations = true
+            return
+        }
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
@@ -47,21 +239,128 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             config.frameSemantics.insert(.smoothedSceneDepth)
         }
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        acceptsObservations = true
     }
 
-    public func pause() { session.pause() }
+    public func pause() {
+        session.pause()
+        motionManager.stopDeviceMotionUpdates()
+    }
 
     // MARK: - ARSessionDelegate
 
+    func ingestDepthSafety(rawDepthMap: CVPixelBuffer,
+                           intrinsics: simd_float3x3,
+                           intrinsicsImageSize: CGSize? = nil,
+                           cameraTransform: simd_float4x4,
+                           timestamp: TimeInterval) {
+        latestDepthSafetySnapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: rawDepthMap,
+            intrinsics: intrinsics,
+            intrinsicsImageSize: intrinsicsImageSize,
+            cameraTransform: cameraTransform,
+            timestamp: timestamp,
+            calibration: RoverConfig.cameraMountCalibration,
+            geometry: RoverConfig.collisionGeometry
+        )
+        depthSnapshotVersion &+= 1
+    }
+
+    func depthSafetyObservation(
+        for command: WheelCommand,
+        at timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> DepthSafetyObservation {
+        guard let latestDepthSafetySnapshot else {
+            return .unavailable(
+                .missingRawDepth,
+                sampleAge: .infinity,
+                motionClass: DepthSafetyMotionClass.classify(command)
+            )
+        }
+        return DepthSafetyEvaluator.evaluate(
+            latestDepthSafetySnapshot,
+            command: command,
+            now: timestamp
+        )
+    }
+
     public func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        let trackingQuality = Self.trackingQuality(frame.camera.trackingState)
+        let observation = PoseObservation(
+            pose: Self.groundPose(from: frame.camera.transform),
+            frameSequence: frameSequence &+ 1,
+            timestamp: frame.timestamp,
+            trackingQuality: trackingQuality,
+            sessionGeneration: sessionGeneration
+        )
+        guard ingest(observation) else { return }
         trackingState = frame.camera.trackingState
-        pose = Self.groundPose(from: frame.camera.transform)
         latestPixelBuffer = frame.capturedImage
         latestCamera = frame.camera
+        if let rawDepth = frame.sceneDepth {
+            ingestDepthSafety(
+                rawDepthMap: rawDepth.depthMap,
+                intrinsics: frame.camera.intrinsics,
+                intrinsicsImageSize: frame.camera.imageResolution,
+                cameraTransform: frame.camera.transform,
+                timestamp: frame.timestamp
+            )
+        } else {
+            latestDepthSafetySnapshot = nil
+        }
         if let depth = frame.smoothedSceneDepth ?? frame.sceneDepth {
             forwardClearance = Self.forwardClearance(from: depth)
             latestDepthMap = depth.depthMap
-            logForwardClearanceIfNeeded()
+        }
+        logForwardClearanceIfNeeded()
+    }
+
+    @discardableResult
+    func ingest(_ observation: PoseObservation) -> Bool {
+        guard acceptsObservations,
+              observation.sessionGeneration == sessionGeneration,
+              observation.frameSequence > frameSequence,
+              lastObservationTimestamp.map({ observation.timestamp > $0 }) ?? true else {
+            return false
+        }
+        latestObservation = observation
+        lastObservationTimestamp = observation.timestamp
+        pose = observation.pose
+        frameSequence = observation.frameSequence
+        observationHandler?(observation)
+        return true
+    }
+
+    private func suspendObservations() {
+        acceptsObservations = false
+        pose = nil
+        forwardClearance = .infinity
+        latestDepthSafetySnapshot = nil
+        trackingState = .notAvailable
+        latestPixelBuffer = nil
+        latestObservation = nil
+        invalidateRelativeHeadingMeasurement(reason: .trackingInterrupted)
+        latestCamera = nil
+        latestDepthMap = nil
+    }
+
+    public func sessionWasInterrupted(_ session: ARSession) {
+        suspendObservations()
+    }
+
+    public func sessionInterruptionEnded(_ session: ARSession) {
+        acceptsObservations = true
+    }
+
+    public func session(_ session: ARSession, didFailWithError error: Error) {
+        suspendObservations()
+    }
+
+    private static func trackingQuality(_ state: ARCamera.TrackingState) -> PoseTrackingQuality {
+        switch state {
+        case .normal: .normal
+        case .limited: .limited
+        case .notAvailable: .unavailable
         }
     }
 
@@ -205,3 +504,5 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return Double(depths[index])
     }
 }
+
+extension ARSessionManager: RoomSessionARManaging {}
