@@ -22,71 +22,77 @@ struct ConversationView: View {
     @State private var speechOut = SpeechOut()
     @State private var agent: MissionAgent?
     @State private var missionPhase: MissionAgent.Phase = .idle
-    @State private var lastCommand = LastCommandState()
+    @State private var lastCommand = ConversationView.makeInitialLastCommandState()
     @State private var authorized = false
     @State private var navigationDebug = NavigationDebugSummary()
 
     var body: some View {
-        VStack(spacing: 18) {
-            if !statusLabel.isEmpty {
-                Text(statusLabel).font(.headline)
-            }
+        VStack(spacing: 12) {
+            ScrollView {
+                VStack(spacing: 18) {
+                    if !statusLabel.isEmpty {
+                        Text(statusLabel).font(.headline)
+                    }
 
-            LiveCameraDebugPanel(ar: ar, summary: navigationDebug)
-                .frame(maxWidth: 320)
+                    LiveCameraDebugPanel(ar: ar, summary: navigationDebug)
+                        .frame(maxWidth: 320)
 
-            Text(speechIn.partialTranscript)
-                .foregroundStyle(.secondary)
-                .frame(minHeight: 40)
-                .multilineTextAlignment(.center)
-
-            if let record = lastCommand.record {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(record.command)
-                        .font(.headline)
-                        .accessibilityIdentifier("last-command-text")
-                    Text(record.status.rawValue)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(statusColor(record.status))
-                        .accessibilityIdentifier("last-command-status")
-                    Text(record.message)
-                        .font(.subheadline)
+                    Text(speechIn.partialTranscript)
                         .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("last-command-message")
-                }
-                .frame(maxWidth: 320, alignment: .leading)
-                .padding(14)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("last-command-card")
-            }
+                        .frame(minHeight: 40)
+                        .multilineTextAlignment(.center)
 
-            VStack(spacing: 16) {
+                    if let record = lastCommand.record {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(record.command)
+                                .font(.headline)
+                                .accessibilityIdentifier("last-command-text")
+                            Text(record.status.rawValue)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(statusColor(record.status))
+                                .accessibilityIdentifier("last-command-status")
+                            Text(record.message)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("last-command-message")
+                        }
+                        .frame(maxWidth: 320, alignment: .leading)
+                        .padding(14)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                        .accessibilityElement(children: .contain)
+                        .accessibilityIdentifier("last-command-card")
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .scrollIndicators(.hidden)
+
+            VStack(spacing: 12) {
                 if agent != nil {
                     Text(phaseStatusLabel)
                         .font(.subheadline)
                         .padding(.horizontal, 18)
-                        .padding(.vertical, 12)
+                        .padding(.vertical, 10)
                         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
 
                 Image(systemName: "mic.circle.fill")
                     .font(.system(size: 72))
+                    .frame(width: 96, height: 96)
+                    .contentShape(Circle())
                     .foregroundStyle(speechIn.state == .listening ? .red : .accentColor)
+                    .accessibilityLabel("Push to talk")
+                    .accessibilityIdentifier("push-to-talk-control")
                     .gesture(
                         DragGesture(minimumDistance: 0)
                             .onChanged { _ in startListening() }
                             .onEnded { _ in speechIn.finish() }
                     )
             }
-            .offset(y: -36)
-            .padding(.bottom, 40)
-
-            Spacer()
+            .padding(.bottom, 8)
         }
         .padding(.horizontal)
-        .padding(.top, 44)
-        .padding(.bottom, 12)
+        .padding(.top, 20)
         .task {
             authorized = await speechIn.requestAuthorization()
             let detector = await Detector()
@@ -111,6 +117,21 @@ struct ConversationView: View {
                 }
             ) { brain }
         }
+    }
+
+    private static func makeInitialLastCommandState() -> LastCommandState {
+        var state = LastCommandState()
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-ui-test-failed-command") {
+            state.reduce(.recognized(id: 1, command: "Go to our room"))
+            state.reduce(.failed(
+                id: 1,
+                command: "Go to our room",
+                message: "I can't safely see the space needed to turn."
+            ))
+        }
+#endif
+        return state
     }
 
     private var statusLabel: String {

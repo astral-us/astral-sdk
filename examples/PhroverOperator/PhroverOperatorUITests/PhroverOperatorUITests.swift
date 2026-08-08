@@ -27,6 +27,26 @@ final class PhroverOperatorUITests: XCTestCase {
         )
     }
 
+    func testTalk_failedCommandKeepsPushToTalkHittable() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-failed-command")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        let failedCard = app.otherElements["last-command-card"]
+        XCTAssertTrue(failedCard.waitForExistence(timeout: 10))
+
+        let mic = app.descendants(matching: .any)
+            .matching(identifier: "push-to-talk-control").element
+        XCTAssertTrue(mic.waitForExistence(timeout: 10))
+        XCTAssertTrue(mic.isHittable)
+        XCTAssertLessThanOrEqual(mic.frame.maxY, talkTab.frame.minY)
+        screenshot(app, name: "talk_failed_command_retry")
+    }
+
     /// Gated integration path: drive forward on the D-pad and confirm the command
     /// actually reached the (mocked) WAVE ROVER base — proves the phone->ESP32 control
     /// loop end-to-end with no chassis needed.
