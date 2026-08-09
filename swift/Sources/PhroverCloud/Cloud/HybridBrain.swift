@@ -25,11 +25,21 @@ public final class HybridBrain: RoverBrain {
     }
 
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
-        switch await PrimaryStageRace.run(brain: onDevice, context: context, timeout: primaryTimeout) {
+        let primaryResult = await PrimaryStageRace.run(
+            brain: onDevice,
+            context: context,
+            timeout: primaryTimeout
+        )
+        try Task.checkCancellation()
+
+        switch primaryResult {
         case .output(let output):
             logSelection("on_device", reason: "primary")
             return output
         case .failure(let error):
+            if error is CancellationError {
+                throw error
+            }
             return try await cloudAction(context, reason: "on_device_failed", primaryError: error)
         case .timedOut:
             return try await cloudAction(
@@ -37,6 +47,8 @@ public final class HybridBrain: RoverBrain {
                 reason: "on_device_timed_out",
                 primaryError: PrimaryStageTimeoutError(timeout: primaryTimeout)
             )
+        case .cancelled:
+            throw CancellationError()
         }
     }
 
@@ -45,6 +57,7 @@ public final class HybridBrain: RoverBrain {
         reason: String,
         primaryError: Error
     ) async throws -> BrainOutput {
+        try Task.checkCancellation()
         guard let cloud, isOnline() else {
             logSelection("on_device", reason: reason, error: primaryError)
             throw primaryError
@@ -54,6 +67,8 @@ public final class HybridBrain: RoverBrain {
             let output = try await cloud.nextAction(context)
             logSelection("cloud", reason: reason, error: primaryError)
             return output
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             logSelection("cloud", reason: "cloud_failed", error: error)
             throw error
@@ -73,45 +88,77 @@ private enum PrimaryStageResult {
     case output(BrainOutput)
     case failure(Error)
     case timedOut
+    case cancelled
 }
 
 @MainActor
 private final class PrimaryStageRace {
     private var continuation: CheckedContinuation<PrimaryStageResult, Never>?
     private var tasks: [Task<Void, Never>] = []
+    private var cancellationRequested = false
 
     static func run(brain: RoverBrain, context: MissionContext, timeout: Duration) async -> PrimaryStageResult {
         let race = PrimaryStageRace()
-        let result = await withCheckedContinuation { continuation in
-            race.continuation = continuation
-            race.tasks = [
-                Task { @MainActor in
-                    do {
-                        race.finish(.output(try await brain.nextAction(context)))
-                    } catch {
-                        race.finish(.failure(error))
-                    }
-                },
-                Task { @MainActor in
-                    do {
-                        try await Task.sleep(for: timeout)
-                    } catch {
-                        return
-                    }
-                    race.finish(.timedOut)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                race.start(
+                    brain: brain,
+                    context: context,
+                    timeout: timeout,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { @MainActor in
+                race.cancel()
+            }
+        }
+    }
+
+    private func start(
+        brain: RoverBrain,
+        context: MissionContext,
+        timeout: Duration,
+        continuation: CheckedContinuation<PrimaryStageResult, Never>
+    ) {
+        self.continuation = continuation
+        guard !cancellationRequested, !Task.isCancelled else {
+            finish(.cancelled)
+            return
+        }
+
+        tasks = [
+            Task { @MainActor in
+                do {
+                    self.finish(.output(try await brain.nextAction(context)))
+                } catch is CancellationError {
+                    self.finish(.cancelled)
+                } catch {
+                    self.finish(.failure(error))
                 }
-            ]
-        }
-        for task in race.tasks {
-            await task.value
-        }
-        return result
+            },
+            Task { @MainActor in
+                do {
+                    try await Task.sleep(for: timeout)
+                } catch {
+                    return
+                }
+                self.finish(.timedOut)
+            }
+        ]
+    }
+
+    private func cancel() {
+        cancellationRequested = true
+        finish(.cancelled)
     }
 
     private func finish(_ result: PrimaryStageResult) {
         guard let continuation else { return }
         self.continuation = nil
-        tasks.forEach { $0.cancel() }
+        let runningTasks = tasks
+        tasks.removeAll()
+        runningTasks.forEach { $0.cancel() }
         continuation.resume(returning: result)
     }
 }
