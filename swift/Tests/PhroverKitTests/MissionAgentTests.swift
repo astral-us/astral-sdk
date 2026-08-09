@@ -49,6 +49,8 @@ final class MissionAgentTests: XCTestCase {
             motion: motion,
             perception: perception,
             voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 1,
             commandStatusDidChange: { statuses.append($0) },
             currentBrain: { nil }
         )
@@ -1045,7 +1047,11 @@ final class MissionAgentTests: XCTestCase {
         let motion = FakeMotion()
         let perception = FakePerception()
         let voice = FakeVoice()
-        let agent = MissionAgent(motion: motion, perception: perception, voice: voice) { nil }
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 visualTargetScanDelay: 0,
+                                 maxVisualTargetScanSteps: 1) { nil }
 
         await agent.handle("go to the chair")
 
@@ -1080,6 +1086,8 @@ final class MissionAgentTests: XCTestCase {
         let agent = MissionAgent(motion: motion,
                                  perception: perception,
                                  voice: voice,
+                                 visualTargetScanDelay: 0,
+                                 maxVisualTargetScanSteps: 1,
                                  brainErrorLogger: { error, context in logged.append((error, context)) },
                                  currentBrain: { brain })
 
@@ -1091,6 +1099,162 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(logged.first?.context.visibleObjects.map(\.label), ["chair"])
         XCTAssertEqual(logged.first?.context.explorationCandidates.map(\.id), ["opening_1"])
         XCTAssertEqual(voice.spoken, ["Sorry, I'm having trouble thinking right now."])
+    }
+
+    func testBrainUnavailableFallsBackToVisibleRefrigeratorAndDoesNotReturn() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        var statuses: [MissionCommandStatus] = []
+        let brain = ThrowingBrain(
+            error: RoverBrainError.onDeviceUnavailable(.modelNotReady)
+        )
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [perception.unprojectResult])
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+        XCTAssertFalse(motion.navigateCalls.contains(.zero))
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected a successful terminal status")
+        }
+    }
+
+    func testBrainUnavailableFallsBackToVisibleRefrigeratorAndReturnsWhenRequested() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        let startPose = perception.pose!.position
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.unprojectResult = Vec2(1, 0)
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(1, 0), yaw: .pi)
+        }
+        var statuses: [MissionCommandStatus] = []
+        let brain = ThrowingBrain(
+            error: RoverBrainError.onDeviceUnavailable(.modelNotReady)
+        )
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the refrigerator and come back")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1, 0), startPose])
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected a successful terminal status")
+        }
+    }
+
+    func testBrainUnavailableRejectsUnsupportedCommandWithoutMotion() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        var statuses: [MissionCommandStatus] = []
+        let brain = ThrowingBrain(
+            error: RoverBrainError.onDeviceUnavailable(.modelNotReady)
+        )
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Tell me a joke")
+
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        XCTAssertTrue(motion.rotateCalls.isEmpty)
+        XCTAssertTrue(motion.scanRotateCalls.isEmpty)
+        guard case .failed = statuses.last else {
+            return XCTFail("Expected an unsupported command failure")
+        }
+    }
+
+    func testBrainFailureAfterUsableOutputDoesNotMixInOfflineFallback() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        let voice = FakeVoice()
+        let brain = OutputThenThrowingBrain(
+            output: BrainOutput(decision: .say("I am checking.")),
+            error: RoverBrainError.onDeviceUnavailable(.modelNotReady)
+        )
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: voice,
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        XCTAssertEqual(voice.spoken, [
+            "I am checking.",
+            "Sorry, I'm having trouble thinking right now."
+        ])
+    }
+
+    func testCallerCancellationDoesNotStartOfflineFallback() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        var statuses: [MissionCommandStatus] = []
+        let brain = CancellableBlockingBrain()
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            brainDecisionTimeout: 0.05,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        let mission = Task { @MainActor in
+            await agent.handle("Go to the refrigerator")
+        }
+        await brain.waitUntilEntered()
+        mission.cancel()
+        await mission.value
+
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        guard case .cancelled = statuses.last else {
+            return XCTFail("Expected caller cancellation to remain authoritative")
+        }
     }
 
     func testStopDecisionCancelsMotion() async {
@@ -1192,6 +1356,8 @@ final class MissionAgentTests: XCTestCase {
                                  perception: perception,
                                  voice: voice,
                                  brainDecisionTimeout: 0.03,
+                                 visualTargetScanDelay: 0,
+                                 maxVisualTargetScanSteps: 1,
                                  currentBrain: { brain })
 
         await agent.handle("go to the refrigerator")
@@ -1248,6 +1414,47 @@ private final class ThrowingBrain: RoverBrain {
 
     func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         throw error
+    }
+}
+
+@MainActor
+private final class OutputThenThrowingBrain: RoverBrain {
+    private var output: BrainOutput?
+    private let error: Error
+
+    init(output: BrainOutput, error: Error) {
+        self.output = output
+        self.error = error
+    }
+
+    func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        if let output {
+            self.output = nil
+            return output
+        }
+        throw error
+    }
+}
+
+@MainActor
+private final class CancellableBlockingBrain: RoverBrain {
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var entered = false
+
+    func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        entered = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        while true {
+            try await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            enteredContinuation = continuation
+        }
     }
 }
 

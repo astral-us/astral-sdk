@@ -891,6 +891,7 @@ public final class MissionAgent {
         // latter should get the "used up my time" wrap-up; the brain-failure paths
         // already spoke their own message and shouldn't pile a second one on top.
         var brainFailed = false
+        var hasUsableBrainOutput = false
 
         for tick in 0..<maxTicksPerUtterance {
             guard isCurrentMission(missionID) else {
@@ -899,14 +900,27 @@ public final class MissionAgent {
                 return
             }
             guard let brain = currentBrain() else {
+                RuntimeFileLog.append("mission_failed", fields: [
+                    "mission": "\(missionID)",
+                    "reason": "missing_brain"
+                ])
+                if !hasUsableBrainOutput {
+                    await attemptOfflineObjectFallback(
+                        utterance: missionUtterance,
+                        missionID: missionID,
+                        brainFailureReason: "missing_brain",
+                        failureMessage: "Sorry, I can’t think right now."
+                    )
+                    return
+                }
                 voice.speak("Sorry, I can't think right now.")
                 publishMissionTerminal(
                     { .failed(id: $0, command: $1, message: "Sorry, I can’t think right now.") },
                     missionID: missionID
                 )
-                RuntimeFileLog.append("mission_failed", fields: [
+                RuntimeFileLog.append("mission_offline_fallback_skipped", fields: [
                     "mission": "\(missionID)",
-                    "reason": "missing_brain"
+                    "reason": "brain_output_already_produced"
                 ])
                 brainFailed = true
                 break
@@ -930,10 +944,30 @@ public final class MissionAgent {
             let output: BrainOutput
             do {
                 output = try await nextBrainAction(brain, context: ctx)
+            } catch is CancellationError {
+                phase = .idle
+                RuntimeFileLog.append("mission_cancelled", fields: [
+                    "mission": "\(missionID)",
+                    "reason": "brain_decision_cancelled"
+                ])
+                return
             } catch is BrainDecisionTimeoutError {
                 guard isCurrentMission(missionID) else {
                     phase = .idle
                     RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
+                    return
+                }
+                RuntimeFileLog.append("mission_brain_timeout", fields: [
+                    "mission": "\(missionID)",
+                    "timeout": String(format: "%.2f", brainDecisionTimeout)
+                ])
+                if !hasUsableBrainOutput {
+                    await attemptOfflineObjectFallback(
+                        utterance: missionUtterance,
+                        missionID: missionID,
+                        brainFailureReason: "brain_timeout",
+                        failureMessage: "Sorry, I’m having trouble thinking right now."
+                    )
                     return
                 }
                 voice.speak("Sorry, I'm having trouble thinking right now.")
@@ -941,9 +975,9 @@ public final class MissionAgent {
                     { .failed(id: $0, command: $1, message: "Sorry, I’m having trouble thinking right now.") },
                     missionID: missionID
                 )
-                RuntimeFileLog.append("mission_brain_timeout", fields: [
+                RuntimeFileLog.append("mission_offline_fallback_skipped", fields: [
                     "mission": "\(missionID)",
-                    "timeout": String(format: "%.2f", brainDecisionTimeout)
+                    "reason": "brain_output_already_produced"
                 ])
                 brainFailed = true
                 break
@@ -954,14 +988,27 @@ public final class MissionAgent {
                     return
                 }
                 brainErrorLogger(error, ctx)
+                RuntimeFileLog.append("mission_brain_error", fields: [
+                    "mission": "\(missionID)",
+                    "error": error.localizedDescription
+                ])
+                if !hasUsableBrainOutput {
+                    await attemptOfflineObjectFallback(
+                        utterance: missionUtterance,
+                        missionID: missionID,
+                        brainFailureReason: "brain_error",
+                        failureMessage: "Sorry, I’m having trouble thinking right now."
+                    )
+                    return
+                }
                 voice.speak("Sorry, I'm having trouble thinking right now.")
                 publishMissionTerminal(
                     { .failed(id: $0, command: $1, message: "Sorry, I’m having trouble thinking right now.") },
                     missionID: missionID
                 )
-                RuntimeFileLog.append("mission_brain_error", fields: [
+                RuntimeFileLog.append("mission_offline_fallback_skipped", fields: [
                     "mission": "\(missionID)",
-                    "error": error.localizedDescription
+                    "reason": "brain_output_already_produced"
                 ])
                 brainFailed = true
                 break
@@ -971,6 +1018,7 @@ public final class MissionAgent {
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return
             }
+            hasUsableBrainOutput = true
             if let updated = output.updatedPlan, !updated.isEmpty {
                 plan = updated
                 RuntimeFileLog.append("mission_plan_updated", fields: [
@@ -1212,22 +1260,205 @@ public final class MissionAgent {
         RuntimeFileLog.append("mission_finished", fields: ["mission": "\(missionID)"])
     }
 
+    private func attemptOfflineObjectFallback(
+        utterance: String,
+        missionID: Int,
+        brainFailureReason: String,
+        failureMessage: String
+    ) async {
+        guard isCurrentMission(missionID), !Task.isCancelled else {
+            phase = .idle
+            RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                "mission": "\(missionID)",
+                "reason": "mission_cancelled_before_start"
+            ])
+            return
+        }
+        guard let intent = OfflineObjectMissionIntentParser.parse(utterance) else {
+            RuntimeFileLog.append("mission_offline_fallback_rejected", fields: [
+                "mission": "\(missionID)",
+                "reason": "unsupported_command",
+                "brain_failure": brainFailureReason
+            ])
+            failOfflineObjectMission(
+                missionID: missionID,
+                message: failureMessage,
+                reason: "unsupported_command"
+            )
+            return
+        }
+
+        RuntimeFileLog.append("mission_offline_fallback_started", fields: [
+            "mission": "\(missionID)",
+            "target": intent.objectQuery,
+            "target_label": intent.targetLabel,
+            "requested_colors": Self.requestedColorsDescription(intent.requestedColors),
+            "return_requested": intent.shouldReturn ? "true" : "false",
+            "brain_failure": brainFailureReason
+        ])
+        await runOfflineObjectMission(
+            intent,
+            missionID: missionID,
+            failureMessage: failureMessage
+        )
+    }
+
+    private func runOfflineObjectMission(
+        _ intent: OfflineObjectMissionIntent,
+        missionID: Int,
+        failureMessage: String
+    ) async {
+        let target = NavigationTarget.visualQuery(intent.objectQuery)
+        var scanSteps = 0
+        let goal: Vec2
+
+        if let visibleGoal = resolve(target, missionID: missionID) {
+            goal = visibleGoal
+        } else {
+            switch await scanForUnresolvedVisualTarget(
+                target,
+                missionID: missionID,
+                scanSteps: &scanSteps
+            ) {
+            case .found(let scannedGoal):
+                goal = scannedGoal
+            case .notFound:
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "target_not_found"
+                )
+                return
+            case .cancelled:
+                phase = .idle
+                RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                    "mission": "\(missionID)",
+                    "reason": "cancelled_while_scanning"
+                ])
+                return
+            }
+        }
+
+        guard isCurrentMission(missionID), !Task.isCancelled else {
+            phase = .idle
+            RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                "mission": "\(missionID)",
+                "reason": "cancelled_before_navigation"
+            ])
+            return
+        }
+
+        phase = .acting
+        navigate(to: goal, for: target)
+        await waitForMotionToSettle()
+        guard isCurrentMission(missionID), !Task.isCancelled else {
+            phase = .idle
+            RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                "mission": "\(missionID)",
+                "reason": "cancelled_during_navigation"
+            ])
+            return
+        }
+
+        if case .failed(let reason) = motion.state {
+            failOfflineObjectMission(
+                missionID: missionID,
+                message: reason,
+                reason: "target_navigation_failed"
+            )
+            return
+        }
+        guard case .arrived = motion.state else {
+            failOfflineObjectMission(
+                missionID: missionID,
+                message: failureMessage,
+                reason: "target_navigation_incomplete"
+            )
+            return
+        }
+
+        RuntimeFileLog.append("mission_offline_fallback_target_arrived", fields: [
+            "mission": "\(missionID)",
+            "target": intent.objectQuery,
+            "goal_x": String(format: "%.2f", goal.x),
+            "goal_y": String(format: "%.2f", goal.y),
+            "stop_distance": String(format: "%.2f", RoverConfig.visualTargetStopDistance)
+        ])
+
+        if intent.shouldReturn {
+            guard let start = memory.missionStartPose else {
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "missing_start_pose"
+                )
+                return
+            }
+            RuntimeFileLog.append("mission_offline_fallback_return_started", fields: [
+                "mission": "\(missionID)",
+                "goal_x": String(format: "%.2f", start.position.x),
+                "goal_y": String(format: "%.2f", start.position.y)
+            ])
+            guard await alignHeadingForReturn(to: start.position, missionID: missionID),
+                  await navigateReturn(to: start.position, missionID: missionID) else {
+                publishMissionTerminal(
+                    { .failed(id: $0, command: $1, message: failureMessage) },
+                    missionID: missionID
+                )
+                RuntimeFileLog.append("mission_offline_fallback_failed", fields: [
+                    "mission": "\(missionID)",
+                    "reason": "return_failed"
+                ])
+                return
+            }
+            RuntimeFileLog.append("mission_offline_fallback_return_completed", fields: [
+                "mission": "\(missionID)"
+            ])
+        }
+
+        phase = .idle
+        publishMissionTerminal(
+            { .succeeded(id: $0, command: $1, message: "Command completed.") },
+            missionID: missionID
+        )
+        RuntimeFileLog.append("mission_offline_fallback_completed", fields: [
+            "mission": "\(missionID)",
+            "target": intent.objectQuery,
+            "returned": intent.shouldReturn ? "true" : "false"
+        ])
+    }
+
+    private func failOfflineObjectMission(
+        missionID: Int,
+        message: String,
+        reason: String
+    ) {
+        motion.cancel()
+        voice.speak(message.replacingOccurrences(of: "I’m", with: "I'm"))
+        phase = .idle
+        publishMissionTerminal(
+            { .failed(id: $0, command: $1, message: message) },
+            missionID: missionID
+        )
+        RuntimeFileLog.append("mission_offline_fallback_failed", fields: [
+            "mission": "\(missionID)",
+            "reason": reason
+        ])
+    }
+
     private func nextBrainAction(_ brain: RoverBrain, context: MissionContext) async throws -> BrainOutput {
-        try await withCheckedThrowingContinuation { continuation in
-            let race = BrainDecisionRace(continuation: continuation)
-            let decisionTask = Task { @MainActor in
-                do {
-                    let output = try await brain.nextAction(context)
-                    race.finish(.success(output))
-                } catch {
-                    race.finish(.failure(error))
-                }
+        let race = BrainDecisionRace()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                race.start(
+                    brain: brain,
+                    context: context,
+                    timeout: brainDecisionTimeout,
+                    continuation: continuation
+                )
             }
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(brainDecisionTimeout))
-                decisionTask.cancel()
-                race.finish(.failure(BrainDecisionTimeoutError(timeout: brainDecisionTimeout)))
-            }
+        } onCancel: {
+            Task { @MainActor in race.cancel() }
         }
     }
 
@@ -2126,16 +2357,52 @@ private struct BrainDecisionTimeoutError: LocalizedError {
 
 @MainActor
 private final class BrainDecisionRace {
-    private var didFinish = false
-    private let continuation: CheckedContinuation<BrainOutput, Error>
+    private var continuation: CheckedContinuation<BrainOutput, Error>?
+    private var tasks: [Task<Void, Never>] = []
+    private var cancellationRequested = false
 
-    init(continuation: CheckedContinuation<BrainOutput, Error>) {
+    func start(
+        brain: RoverBrain,
+        context: MissionContext,
+        timeout: TimeInterval,
+        continuation: CheckedContinuation<BrainOutput, Error>
+    ) {
         self.continuation = continuation
+        guard !cancellationRequested, !Task.isCancelled else {
+            finish(.failure(CancellationError()))
+            return
+        }
+
+        tasks = [
+            Task { @MainActor in
+                do {
+                    self.finish(.success(try await brain.nextAction(context)))
+                } catch {
+                    self.finish(.failure(error))
+                }
+            },
+            Task { @MainActor in
+                do {
+                    try await Task.sleep(for: .seconds(timeout))
+                } catch {
+                    return
+                }
+                self.finish(.failure(BrainDecisionTimeoutError(timeout: timeout)))
+            }
+        ]
+    }
+
+    func cancel() {
+        cancellationRequested = true
+        finish(.failure(CancellationError()))
     }
 
     func finish(_ result: Result<BrainOutput, Error>) {
-        guard !didFinish else { return }
-        didFinish = true
+        guard let continuation else { return }
+        self.continuation = nil
+        let runningTasks = tasks
+        tasks.removeAll()
+        runningTasks.forEach { $0.cancel() }
         continuation.resume(with: result)
     }
 }
