@@ -1288,9 +1288,13 @@ final class MissionAgentTests: XCTestCase {
 
     func testCallerCancellationDuringOfflineScanStopsRotation() async {
         let motion = FakeMotion()
-        motion.rotateNeverCompletes = true
+        motion.scanRotationUsesIndependentTask = true
         let perception = FakePerception()
         var statuses: [MissionCommandStatus] = []
+        let scanStarted = expectation(description: "offline scan started")
+        let scanCancelled = expectation(description: "offline scan cancelled")
+        motion.onScanRotate = { _ in scanStarted.fulfill() }
+        motion.onCancel = { scanCancelled.fulfill() }
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -1306,10 +1310,12 @@ final class MissionAgentTests: XCTestCase {
         let mission = Task { @MainActor in
             await agent.handle("Go to the refrigerator")
         }
-        while motion.scanRotateCalls.isEmpty {
-            await Task.yield()
-        }
+        await fulfillment(of: [scanStarted], timeout: 1)
         mission.cancel()
+        await fulfillment(of: [scanCancelled], timeout: 0.1)
+        if motion.cancelCallCount == 0 {
+            motion.cancel()
+        }
         await mission.value
 
         XCTAssertGreaterThanOrEqual(motion.cancelCallCount, 1)
@@ -1329,6 +1335,10 @@ final class MissionAgentTests: XCTestCase {
                             normalizedPoint: CGPoint(x: 0.5, y: 0.5))
         ]
         var statuses: [MissionCommandStatus] = []
+        let navigationStarted = expectation(description: "offline navigation started")
+        let navigationCancelled = expectation(description: "offline navigation cancelled")
+        motion.onNavigate = { _ in navigationStarted.fulfill() }
+        motion.onCancel = { navigationCancelled.fulfill() }
         let agent = MissionAgent(
             motion: motion,
             perception: perception,
@@ -1342,14 +1352,13 @@ final class MissionAgentTests: XCTestCase {
         let mission = Task { @MainActor in
             await agent.handle("Go to the refrigerator")
         }
-        while motion.navigateCalls.isEmpty {
-            await Task.yield()
-        }
+        await fulfillment(of: [navigationStarted], timeout: 1)
         mission.cancel()
-        motion.state = .arrived
+        await fulfillment(of: [navigationCancelled], timeout: 1)
         await mission.value
 
         XCTAssertGreaterThanOrEqual(motion.cancelCallCount, 1)
+        XCTAssertEqual(motion.state, .idle)
         XCTAssertEqual(
             statuses.first { $0.id == 1 && $0.isTerminal },
             .cancelled(id: 1, command: "Go to the refrigerator")
@@ -1366,9 +1375,13 @@ final class MissionAgentTests: XCTestCase {
                             normalizedPoint: CGPoint(x: 0.5, y: 0.5))
         ]
         perception.unprojectResult = Vec2(1, 0)
+        let returnNavigationStarted = expectation(description: "return navigation started")
         motion.onNavigate = { call in
-            guard call == 1 else { return }
-            perception.pose = Pose2D(position: Vec2(1, 0), yaw: .pi)
+            if call == 1 {
+                perception.pose = Pose2D(position: Vec2(1, 0), yaw: .pi)
+            } else if call == 2 {
+                returnNavigationStarted.fulfill()
+            }
         }
         var statuses: [MissionCommandStatus] = []
         let agent = MissionAgent(
@@ -1384,9 +1397,7 @@ final class MissionAgentTests: XCTestCase {
         let mission = Task { @MainActor in
             await agent.handle("Go to the refrigerator and come back")
         }
-        while motion.navigateCalls.count < 2 {
-            await Task.yield()
-        }
+        await fulfillment(of: [returnNavigationStarted], timeout: 1)
         await agent.handle("stop")
         let motionCountAfterStop = motion.navigateCalls.count + motion.scanRotateCalls.count
         await mission.value
@@ -1396,6 +1407,95 @@ final class MissionAgentTests: XCTestCase {
             .cancelled(id: 1, command: "Go to the refrigerator and come back")
         )
         XCTAssertEqual(motion.navigateCalls.count + motion.scanRotateCalls.count, motionCountAfterStop)
+    }
+
+    func testCallerCancellationDuringReturnAlignmentStopsIndependentRotation() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.arrived]
+        motion.scanRotationUsesIndependentTask = true
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.unprojectResult = Vec2(1, 0)
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(1, 0), yaw: 0)
+        }
+        let alignmentStarted = expectation(description: "return alignment started")
+        let alignmentCancelled = expectation(description: "return alignment cancelled")
+        motion.onScanRotate = { _ in alignmentStarted.fulfill() }
+        motion.onCancel = { alignmentCancelled.fulfill() }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        let mission = Task { @MainActor in
+            await agent.handle("Go to the refrigerator and come back")
+        }
+        await fulfillment(of: [alignmentStarted], timeout: 1)
+        mission.cancel()
+        await fulfillment(of: [alignmentCancelled], timeout: 0.1)
+        if motion.cancelCallCount == 0 {
+            motion.cancel()
+        }
+        await mission.value
+
+        XCTAssertEqual(motion.navigateCalls.count, 1)
+        XCTAssertEqual(
+            statuses.first { $0.id == 1 && $0.isTerminal },
+            .cancelled(id: 1, command: "Go to the refrigerator and come back")
+        )
+    }
+
+    func testCallerCancellationImmediatelyBeforeOfflineReturnSuccessWinsTerminalBoundary() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.arrived, .arrived]
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.unprojectResult = Vec2(1, 0)
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(1, 0), yaw: .pi)
+        }
+        var statuses: [MissionCommandStatus] = []
+        var mission: Task<Void, Never>?
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            phaseDidChange: { phase in
+                guard phase == .idle, motion.navigateCalls.count == 2 else { return }
+                mission?.cancel()
+            },
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        mission = Task { @MainActor in
+            await agent.handle("Go to the refrigerator and come back")
+        }
+        await mission?.value
+
+        XCTAssertEqual(
+            statuses.first { $0.id == 1 && $0.isTerminal },
+            .cancelled(id: 1, command: "Go to the refrigerator and come back")
+        )
     }
 
     func testBrainCancellationErrorFallsBackWhenMissionIsStillActive() async {
@@ -1683,11 +1783,14 @@ private final class FakeMotion: RoverMotion {
     var navigateOutcome: NavigationController.State = .arrived
     var navigateOutcomes: [NavigationController.State] = []
     var rotateNeverCompletes = false
+    var scanRotationUsesIndependentTask = false
     var rotateDelay: TimeInterval = 0
     var stopAndWaitDelay: TimeInterval = 0
     var onNavigate: ((Int) -> Void)?
     var onRotate: ((Double) -> Void)?
     var onScanRotate: ((Double) -> Void)?
+    var onCancel: (() -> Void)?
+    private var independentScanTask: Task<Void, Never>?
 
     func navigate(to goal: Vec2) {
         lifecycleEvents.append("navigate")
@@ -1725,12 +1828,29 @@ private final class FakeMotion: RoverMotion {
     func rotateForScan(by angle: Double) async {
         scanRotateCalls.append(angle)
         onScanRotate?(angle)
+        if scanRotationUsesIndependentTask {
+            state = .driving
+            let task = Task { @MainActor in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(5))
+                }
+            }
+            independentScanTask = task
+            await task.value
+            independentScanTask = nil
+            return
+        }
         await rotate(by: angle)
     }
 
     func cancel() {
         cancelCallCount += 1
+        independentScanTask?.cancel()
+        independentScanTask = nil
         state = .idle
+        let cancellationObserver = onCancel
+        onCancel = nil
+        cancellationObserver?()
     }
 
     func stopAndWait() async {

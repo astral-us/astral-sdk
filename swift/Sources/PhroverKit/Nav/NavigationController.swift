@@ -34,6 +34,21 @@ public final class NavigationController {
     private let trackingRecoveryTimeout: TimeInterval
     private let scanDepthRecoveryTimeout: TimeInterval
 
+    static func awaitScanRotationTask(
+        _ task: Task<Void, Never>,
+        stop: @escaping @MainActor () async -> Void
+    ) async {
+        await withTaskCancellationHandler {
+            await task.value
+            guard Task.isCancelled else { return }
+            task.cancel()
+            await task.value
+            await stop()
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
     public convenience init(
         ar: ARSessionManager,
         control: RoverControl,
@@ -160,7 +175,12 @@ public final class NavigationController {
             )
         }
         loop = task
-        await task.value
+        await Self.awaitScanRotationTask(task) { [control] in
+            try? await control.stop()
+        }
+        if Task.isCancelled {
+            state = .idle
+        }
     }
 
     /// Stop and clear the current goal.

@@ -4,6 +4,31 @@ import RoverNav
 
 @MainActor
 final class RotationCommandTests: XCTestCase {
+    func testCancellingScanAwaitCancelsIndependentRotationAndAwaitsStop() async {
+        let rotationCancelled = expectation(description: "independent rotation cancelled")
+        let stopCompleted = expectation(description: "transport stop completed")
+        let rotation = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+            } catch is CancellationError {
+                rotationCancelled.fulfill()
+            } catch {
+                XCTFail("Unexpected scan task error: \(error)")
+            }
+        }
+        let scanAwait = Task { @MainActor in
+            await NavigationController.awaitScanRotationTask(rotation) {
+                stopCompleted.fulfill()
+            }
+        }
+
+        await Task.yield()
+        scanAwait.cancel()
+
+        await fulfillment(of: [rotationCancelled, stopCompleted], timeout: 1)
+        await scanAwait.value
+    }
+
     func testScanFailureWithoutTrackedPoseAwaitsTransportStop() async {
         TestURLProtocol.reset()
         let configuration = URLSessionConfiguration.ephemeral

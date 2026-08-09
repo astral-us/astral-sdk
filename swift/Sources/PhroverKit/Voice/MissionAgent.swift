@@ -1465,12 +1465,28 @@ public final class MissionAgent {
             case .arrived:
                 break
             }
+            guard !missionCancellationDetected(missionID) else {
+                cancelActiveMotion(missionID: missionID, reason: "cancelled_before_return_completion")
+                RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                    "mission": "\(missionID)",
+                    "reason": "cancelled_before_return_completion"
+                ])
+                return
+            }
             RuntimeFileLog.append("mission_offline_fallback_return_completed", fields: [
                 "mission": "\(missionID)"
             ])
         }
 
         phase = .idle
+        guard !missionCancellationDetected(missionID) else {
+            cancelActiveMotion(missionID: missionID, reason: "cancelled_before_success")
+            RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                "mission": "\(missionID)",
+                "reason": "cancelled_before_success"
+            ])
+            return
+        }
         publishMissionTerminal(
             { .succeeded(id: $0, command: $1, message: "Command completed.") },
             missionID: missionID
@@ -1864,7 +1880,7 @@ public final class MissionAgent {
                 "angle": String(format: "%.0fdeg", angle * 180 / .pi)
             ])
             let frameBeforeTurn = perception.frameSequence
-            await motion.rotateForScan(by: angle)
+            await rotateForScanRespectingCancellation(by: angle)
             guard !missionCancellationDetected(missionID) else {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_during_scan_turn")
                 return .cancelled
@@ -2129,7 +2145,7 @@ public final class MissionAgent {
                 "step": "\(step)",
                 "angle_deg": String(format: "%.0f", angle * 180 / .pi)
             ])
-            await motion.rotateForScan(by: angle)
+            await rotateForScanRespectingCancellation(by: angle)
 
             guard !missionCancellationDetected(missionID) else {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_during_return_alignment")
@@ -2148,6 +2164,16 @@ public final class MissionAgent {
             "steps": "\(step)"
         ])
         return .arrived
+    }
+
+    private func rotateForScanRespectingCancellation(by angle: Double) async {
+        await withTaskCancellationHandler {
+            await motion.rotateForScan(by: angle)
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.motion.cancel()
+            }
+        }
     }
 
     private func navigateReturn(to goal: Vec2, missionID: Int) async -> ReturnLegOutcome {
