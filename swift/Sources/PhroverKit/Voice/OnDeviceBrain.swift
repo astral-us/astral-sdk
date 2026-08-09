@@ -51,6 +51,26 @@ protocol OnDeviceBrainResponder {
     func nextAction(prompt: String, context: MissionContext) async throws -> BrainOutput
 }
 
+public enum OnDeviceBrainAvailability: Equatable, Sendable {
+    case available
+    case deviceNotEligible
+    case appleIntelligenceNotEnabled
+    case modelNotReady
+
+    public var operatorMessage: String? {
+        switch self {
+        case .available:
+            nil
+        case .deviceNotEligible:
+            "Apple Intelligence is not supported on this iPhone. Supported object commands can still run offline."
+        case .appleIntelligenceNotEnabled:
+            "Turn on Apple Intelligence in Settings. Supported object commands can still run offline."
+        case .modelNotReady:
+            "Apple Intelligence is still preparing. Keep the iPhone on Wi-Fi and power. Supported object commands can still run offline."
+        }
+    }
+}
+
 /// Fallback brain: Apple's on-device Foundation Model, reasoning over a *text* summary of
 /// what's visible. The model itself only sees COCO labels (no color/attribute
 /// understanding — it can't tell "green" from "red"), but it can still emit a free-text
@@ -60,7 +80,7 @@ protocol OnDeviceBrainResponder {
 /// the richer understanding `CloudBrain` provides when online.
 @MainActor
 public final class OnDeviceBrain: RoverBrain {
-    private let isAvailableProvider: () -> Bool
+    private let availabilityProvider: () -> OnDeviceBrainAvailability
     private let makeResponder: () -> OnDeviceBrainResponder
 
     /// - Parameter adapter: an optional custom-trained adapter (Apple's adapter training
@@ -68,29 +88,57 @@ public final class OnDeviceBrain: RoverBrain {
     ///   rover missions. `nil` uses the stock system model.
     public init(adapter: SystemLanguageModel.Adapter? = nil) {
         let model = adapter.map { SystemLanguageModel(adapter: $0) } ?? SystemLanguageModel.default
-        isAvailableProvider = {
-            if case .available = model.availability { return true }
-            return false
+        availabilityProvider = {
+            Self.mapAvailability(model.availability)
         }
         makeResponder = {
             FoundationModelsOnDeviceResponder(model: model, instructions: Self.instructions)
         }
     }
 
-    init(isAvailable: @escaping () -> Bool, makeResponder: @escaping () -> OnDeviceBrainResponder) {
-        self.isAvailableProvider = isAvailable
+    init(availability: @escaping () -> OnDeviceBrainAvailability,
+         makeResponder: @escaping () -> OnDeviceBrainResponder) {
+        self.availabilityProvider = availability
         self.makeResponder = makeResponder
     }
 
+    convenience init(isAvailable: @escaping () -> Bool,
+                     makeResponder: @escaping () -> OnDeviceBrainResponder) {
+        self.init(availability: { isAvailable() ? .available : .modelNotReady },
+                  makeResponder: makeResponder)
+    }
+
+    public var availability: OnDeviceBrainAvailability {
+        availabilityProvider()
+    }
+
     public var isAvailable: Bool {
-        isAvailableProvider()
+        availability == .available
     }
 
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
-        guard isAvailable else { throw RoverBrainError.unavailable }
+        let availability = availability
+        guard availability == .available else {
+            RuntimeFileLog.append("on_device_brain_availability", fields: [
+                "state": String(describing: availability),
+            ])
+            throw RoverBrainError.onDeviceUnavailable(availability)
+        }
         let prompt = promptText(context)
         let output = try await makeResponder().nextAction(prompt: prompt, context: context)
         return Self.grounded(output, context: context)
+    }
+
+    private static func mapAvailability(
+        _ availability: SystemLanguageModel.Availability
+    ) -> OnDeviceBrainAvailability {
+        switch availability {
+        case .available: .available
+        case .unavailable(.deviceNotEligible): .deviceNotEligible
+        case .unavailable(.appleIntelligenceNotEnabled): .appleIntelligenceNotEnabled
+        case .unavailable(.modelNotReady): .modelNotReady
+        @unknown default: .modelNotReady
+        }
     }
 
     private static func grounded(_ output: BrainOutput, context: MissionContext) -> BrainOutput {

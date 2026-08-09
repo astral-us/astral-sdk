@@ -289,10 +289,19 @@ public protocol RoverBrain: AnyObject {
     func nextAction(_ context: MissionContext) async throws -> BrainOutput
 }
 
-public enum RoverBrainError: LocalizedError {
+public enum RoverBrainError: Error, Equatable, LocalizedError {
     case unavailable
+    case onDeviceUnavailable(OnDeviceBrainAvailability)
+    case unsupported(String)
 
     public var errorDescription: String? {
-        "This brain is not available right now."
+        switch self {
+        case .unavailable:
+            "This brain is not available right now."
+        case .onDeviceUnavailable(let availability):
+            availability.operatorMessage
+        case .unsupported(let message):
+            message
+        }
     }
 }

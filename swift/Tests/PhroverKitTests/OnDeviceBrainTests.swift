@@ -4,6 +4,48 @@ import RoverNav
 
 @MainActor
 final class OnDeviceBrainTests: XCTestCase {
+    func testReportsEveryUnavailableReasonWithoutCreatingResponder() async {
+        let unavailableStates: [(OnDeviceBrainAvailability, String)] = [
+            (.deviceNotEligible,
+             "Apple Intelligence is not supported on this iPhone. Supported object commands can still run offline."),
+            (.appleIntelligenceNotEnabled,
+             "Turn on Apple Intelligence in Settings. Supported object commands can still run offline."),
+            (.modelNotReady,
+             "Apple Intelligence is still preparing. Keep the iPhone on Wi-Fi and power. Supported object commands can still run offline."),
+        ]
+
+        for (state, expectedOperatorMessage) in unavailableStates {
+            let brain = OnDeviceBrain(availability: { state }, makeResponder: {
+                XCTFail("Unavailable brain must not create a responder")
+                return FakeOnDeviceBrainResponder()
+            })
+
+            XCTAssertEqual(brain.availability, state)
+            XCTAssertFalse(brain.isAvailable)
+            XCTAssertEqual(state.operatorMessage, expectedOperatorMessage)
+            do {
+                _ = try await brain.nextAction(MissionContext())
+                XCTFail("Expected unavailable brain to throw")
+            } catch {
+                XCTAssertEqual(error as? RoverBrainError, .onDeviceUnavailable(state))
+            }
+        }
+    }
+
+    func testAvailableStateCreatesFreshResponderForEachDecision() async throws {
+        let factory = RecordingResponderFactory()
+        let brain = OnDeviceBrain(availability: { .available }, makeResponder: factory.makeResponder)
+
+        XCTAssertEqual(brain.availability, .available)
+        XCTAssertTrue(brain.isAvailable)
+        XCTAssertNil(brain.availability.operatorMessage)
+
+        _ = try await brain.nextAction(MissionContext())
+        _ = try await brain.nextAction(MissionContext())
+
+        XCTAssertEqual(factory.createdCount, 2)
+    }
+
     func testCreatesFreshResponderForEachDecision() async throws {
         let factory = RecordingResponderFactory()
         let brain = OnDeviceBrain(isAvailable: { true }, makeResponder: factory.makeResponder)
