@@ -22,6 +22,17 @@ final class OfflineObjectMissionIntentParserTests: XCTestCase {
         XCTAssertTrue(intent.shouldReturn)
     }
 
+    func testParsesThenComeBackAfterOtherRoom() throws {
+        let intent = try XCTUnwrap(OfflineObjectMissionIntentParser.parse(
+            "Go to the green chair in the other room, then come back"
+        ))
+        XCTAssertEqual(intent.objectQuery, "green chair")
+        XCTAssertEqual(intent.targetLabel, "chair")
+        XCTAssertEqual(intent.requestedColors, [.green])
+        XCTAssertTrue(intent.searchOtherRooms)
+        XCTAssertTrue(intent.shouldReturn)
+    }
+
     func testParsesExplicitGoBackReturn() throws {
         let intent = try XCTUnwrap(OfflineObjectMissionIntentParser.parse(
             "Go to the chair and go back"

@@ -720,6 +720,109 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(MissionAgent.visualTargetDirection(for: CGPoint(x: 0.8, y: 0.5)), "right")
     }
 
+    func testBlackChairRequiresCategoryAndBlackConfidenceThresholds() {
+        let intent = OfflineObjectMissionIntent(
+            objectQuery: "black chair",
+            targetLabel: "chair",
+            requestedColors: [.black],
+            searchOtherRooms: false,
+            shouldReturn: false
+        )
+        let grayChair = PerceivedObject(
+            label: "chair",
+            confidence: 0.99,
+            normalizedPoint: CGPoint(x: 0.2, y: 0.5),
+            colorEvidence: [ObjectColorEvidence(color: .gray, confidence: 0.95)]
+        )
+        let weakBlackChair = PerceivedObject(
+            label: "chair",
+            confidence: 0.99,
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+            colorEvidence: [ObjectColorEvidence(color: .black, confidence: 0.69)]
+        )
+        let blackChair = PerceivedObject(
+            label: "chair",
+            confidence: 0.90,
+            normalizedPoint: CGPoint(x: 0.8, y: 0.5),
+            colorEvidence: [ObjectColorEvidence(color: .black, confidence: 0.70)]
+        )
+
+        XCTAssertEqual(
+            MissionAgent.bestVisualTargetMatch(
+                intent: intent,
+                objects: [grayChair, weakBlackChair, blackChair]
+            ),
+            blackChair
+        )
+    }
+
+    func testUnqualifiedChairDoesNotRequireColorEvidence() {
+        let intent = OfflineObjectMissionIntent(
+            objectQuery: "chair",
+            targetLabel: "chair",
+            requestedColors: [],
+            searchOtherRooms: false,
+            shouldReturn: false
+        )
+        let chair = PerceivedObject(
+            label: "chair",
+            confidence: 0.90,
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+        )
+
+        XCTAssertEqual(
+            MissionAgent.bestVisualTargetMatch(intent: intent, objects: [chair]),
+            chair
+        )
+    }
+
+    func testOriginalBlackChairTargetDoesNotChangeWhenCameraShowsRefrigerator() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        let refrigeratorPoint = Vec2(1, 0)
+        let chairPoint = Vec2(2, 0)
+        var scanCount = 0
+        motion.onRotate = { _ in
+            scanCount += 1
+            if scanCount == 1 {
+                perception.objects = [
+                    PerceivedObject(
+                        label: "refrigerator",
+                        confidence: 0.99,
+                        normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+                        colorEvidence: [ObjectColorEvidence(color: .black, confidence: 0.95)]
+                    )
+                ]
+                perception.unprojectResult = refrigeratorPoint
+            } else if scanCount == 2 {
+                perception.objects = [
+                    PerceivedObject(
+                        label: "chair",
+                        confidence: 0.95,
+                        normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+                        colorEvidence: [ObjectColorEvidence(color: .black, confidence: 0.90)]
+                    )
+                ]
+                perception.unprojectResult = chairPoint
+            }
+        }
+        let brain = FakeBrain(script: [.navigate(.visualQuery("refrigerator")), .done])
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 3,
+            currentBrain: { brain }
+        )
+
+        await agent.handle("go to black chair")
+
+        XCTAssertEqual(motion.rotateCalls, [.pi / 6, .pi / 6])
+        XCTAssertEqual(motion.navigateCalls, [chairPoint])
+        XCTAssertFalse(motion.navigateCalls.contains(refrigeratorPoint))
+    }
+
     func testScansUntilVisualTargetIsConfidentlyDetected() async {
         let motion = FakeMotion()
         let perception = FakePerception()

@@ -36,7 +36,11 @@ public enum OfflineObjectMissionIntentParser {
         remainder = String(remainder.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
 
         var shouldReturn = false
-        for phrase in ["and come back", "come back", "and go back", "go back", "and return", "return"] {
+        for phrase in [
+            "and come back", "then come back", "come back",
+            "and go back", "then go back", "go back",
+            "and return", "then return", "return",
+        ] {
             if remainder == phrase {
                 shouldReturn = true
                 remainder = ""

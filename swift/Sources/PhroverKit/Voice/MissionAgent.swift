@@ -873,8 +873,19 @@ public final class MissionAgent {
     private func runLoop(firstUtterance: String?, missionID: Int) async {
         var nextUtterance = firstUtterance
         let missionUtterance = firstUtterance ?? ""
-        var lockedVisualQuery: String?
+        let missionVisualIntent = OfflineObjectMissionIntentParser.parse(missionUtterance)
+        var lockedVisualQuery = missionVisualIntent?.objectQuery
         var visualTargetScanSteps = 0
+        if let missionVisualIntent {
+            RuntimeFileLog.append("mission_target_locked", fields: [
+                "mission": "\(missionID)",
+                "target": missionVisualIntent.objectQuery,
+                "target_label": missionVisualIntent.targetLabel,
+                "requested_colors": Self.requestedColorsDescription(missionVisualIntent.requestedColors),
+                "source": "operator_command",
+                "threshold": String(format: "%.2f", visualTargetConfidenceThreshold)
+            ])
+        }
         // Distinguishes "the brain itself failed" (missing/timed out/errored) from
         // genuinely exhausting every tick without the brain ever stopping — only the
         // latter should get the "used up my time" wrap-up; the brain-failure paths
@@ -1415,18 +1426,67 @@ public final class MissionAgent {
     static func bestVisualTargetMatch(query: String,
                                       objects: [PerceivedObject],
                                       minimumConfidence: Float) -> PerceivedObject? {
-        let queryTokens = normalizedVisualQueryTokens(query)
-        guard !queryTokens.isEmpty else { return nil }
-        return objects
-            .filter { $0.confidence >= minimumConfidence }
-            .filter { object in
-                let label = normalizedVisualQuery(object.label)
-                let labelTokens = normalizedVisualQueryTokens(object.label)
-                return queryTokens.contains(label)
-                    || labelTokens.contains(where: { queryTokens.contains($0) })
-                    || queryTokens.contains(where: { label.contains($0) })
+        guard let intent = visualTargetIntent(for: query) else { return nil }
+        return bestVisualTargetMatch(intent: intent,
+                                     objects: objects,
+                                     minimumConfidence: minimumConfidence)
+    }
+
+    static func bestVisualTargetMatch(
+        intent: OfflineObjectMissionIntent,
+        objects: [PerceivedObject],
+        minimumConfidence: Float = 0.90,
+        minimumColorConfidence: Float = 0.70
+    ) -> PerceivedObject? {
+        let requestedColors = requestedColorsDescription(intent.requestedColors)
+        let targetLabel = canonicalVisualLabel(intent.targetLabel)
+        var matches: [PerceivedObject] = []
+
+        for object in objects {
+            let labelMatches = canonicalVisualLabel(object.label) == targetLabel
+            let objectConfidenceMatches = object.confidence >= minimumConfidence
+            let requestedEvidence = intent.requestedColors.map { requestedColor in
+                object.colorEvidence
+                    .filter { $0.color == requestedColor }
+                    .map(\.confidence)
+                    .max() ?? 0
             }
-            .max { $0.confidence < $1.confidence }
+            let colorConfidence = requestedEvidence.min() ?? 1
+            let colorMatches = requestedEvidence.allSatisfy { $0 >= minimumColorConfidence }
+            let fields = [
+                "target_label": targetLabel,
+                "requested_colors": requestedColors,
+                "label": object.label,
+                "object_confidence": String(format: "%.2f", object.confidence),
+                "color_confidence": String(format: "%.2f", colorConfidence),
+                "object_threshold": String(format: "%.2f", minimumConfidence),
+                "color_threshold": String(format: "%.2f", minimumColorConfidence)
+            ]
+
+            guard labelMatches, objectConfidenceMatches, colorMatches else {
+                RuntimeFileLog.append("mission_attribute_rejected", fields: fields)
+                continue
+            }
+            RuntimeFileLog.append("mission_attribute_match", fields: fields)
+            matches.append(object)
+        }
+
+        return matches.max { $0.confidence < $1.confidence }
+    }
+
+    private static func visualTargetIntent(for query: String) -> OfflineObjectMissionIntent? {
+        OfflineObjectMissionIntentParser.parse(query)
+            ?? OfflineObjectMissionIntentParser.parse("go to \(query)")
+    }
+
+    private static func requestedColorsDescription(_ colors: Set<LocalObjectColor>) -> String {
+        colors.map(\.rawValue).sorted().joined(separator: ",")
+    }
+
+    private static func canonicalVisualLabel(_ value: String) -> String {
+        let tokens = normalizedVisualQueryTokens(value)
+        guard !tokens.isEmpty else { return "" }
+        return tokens.joined(separator: " ")
     }
 
     private static func normalizedVisualQuery(_ value: String) -> String {
@@ -1451,6 +1511,10 @@ public final class MissionAgent {
             return "refrigerator"
         case "refrigerators":
             return "refrigerator"
+        case "couch", "couches":
+            return "sofa"
+        case "sofas":
+            return "sofa"
         case "tvs", "television", "televisions":
             return "tv"
         default:
