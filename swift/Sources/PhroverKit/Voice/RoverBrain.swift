@@ -4,17 +4,58 @@ import RoverNav
 
 /// One perceived object, as seen by whichever detector produced it — the on-device COCO
 /// `Detector`, or a cloud VLM's open-vocabulary grounding.
+public struct ObjectColorEvidence: Equatable, Sendable {
+    public let color: LocalObjectColor
+    public let confidence: Float
+
+    public init(color: LocalObjectColor, confidence: Float) {
+        self.color = color
+        self.confidence = Self.clamped(confidence)
+    }
+
+    private static func clamped(_ confidence: Float) -> Float {
+        confidence.isFinite ? min(max(confidence, 0), 1) : 0
+    }
+}
+
 public struct PerceivedObject: Equatable, Sendable {
     public var label: String
-    public var confidence: Float
+    public var confidence: Float {
+        didSet { confidence = Self.clamped(confidence) }
+    }
     /// Normalized Vision-space point (bottom-left origin), suitable for
     /// `ARSessionManager.unproject(normalizedPoint:)`.
     public var normalizedPoint: CGPoint
+    /// Normalized Vision-space bounds (bottom-left origin) used for local image analysis.
+    public var normalizedBoundingBox: CGRect?
+    /// Dominant local colors, sorted by confidence and then color name.
+    public var colorEvidence: [ObjectColorEvidence] {
+        didSet { colorEvidence = Self.sorted(colorEvidence) }
+    }
 
-    public init(label: String, confidence: Float, normalizedPoint: CGPoint) {
+    public init(label: String,
+                confidence: Float,
+                normalizedPoint: CGPoint,
+                normalizedBoundingBox: CGRect? = nil,
+                colorEvidence: [ObjectColorEvidence] = []) {
         self.label = label
-        self.confidence = confidence
+        self.confidence = Self.clamped(confidence)
         self.normalizedPoint = normalizedPoint
+        self.normalizedBoundingBox = normalizedBoundingBox
+        self.colorEvidence = Self.sorted(colorEvidence)
+    }
+
+    private static func clamped(_ confidence: Float) -> Float {
+        confidence.isFinite ? min(max(confidence, 0), 1) : 0
+    }
+
+    private static func sorted(_ evidence: [ObjectColorEvidence]) -> [ObjectColorEvidence] {
+        evidence.sorted {
+            if $0.confidence != $1.confidence {
+                return $0.confidence > $1.confidence
+            }
+            return $0.color.rawValue < $1.color.rawValue
+        }
     }
 }
 

@@ -95,6 +95,7 @@ extension RoverPerception {
 public final class ARPerceptionSource: RoverPerception {
     private let ar: ARSessionManager
     private let detector: Detector?
+    private let colorAnalyzer = LocalObjectColorAnalyzer()
 
     public init(ar: ARSessionManager, detector: Detector?) {
         self.ar = ar
@@ -107,10 +108,20 @@ public final class ARPerceptionSource: RoverPerception {
 
     public func detectObjects() -> [PerceivedObject] {
         guard let detector, let buffer = ar.latestPixelBuffer else { return [] }
-        return detector.detect(buffer).map {
-            PerceivedObject(label: $0.label,
-                            confidence: $0.confidence,
-                            normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
+        return detector.detect(buffer).map { detection in
+            PerceivedObject(
+                label: detection.label,
+                confidence: detection.confidence,
+                normalizedPoint: CGPoint(
+                    x: detection.boundingBox.midX,
+                    y: detection.boundingBox.midY
+                ),
+                normalizedBoundingBox: detection.boundingBox,
+                colorEvidence: colorAnalyzer.analyze(
+                    pixelBuffer: buffer,
+                    normalizedBoundingBox: detection.boundingBox
+                )
+            )
         }
     }
 

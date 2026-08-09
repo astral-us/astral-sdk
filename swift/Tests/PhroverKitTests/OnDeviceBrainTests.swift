@@ -81,6 +81,39 @@ final class OnDeviceBrainTests: XCTestCase {
         XCTAssertEqual(output.decision, .explore(candidateId: "opening_2"))
         XCTAssertNil(output.updatedPlan)
     }
+
+    func testPromptIncludesObjectAndColorConfidence() async throws {
+        let responder = PromptRecordingResponder()
+        let brain = OnDeviceBrain(availability: { .available }, makeResponder: { responder })
+
+        _ = try await brain.nextAction(MissionContext(visibleObjects: [
+            PerceivedObject(
+                label: "chair",
+                confidence: 0.96,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+                colorEvidence: [ObjectColorEvidence(color: .black, confidence: 0.82)]
+            ),
+        ]))
+
+        XCTAssertTrue(responder.lastPrompt?.contains(
+            "black chair (96% object confidence, 82% color confidence)"
+        ) == true)
+    }
+
+    func testPromptPreservesLegacyObjectFormatWithoutColorEvidence() async throws {
+        let responder = PromptRecordingResponder()
+        let brain = OnDeviceBrain(availability: { .available }, makeResponder: { responder })
+
+        _ = try await brain.nextAction(MissionContext(visibleObjects: [
+            PerceivedObject(
+                label: "chair",
+                confidence: 0.96,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+            ),
+        ]))
+
+        XCTAssertTrue(responder.lastPrompt?.contains("chair (96% confidence)") == true)
+    }
 }
 
 @MainActor
@@ -104,5 +137,15 @@ private struct ScriptedOnDeviceBrainResponder: OnDeviceBrainResponder {
 
     func nextAction(prompt: String, context: MissionContext) async throws -> BrainOutput {
         output
+    }
+}
+
+@MainActor
+private final class PromptRecordingResponder: OnDeviceBrainResponder {
+    private(set) var lastPrompt: String?
+
+    func nextAction(prompt: String, context: MissionContext) async throws -> BrainOutput {
+        lastPrompt = prompt
+        return BrainOutput(decision: .done)
     }
 }

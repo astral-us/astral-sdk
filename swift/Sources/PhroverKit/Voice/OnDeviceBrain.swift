@@ -71,13 +71,12 @@ public enum OnDeviceBrainAvailability: Equatable, Sendable {
     }
 }
 
-/// Fallback brain: Apple's on-device Foundation Model, reasoning over a *text* summary of
-/// what's visible. The model itself only sees COCO labels (no color/attribute
-/// understanding — it can't tell "green" from "red"), but it can still emit a free-text
-/// `visualQuery` naming attributes the operator mentioned; whether that's actually
-/// resolved goes to `RoverPerception.groundObject`, which may or may not understand more
-/// than the model does. Keeps the rover responsive with no network at all, at the cost of
-/// the richer understanding `CloudBrain` provides when online.
+/// Apple's on-device Foundation Model, reasoning over a text summary of detector labels
+/// and locally measured color evidence. It does not inspect camera pixels itself, but it
+/// can emit a free-text `visualQuery` naming other attributes the operator mentioned;
+/// whether those are resolved goes to `RoverPerception.groundObject`. Keeps the rover
+/// responsive with no network at all, at the cost of the richer understanding
+/// `CloudBrain` provides when online.
 @MainActor
 public final class OnDeviceBrain: RoverBrain {
     private let availabilityProvider: () -> OnDeviceBrainAvailability
@@ -199,8 +198,8 @@ public final class OnDeviceBrain: RoverBrain {
             current plan. For navigateToObject, describe what to drive toward in your own \
             words as visualQuery — including any colors, attributes, or possessives the \
             operator mentioned ("the green chair", "my backpack") — even if that exact \
-            object isn't in the visible-objects list, since visible-objects only reports \
-            coarse categories and grounding the full description happens outside you. If \
+            object isn't in the visible-objects list, since visible-objects reports coarse \
+            categories and local color evidence while full grounding happens outside you. If \
             the target isn't visible here, the remembered-objects list may already have it \
             at a known position (use navigateToMemory or the position), or it may be in an \
             unexplored part of the space: choose explore with an opening id from the \
@@ -224,7 +223,14 @@ public final class OnDeviceBrain: RoverBrain {
         lines.append(context.visibleObjects.isEmpty
             ? "Nothing recognized nearby right now."
             : "Visible now: " + context.visibleObjects
-                .map { "\($0.label) (\(Int($0.confidence * 100))% confidence)" }
+                .map { object in
+                    guard let color = object.colorEvidence.first else {
+                        return "\(object.label) (\(Int(object.confidence * 100))% confidence)"
+                    }
+                    return "\(color.color.rawValue) \(object.label) "
+                        + "(\(Int(object.confidence * 100))% object confidence, "
+                        + "\(Int(color.confidence * 100))% color confidence)"
+                }
                 .joined(separator: ", "))
         if !context.memory.rememberedObjects.isEmpty {
             lines.append("Objects remembered from earlier (may not be visible now): "
