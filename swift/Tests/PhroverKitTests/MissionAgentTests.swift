@@ -756,6 +756,26 @@ final class MissionAgentTests: XCTestCase {
         )
     }
 
+    func testBlackChairRejectsBlackWheelchairCategory() {
+        let intent = OfflineObjectMissionIntent(
+            objectQuery: "black chair",
+            targetLabel: "chair",
+            requestedColors: [.black],
+            searchOtherRooms: false,
+            shouldReturn: false
+        )
+        let blackWheelchair = PerceivedObject(
+            label: "wheelchair",
+            confidence: 0.99,
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+            colorEvidence: [ObjectColorEvidence(color: .black, confidence: 0.99)]
+        )
+
+        XCTAssertNil(
+            MissionAgent.bestVisualTargetMatch(intent: intent, objects: [blackWheelchair])
+        )
+    }
+
     func testUnqualifiedChairDoesNotRequireColorEvidence() {
         let intent = OfflineObjectMissionIntent(
             objectQuery: "chair",
@@ -774,6 +794,29 @@ final class MissionAgentTests: XCTestCase {
             MissionAgent.bestVisualTargetMatch(intent: intent, objects: [chair]),
             chair
         )
+    }
+
+    func testUnqualifiedChairLogsColorEvidenceAsNotRequired() {
+        let intent = OfflineObjectMissionIntent(
+            objectQuery: "chair",
+            targetLabel: "chair",
+            requestedColors: [],
+            searchOtherRooms: false,
+            shouldReturn: false
+        )
+        let chair = PerceivedObject(
+            label: "chair",
+            confidence: 0.90,
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+        )
+        let logBefore = runtimeLog()
+
+        _ = MissionAgent.bestVisualTargetMatch(intent: intent, objects: [chair])
+
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("mission_attribute_match"))
+        XCTAssertTrue(logDelta.contains("color_confidence=not_required"))
+        XCTAssertFalse(logDelta.contains("color_confidence=1.00"))
     }
 
     func testOriginalBlackChairTargetDoesNotChangeWhenCameraShowsRefrigerator() async {
@@ -1157,6 +1200,11 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertTrue(motion.navigateCalls.isEmpty)
         XCTAssertEqual(voice.spoken, ["Sorry, I'm having trouble thinking right now."])
         XCTAssertEqual(agent.phase, .idle)
+    }
+
+    private func runtimeLog() -> String {
+        guard let url = RuntimeFileLog.logFileURL else { return "" }
+        return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 }
 

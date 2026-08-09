@@ -1451,14 +1451,15 @@ public final class MissionAgent {
                     .map(\.confidence)
                     .max() ?? 0
             }
-            let colorConfidence = requestedEvidence.min() ?? 1
+            let colorConfidence = requestedEvidence.min()
             let colorMatches = requestedEvidence.allSatisfy { $0 >= minimumColorConfidence }
             let fields = [
                 "target_label": targetLabel,
                 "requested_colors": requestedColors,
                 "label": object.label,
                 "object_confidence": String(format: "%.2f", object.confidence),
-                "color_confidence": String(format: "%.2f", colorConfidence),
+                "color_confidence": colorConfidence.map { String(format: "%.2f", $0) }
+                    ?? "not_required",
                 "object_threshold": String(format: "%.2f", minimumConfidence),
                 "color_threshold": String(format: "%.2f", minimumColorConfidence)
             ]
