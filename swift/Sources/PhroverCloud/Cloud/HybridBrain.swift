@@ -82,7 +82,7 @@ private final class PrimaryStageRace {
 
     static func run(brain: RoverBrain, context: MissionContext, timeout: Duration) async -> PrimaryStageResult {
         let race = PrimaryStageRace()
-        return await withCheckedContinuation { continuation in
+        let result = await withCheckedContinuation { continuation in
             race.continuation = continuation
             race.tasks = [
                 Task { @MainActor in
@@ -102,6 +102,10 @@ private final class PrimaryStageRace {
                 }
             ]
         }
+        for task in race.tasks {
+            await task.value
+        }
+        return result
     }
 
     private func finish(_ result: PrimaryStageResult) {
