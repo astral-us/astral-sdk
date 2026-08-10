@@ -224,12 +224,14 @@ public final class MissionAgent {
         case found(Vec2)
         case notFound
         case cancelled
+        case sessionGenerationChanged
     }
 
     private enum ReturnLegOutcome {
         case arrived
         case failed
         case cancelled
+        case sessionGenerationChanged
     }
 
     private enum BlockedHeadingRecoveryOutcome: Equatable {
@@ -1193,6 +1195,13 @@ public final class MissionAgent {
                         phase = .idle
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                         return
+                    case .sessionGenerationChanged:
+                        phase = .idle
+                        RuntimeFileLog.append("mission_cancelled", fields: [
+                            "mission": "\(missionID)",
+                            "reason": "session_generation_changed"
+                        ])
+                        return
                     case .notFound:
                         updateWorldModel()
                         if let candidate = nextUnexploredCandidate() {
@@ -1455,7 +1464,9 @@ public final class MissionAgent {
                     target,
                     missionID: missionID,
                     scanSteps: &scanSteps,
-                    requireNewFrameAfterInitialTurn: requiresFreshScanTurn
+                    requireNewFrameAfterInitialTurn: requiresFreshScanTurn,
+                    expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil,
+                    requireTrackedFrame: requiresFreshScanTurn
                 ) {
                 case .found(let scannedGoal):
                     resolvedGoal = scannedGoal
@@ -1467,6 +1478,13 @@ public final class MissionAgent {
                         "mission": "\(missionID)",
                         "reason": "cancelled_while_scanning"
                     ])
+                    return
+                case .sessionGenerationChanged:
+                    failOfflineObjectMission(
+                        missionID: missionID,
+                        message: failureMessage,
+                        reason: "session_generation_changed"
+                    )
                     return
                 }
             }
@@ -1577,7 +1595,18 @@ public final class MissionAgent {
 
         phase = .acting
         navigate(to: goal, for: target)
-        guard await waitForMotionToSettle(missionID: missionID) else {
+        guard await waitForMotionToSettle(
+            missionID: missionID,
+            expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil
+        ) else {
+            if sessionGenerationChanged(from: intent.searchOtherRooms ? sessionGeneration : nil) {
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "session_generation_changed"
+                )
+                return
+            }
             RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
                 "mission": "\(missionID)",
                 "reason": "cancelled_during_navigation"
@@ -1717,7 +1746,11 @@ public final class MissionAgent {
                 "goal_x": String(format: "%.2f", start.position.x),
                 "goal_y": String(format: "%.2f", start.position.y)
             ])
-            switch await alignHeadingForReturn(to: start.position, missionID: missionID) {
+            switch await alignHeadingForReturn(
+                to: start.position,
+                missionID: missionID,
+                expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil
+            ) {
             case .cancelled:
                 RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
                     "mission": "\(missionID)",
@@ -1734,10 +1767,21 @@ public final class MissionAgent {
                     "reason": "return_failed"
                 ])
                 return
+            case .sessionGenerationChanged:
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "session_generation_changed"
+                )
+                return
             case .arrived:
                 break
             }
-            switch await navigateReturn(to: start.position, missionID: missionID) {
+            switch await navigateReturn(
+                to: start.position,
+                missionID: missionID,
+                expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil
+            ) {
             case .cancelled:
                 RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
                     "mission": "\(missionID)",
@@ -1753,6 +1797,13 @@ public final class MissionAgent {
                     "mission": "\(missionID)",
                     "reason": "return_failed"
                 ])
+                return
+            case .sessionGenerationChanged:
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "session_generation_changed"
+                )
                 return
             case .arrived:
                 break
@@ -2163,19 +2214,31 @@ public final class MissionAgent {
     private func scanForUnresolvedVisualTarget(_ target: NavigationTarget,
                                                missionID: Int,
                                                scanSteps: inout Int,
-                                               requireNewFrameAfterInitialTurn: Bool = false) async
+                                               requireNewFrameAfterInitialTurn: Bool = false,
+                                               expectedSessionGeneration: UInt64? = nil,
+                                               requireTrackedFrame: Bool = false) async
         -> VisualTargetScanResult {
         guard case .visualQuery(let query) = target else { return .notFound }
         var shouldEvaluateBeforeTurn = !requireNewFrameAfterInitialTurn
         while scanSteps < maxVisualTargetScanSteps {
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                return .sessionGenerationChanged
+            }
             if shouldEvaluateBeforeTurn {
-                switch await waitForVisualTarget(query: query, missionID: missionID) {
+                switch await waitForVisualTarget(
+                    query: query,
+                    missionID: missionID,
+                    expectedSessionGeneration: expectedSessionGeneration,
+                    requireTrackedFrame: requireTrackedFrame
+                ) {
                 case .found(let goal):
                     return .found(goal)
                 case .noVisibleObjects:
                     break
                 case .cancelled:
                     return .cancelled
+                case .sessionGenerationChanged:
+                    return .sessionGenerationChanged
                 case .timedOut:
                     break
                 }
@@ -2196,19 +2259,35 @@ public final class MissionAgent {
                 "angle": String(format: "%.0fdeg", angle * 180 / .pi)
             ])
             let frameBeforeTurn = perception.frameSequence
-            await rotateForScanRespectingCancellation(by: angle)
+            switch await rotateForScanRespectingCancellation(
+                by: angle,
+                expectedSessionGeneration: expectedSessionGeneration
+            ) {
+            case .completed:
+                break
+            case .cancelled:
+                return .cancelled
+            case .sessionGenerationChanged:
+                return .sessionGenerationChanged
+            }
             guard !missionCancellationDetected(missionID) else {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_during_scan_turn")
                 return .cancelled
             }
 
-            switch await waitForVisualTarget(query: query,
-                                             missionID: missionID,
-                                             newerThanFrame: frameBeforeTurn) {
+            switch await waitForVisualTarget(
+                query: query,
+                missionID: missionID,
+                newerThanFrame: frameBeforeTurn,
+                expectedSessionGeneration: expectedSessionGeneration,
+                requireTrackedFrame: requireTrackedFrame
+            ) {
             case .found(let goal):
                 return .found(goal)
             case .cancelled:
                 return .cancelled
+            case .sessionGenerationChanged:
+                return .sessionGenerationChanged
             case .noVisibleObjects, .timedOut:
                 break
             }
@@ -2227,14 +2306,24 @@ public final class MissionAgent {
         case timedOut
         case noVisibleObjects
         case cancelled
+        case sessionGenerationChanged
     }
 
     private func waitForVisualTarget(query: String,
                                      missionID: Int,
-                                     newerThanFrame frameBaseline: UInt64? = nil) async -> VisualTargetWaitResult {
+                                     newerThanFrame frameBaseline: UInt64? = nil,
+                                     expectedSessionGeneration: UInt64? = nil,
+                                     requireTrackedFrame: Bool = false) async -> VisualTargetWaitResult {
         if visualTargetScanDelay <= 0 {
             guard !missionCancellationDetected(missionID) else { return .cancelled }
-            guard hasFreshPerceptionFrame(newerThan: frameBaseline) else { return .timedOut }
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                return .sessionGenerationChanged
+            }
+            guard hasUsablePerceptionFrame(
+                newerThan: frameBaseline,
+                expectedSessionGeneration: expectedSessionGeneration,
+                requireTrackedFrame: requireTrackedFrame
+            ) else { return .timedOut }
             let objects = perception.detectObjects()
             guard !objects.isEmpty else { return .timedOut }
             if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
@@ -2249,7 +2338,14 @@ public final class MissionAgent {
         var didLogFreshFrameWait = false
         while Date() < deadline {
             guard !missionCancellationDetected(missionID) else { return .cancelled }
-            guard hasFreshPerceptionFrame(newerThan: frameBaseline) else {
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                return .sessionGenerationChanged
+            }
+            guard hasUsablePerceptionFrame(
+                newerThan: frameBaseline,
+                expectedSessionGeneration: expectedSessionGeneration,
+                requireTrackedFrame: requireTrackedFrame
+            ) else {
                 if !didLogFreshFrameWait {
                     RuntimeFileLog.append("mission_target_scan_wait_fresh_frame", fields: [
                         "mission": "\(missionID)",
@@ -2311,6 +2407,23 @@ public final class MissionAgent {
             "seconds": String(format: "%.2f", visualTargetScanDelay)
         ])
         return .timedOut
+    }
+
+    private func hasUsablePerceptionFrame(
+        newerThan baseline: UInt64?,
+        expectedSessionGeneration: UInt64?,
+        requireTrackedFrame: Bool
+    ) -> Bool {
+        guard requireTrackedFrame else {
+            return hasFreshPerceptionFrame(newerThan: baseline)
+        }
+        guard let observation = perception.latestObservation,
+              observation.trackingQuality == .normal,
+              observation.sessionGeneration == expectedSessionGeneration else {
+            return false
+        }
+        guard let baseline else { return true }
+        return observation.frameSequence > baseline
     }
 
     private func hasFreshPerceptionFrame(newerThan baseline: UInt64?) -> Bool {
@@ -2426,10 +2539,18 @@ public final class MissionAgent {
         return true
     }
 
-    private func alignHeadingForReturn(to goal: Vec2, missionID: Int) async -> ReturnLegOutcome {
+    private func alignHeadingForReturn(
+        to goal: Vec2,
+        missionID: Int,
+        expectedSessionGeneration: UInt64? = nil
+    ) async -> ReturnLegOutcome {
         guard !missionCancellationDetected(missionID) else {
             cancelActiveMotion(missionID: missionID, reason: "cancelled_before_return_alignment")
             return .cancelled
+        }
+        guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+            await motion.stopAndWait()
+            return .sessionGenerationChanged
         }
         guard let pose = perception.pose else {
             failReturnMission(missionID: missionID,
@@ -2457,6 +2578,10 @@ public final class MissionAgent {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_during_return_alignment")
                 return .cancelled
             }
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                await motion.stopAndWait()
+                return .sessionGenerationChanged
+            }
 
             let angle = min(abs(remaining), maximumStep) * (remaining < 0 ? -1 : 1)
             step += 1
@@ -2465,7 +2590,17 @@ public final class MissionAgent {
                 "step": "\(step)",
                 "angle_deg": String(format: "%.0f", angle * 180 / .pi)
             ])
-            await rotateForScanRespectingCancellation(by: angle)
+            switch await rotateForScanRespectingCancellation(
+                by: angle,
+                expectedSessionGeneration: expectedSessionGeneration
+            ) {
+            case .completed:
+                break
+            case .cancelled:
+                return .cancelled
+            case .sessionGenerationChanged:
+                return .sessionGenerationChanged
+            }
 
             guard !missionCancellationDetected(missionID) else {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_during_return_alignment")
@@ -2486,17 +2621,48 @@ public final class MissionAgent {
         return .arrived
     }
 
-    private func rotateForScanRespectingCancellation(by angle: Double) async {
-        await withTaskCancellationHandler {
-            await motion.rotateForScan(by: angle)
+    private func rotateForScanRespectingCancellation(
+        by angle: Double,
+        expectedSessionGeneration: UInt64? = nil
+    ) async -> ScanRotationOutcome {
+        guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+            motion.cancel()
+            return .sessionGenerationChanged
+        }
+        guard expectedSessionGeneration != nil else {
+            await withTaskCancellationHandler {
+                await motion.rotateForScan(by: angle)
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.motion.cancel()
+                }
+            }
+            return Task.isCancelled ? .cancelled : .completed
+        }
+
+        let race = ScanRotationRace()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                race.start(
+                    motion: motion,
+                    topology: roomTopology,
+                    expectedSessionGeneration: expectedSessionGeneration,
+                    angle: angle,
+                    continuation: continuation
+                )
+            }
         } onCancel: {
-            Task { @MainActor [weak self] in
-                self?.motion.cancel()
+            Task { @MainActor in
+                race.cancel()
             }
         }
     }
 
-    private func navigateReturn(to goal: Vec2, missionID: Int) async -> ReturnLegOutcome {
+    private func navigateReturn(
+        to goal: Vec2,
+        missionID: Int,
+        expectedSessionGeneration: UInt64? = nil
+    ) async -> ReturnLegOutcome {
         let maximumAttempts = 2
 
         for attempt in 1...maximumAttempts {
@@ -2504,13 +2670,23 @@ public final class MissionAgent {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_before_return_navigation")
                 return .cancelled
             }
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                await motion.stopAndWait()
+                return .sessionGenerationChanged
+            }
             RuntimeFileLog.append("mission_return_navigation_attempt", fields: [
                 "mission": "\(missionID)",
                 "attempt": "\(attempt)",
                 "max": "\(maximumAttempts)"
             ])
             motion.navigate(to: goal)
-            guard await waitForMotionToSettle(missionID: missionID) else {
+            guard await waitForMotionToSettle(
+                missionID: missionID,
+                expectedSessionGeneration: expectedSessionGeneration
+            ) else {
+                if sessionGenerationChanged(from: expectedSessionGeneration) {
+                    return .sessionGenerationChanged
+                }
                 return .cancelled
             }
 
@@ -2626,6 +2802,14 @@ public final class MissionAgent {
             phase = .idle
             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
             return true
+
+        case .sessionGenerationChanged:
+            phase = .idle
+            RuntimeFileLog.append("mission_cancelled", fields: [
+                "mission": "\(missionID)",
+                "reason": "session_generation_changed"
+            ])
+            return true
         }
     }
 
@@ -2654,8 +2838,15 @@ public final class MissionAgent {
     }
 
     @discardableResult
-    private func waitForMotionToSettle(missionID: Int? = nil) async -> Bool {
+    private func waitForMotionToSettle(
+        missionID: Int? = nil,
+        expectedSessionGeneration: UInt64? = nil
+    ) async -> Bool {
         while motion.state == .driving {
+            if sessionGenerationChanged(from: expectedSessionGeneration) {
+                await motion.stopAndWait()
+                return false
+            }
             if let missionID, missionCancellationDetected(missionID) {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_while_motion_active")
                 return false
@@ -2678,12 +2869,21 @@ public final class MissionAgent {
                 return false
             }
         }
+        if sessionGenerationChanged(from: expectedSessionGeneration) {
+            await motion.stopAndWait()
+            return false
+        }
         if let missionID, missionCancellationDetected(missionID) {
             cancelActiveMotion(missionID: missionID, reason: "cancelled_after_motion_settled")
             return false
         }
         RuntimeFileLog.append("motion_settled", fields: ["state": motion.state.description])
         return true
+    }
+
+    private func sessionGenerationChanged(from expected: UInt64?) -> Bool {
+        guard let expected else { return false }
+        return roomTopology?.snapshot.sessionGeneration != expected
     }
 
     private func recoverOrStopMissionIfMotionFailed(missionID: Int,
@@ -2889,6 +3089,65 @@ private struct BrainDecisionTimeoutError: LocalizedError {
 
     var errorDescription: String? {
         "Brain decision timed out after \(String(format: "%.2f", timeout)) seconds."
+    }
+}
+
+private enum ScanRotationOutcome: Equatable {
+    case completed
+    case cancelled
+    case sessionGenerationChanged
+}
+
+@MainActor
+private final class ScanRotationRace {
+    private var continuation: CheckedContinuation<ScanRotationOutcome, Never>?
+    private var tasks: [Task<Void, Never>] = []
+    private weak var motion: RoverMotion?
+
+    func start(
+        motion: RoverMotion,
+        topology: (any RoomTopologyManaging)?,
+        expectedSessionGeneration: UInt64?,
+        angle: Double,
+        continuation: CheckedContinuation<ScanRotationOutcome, Never>
+    ) {
+        self.motion = motion
+        self.continuation = continuation
+        tasks = [
+            Task { @MainActor in
+                await motion.rotateForScan(by: angle)
+                self.finish(Task.isCancelled ? .cancelled : .completed)
+            },
+            Task { @MainActor in
+                while !Task.isCancelled {
+                    if let expectedSessionGeneration,
+                       topology?.snapshot.sessionGeneration != expectedSessionGeneration {
+                        motion.cancel()
+                        self.finish(.sessionGenerationChanged)
+                        return
+                    }
+                    do {
+                        try await Task.sleep(for: .milliseconds(10))
+                    } catch {
+                        return
+                    }
+                }
+            }
+        ]
+    }
+
+    func cancel() {
+        motion?.cancel()
+        finish(.cancelled)
+    }
+
+    private func finish(_ outcome: ScanRotationOutcome) {
+        guard let continuation else { return }
+        self.continuation = nil
+        let runningTasks = tasks
+        tasks.removeAll()
+        runningTasks.forEach { $0.cancel() }
+        continuation.resume(returning: outcome)
     }
 }
 
