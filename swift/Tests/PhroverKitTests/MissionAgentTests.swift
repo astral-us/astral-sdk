@@ -1493,6 +1493,46 @@ final class MissionAgentTests: XCTestCase {
         }
     }
 
+    func testUnavailableBrainFallbackEmitsOrderedMissionTelemetry() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(
+                label: "refrigerator",
+                confidence: 0.99,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+            )
+        ]
+        perception.unprojectResult = Vec2(1, 0)
+        var events: [(name: String, fields: [String: String])] = []
+        let telemetry: MissionTelemetrySink = { name, fields in
+            events.append((name, fields))
+        }
+        let brain = TelemetryThrowingBrain(
+            telemetry: telemetry,
+            error: RoverBrainError.onDeviceUnavailable(.modelNotReady)
+        )
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            missionTelemetry: telemetry,
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(events.map(\.name), [
+            "mission_brain_selected",
+            "mission_offline_fallback_started",
+            "mission_attribute_match",
+        ])
+        XCTAssertEqual(events.map { $0.fields["mission"] }, ["1", "1", "1"])
+        XCTAssertEqual(events[0].fields["reason"], "on_device_failed")
+        XCTAssertEqual(events[1].fields["reason"], "brain_error")
+        XCTAssertEqual(events[2].fields["reason"], "matched_required_attributes")
+    }
+
     func testBrainFailureAfterUsableOutputDoesNotMixInOfflineFallback() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -2070,6 +2110,26 @@ private final class ThrowingBrain: RoverBrain {
 
     func nextAction(_ context: MissionContext) async throws -> BrainOutput {
         callCount += 1
+        throw error
+    }
+}
+
+@MainActor
+private final class TelemetryThrowingBrain: RoverBrain {
+    private let telemetry: MissionTelemetrySink
+    private let error: Error
+
+    init(telemetry: @escaping MissionTelemetrySink, error: Error) {
+        self.telemetry = telemetry
+        self.error = error
+    }
+
+    func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        telemetry("mission_brain_selected", [
+            "mission": context.missionID.map(String.init) ?? "none",
+            "brain": "on_device",
+            "reason": "on_device_failed",
+        ])
         throw error
     }
 }

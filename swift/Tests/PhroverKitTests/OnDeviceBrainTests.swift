@@ -32,6 +32,16 @@ final class OnDeviceBrainTests: XCTestCase {
         }
     }
 
+    func testAvailabilityStatesHaveStableLogValues() {
+        XCTAssertEqual(OnDeviceBrainAvailability.available.logValue, "available")
+        XCTAssertEqual(OnDeviceBrainAvailability.deviceNotEligible.logValue, "device_not_eligible")
+        XCTAssertEqual(
+            OnDeviceBrainAvailability.appleIntelligenceNotEnabled.logValue,
+            "apple_intelligence_not_enabled"
+        )
+        XCTAssertEqual(OnDeviceBrainAvailability.modelNotReady.logValue, "model_not_ready")
+    }
+
     func testAvailableStateCreatesFreshResponderForEachDecision() async throws {
         let factory = RecordingResponderFactory()
         let brain = OnDeviceBrain(availability: { .available }, makeResponder: factory.makeResponder)

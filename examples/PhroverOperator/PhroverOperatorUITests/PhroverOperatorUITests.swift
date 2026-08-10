@@ -47,6 +47,42 @@ final class PhroverOperatorUITests: XCTestCase {
         screenshot(app, name: "talk_failed_command_retry")
     }
 
+    func testTalkShowsModelNotReadyDiagnostic() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-brain-model-not-ready")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        let diagnostic = app.staticTexts["brain-availability-message"]
+        XCTAssertTrue(diagnostic.waitForExistence(timeout: 10))
+        XCTAssertTrue(diagnostic.label.contains("Apple Intelligence is still preparing"))
+
+        let mic = app.descendants(matching: .any)
+            .matching(identifier: "push-to-talk-control").element
+        XCTAssertTrue(mic.waitForExistence(timeout: 10))
+        XCTAssertTrue(mic.isHittable)
+        XCTAssertLessThanOrEqual(mic.frame.maxY, talkTab.frame.minY)
+    }
+
+    func testTalkHidesBrainDiagnosticWhenAvailable() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-brain-available")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        XCTAssertFalse(app.staticTexts["brain-availability-message"].exists)
+        let mic = app.descendants(matching: .any)
+            .matching(identifier: "push-to-talk-control").element
+        XCTAssertTrue(mic.waitForExistence(timeout: 10))
+        XCTAssertTrue(mic.isHittable)
+    }
+
     /// Gated integration path: drive forward on the D-pad and confirm the command
     /// actually reached the (mocked) WAVE ROVER base — proves the phone->ESP32 control
     /// loop end-to-end with no chassis needed.

@@ -257,6 +257,9 @@ public struct BrainOutput: Equatable, Sendable {
 /// Deliberately data-only so different brains — an on-device text reasoner, a cloud vision
 /// reasoner — can consume the same shape, each using whatever subset it can.
 public struct MissionContext: Sendable {
+    /// Stable identifier assigned by `MissionAgent` for correlating brain selection,
+    /// perception, and navigation telemetry. Standalone brain callers may leave it nil.
+    public var missionID: Int?
     /// What the operator just said, if this tick was triggered by a fresh utterance.
     public var utterance: String?
     /// Downscaled JPEG of the rover's current view, for brains that can see. `nil` when no
@@ -294,7 +297,8 @@ public struct MissionContext: Sendable {
     /// attempt or the fortieth).
     public var recentActions: [String]
 
-    public init(utterance: String? = nil,
+    public init(missionID: Int? = nil,
+                utterance: String? = nil,
                 frameJPEG: Data? = nil,
                 visibleObjects: [PerceivedObject] = [],
                 pose: Pose2D? = nil,
@@ -306,6 +310,7 @@ public struct MissionContext: Sendable {
                 batteryPercent: Double? = nil,
                 teamContext: TeamContext? = nil,
                 recentActions: [String] = []) {
+        self.missionID = missionID
         self.utterance = utterance
         self.frameJPEG = frameJPEG
         self.visibleObjects = visibleObjects
@@ -318,6 +323,22 @@ public struct MissionContext: Sendable {
         self.batteryPercent = batteryPercent
         self.teamContext = teamContext
         self.recentActions = recentActions
+    }
+}
+
+/// Structured mission diagnostics shared by the brain selector and mission executor.
+/// Runtime callers normally use the default closure supplied by their initializer; tests
+/// can inject one sink across both components to assert causal event ordering.
+public typealias MissionTelemetrySink = (_ event: String, _ fields: [String: String]) -> Void
+
+extension OnDeviceBrainAvailability {
+    public var logValue: String {
+        switch self {
+        case .available: "available"
+        case .deviceNotEligible: "device_not_eligible"
+        case .appleIntelligenceNotEnabled: "apple_intelligence_not_enabled"
+        case .modelNotReady: "model_not_ready"
+        }
     }
 }
 

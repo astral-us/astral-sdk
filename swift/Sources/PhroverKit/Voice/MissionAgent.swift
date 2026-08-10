@@ -280,6 +280,7 @@ public final class MissionAgent {
     private let commandStatusDidChange: ((MissionCommandStatus) -> Void)?
     private let currentBrain: () -> RoverBrain?
     private let brainErrorLogger: (Error, MissionContext) -> Void
+    private let missionTelemetry: MissionTelemetrySink
 
     private var roomTransitionDebugState: RoomTransitionDebugState = .idle
     private var roomTraversalExhaustionFields: [String: String] = [:]
@@ -336,6 +337,9 @@ public final class MissionAgent {
                 brainErrorLogger: @escaping (Error, MissionContext) -> Void = { error, context in
                     BrainErrorFileLog.append(error: error, context: context)
                 },
+                missionTelemetry: @escaping MissionTelemetrySink = { event, fields in
+                    RuntimeFileLog.append(event, fields: fields)
+                },
                 currentBrain: @escaping () -> RoverBrain?) {
         self.motion = motion
         self.perception = perception
@@ -359,6 +363,7 @@ public final class MissionAgent {
         self.roomTransitionTelemetry = roomTransitionTelemetry
         self.commandStatusDidChange = commandStatusDidChange
         self.brainErrorLogger = brainErrorLogger
+        self.missionTelemetry = missionTelemetry
         self.currentBrain = currentBrain
     }
 
@@ -1009,7 +1014,7 @@ public final class MissionAgent {
             let rememberedCountBefore = memory.rememberedObjects.count
             updateWorldModel()
             let newObjects = memory.rememberedObjects.count - rememberedCountBefore
-            let ctx = makeContext(utterance: nextUtterance)
+            let ctx = makeContext(utterance: nextUtterance, missionID: missionID)
             RuntimeFileLog.append("mission_thinking", fields: [
                 "mission": "\(missionID)",
                 "tick": "\(tick)",
@@ -1389,13 +1394,14 @@ public final class MissionAgent {
             return
         }
 
-        RuntimeFileLog.append("mission_offline_fallback_started", fields: [
+        missionTelemetry("mission_offline_fallback_started", [
             "mission": "\(missionID)",
             "target": intent.objectQuery,
             "target_label": intent.targetLabel,
             "requested_colors": Self.requestedColorsDescription(intent.requestedColors),
             "return_requested": intent.shouldReturn ? "true" : "false",
-            "brain_failure": brainFailureReason
+            "brain_failure": brainFailureReason,
+            "reason": brainFailureReason,
         ])
         await runOfflineObjectMission(
             intent,
@@ -2003,9 +2009,13 @@ public final class MissionAgent {
 
     private func lockedVisualTargetPoint(query: String, missionID: Int) -> CGPoint? {
         let objects = perception.detectObjects()
-        guard let match = Self.bestVisualTargetMatch(query: query,
-                                                     objects: objects,
-                                                     minimumConfidence: visualTargetConfidenceThreshold) else {
+        guard let match = Self.bestVisualTargetMatch(
+            query: query,
+            objects: objects,
+            minimumConfidence: visualTargetConfidenceThreshold,
+            missionID: missionID,
+            telemetry: missionTelemetry
+        ) else {
             RuntimeFileLog.append("mission_target_not_locked", fields: [
                 "mission": "\(missionID)",
                 "target": query,
@@ -2027,18 +2037,28 @@ public final class MissionAgent {
 
     static func bestVisualTargetMatch(query: String,
                                       objects: [PerceivedObject],
-                                      minimumConfidence: Float) -> PerceivedObject? {
+                                      minimumConfidence: Float,
+                                      missionID: Int? = nil,
+                                      telemetry: @escaping MissionTelemetrySink = { event, fields in
+                                          RuntimeFileLog.append(event, fields: fields)
+                                      }) -> PerceivedObject? {
         guard let intent = visualTargetIntent(for: query) else { return nil }
         return bestVisualTargetMatch(intent: intent,
                                      objects: objects,
-                                     minimumConfidence: minimumConfidence)
+                                     minimumConfidence: minimumConfidence,
+                                     missionID: missionID,
+                                     telemetry: telemetry)
     }
 
     static func bestVisualTargetMatch(
         intent: OfflineObjectMissionIntent,
         objects: [PerceivedObject],
         minimumConfidence: Float = 0.90,
-        minimumColorConfidence: Float = 0.70
+        minimumColorConfidence: Float = 0.70,
+        missionID: Int? = nil,
+        telemetry: @escaping MissionTelemetrySink = { event, fields in
+            RuntimeFileLog.append(event, fields: fields)
+        }
     ) -> PerceivedObject? {
         let requestedColors = requestedColorsDescription(intent.requestedColors)
         let targetLabel = canonicalVisualLabel(intent.targetLabel)
@@ -2056,6 +2076,7 @@ public final class MissionAgent {
             let colorConfidence = requestedEvidence.min()
             let colorMatches = requestedEvidence.allSatisfy { $0 >= minimumColorConfidence }
             let fields = [
+                "mission": missionID.map(String.init) ?? "none",
                 "target_label": targetLabel,
                 "requested_colors": requestedColors,
                 "label": object.label,
@@ -2063,14 +2084,17 @@ public final class MissionAgent {
                 "color_confidence": colorConfidence.map { String(format: "%.2f", $0) }
                     ?? "not_required",
                 "object_threshold": String(format: "%.2f", minimumConfidence),
-                "color_threshold": String(format: "%.2f", minimumColorConfidence)
+                "color_threshold": String(format: "%.2f", minimumColorConfidence),
+                "reason": labelMatches && objectConfidenceMatches && colorMatches
+                    ? "matched_required_attributes"
+                    : "attributes_below_threshold",
             ]
 
             guard labelMatches, objectConfidenceMatches, colorMatches else {
-                RuntimeFileLog.append("mission_attribute_rejected", fields: fields)
+                telemetry("mission_attribute_rejected", fields)
                 continue
             }
-            RuntimeFileLog.append("mission_attribute_match", fields: fields)
+            telemetry("mission_attribute_match", fields)
             matches.append(object)
         }
 
@@ -2301,9 +2325,13 @@ public final class MissionAgent {
     private func lockedVisualTargetPoint(query: String,
                                          objects: [PerceivedObject],
                                          missionID: Int) -> CGPoint? {
-        guard let match = Self.bestVisualTargetMatch(query: query,
-                                                     objects: objects,
-                                                     minimumConfidence: visualTargetConfidenceThreshold) else {
+        guard let match = Self.bestVisualTargetMatch(
+            query: query,
+            objects: objects,
+            minimumConfidence: visualTargetConfidenceThreshold,
+            missionID: missionID,
+            telemetry: missionTelemetry
+        ) else {
             RuntimeFileLog.append("mission_target_not_locked", fields: [
                 "mission": "\(missionID)",
                 "target": query,
@@ -2808,8 +2836,9 @@ public final class MissionAgent {
         reason.localizedCaseInsensitiveContains("Navigation stalled")
     }
 
-    private func makeContext(utterance: String?) -> MissionContext {
-        MissionContext(utterance: utterance,
+    private func makeContext(utterance: String?, missionID: Int) -> MissionContext {
+        MissionContext(missionID: missionID,
+                       utterance: utterance,
                        frameJPEG: perception.capturedFrameJPEG(),
                        visibleObjects: perception.detectObjects(),
                        pose: perception.pose,

@@ -119,7 +119,7 @@ public final class OnDeviceBrain: RoverBrain {
         let availability = availability
         guard availability == .available else {
             RuntimeFileLog.append("on_device_brain_availability", fields: [
-                "state": String(describing: availability),
+                "state": availability.logValue,
             ])
             throw RoverBrainError.onDeviceUnavailable(availability)
         }

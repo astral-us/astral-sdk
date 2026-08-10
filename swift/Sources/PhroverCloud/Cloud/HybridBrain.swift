@@ -11,17 +11,22 @@ public final class HybridBrain: RoverBrain {
     private let onDevice: RoverBrain
     private let primaryTimeout: Duration
     private let isOnline: () -> Bool
+    private let missionTelemetry: MissionTelemetrySink
 
     public init(
         cloud: RoverBrain?,
         onDevice: RoverBrain,
         primaryTimeout: Duration = .seconds(1.5),
-        isOnline: @escaping () -> Bool = { NetworkMonitor.shared.isOnline }
+        isOnline: @escaping () -> Bool = { NetworkMonitor.shared.isOnline },
+        missionTelemetry: @escaping MissionTelemetrySink = { event, fields in
+            RuntimeFileLog.append(event, fields: fields)
+        }
     ) {
         self.cloud = cloud
         self.onDevice = onDevice
         self.primaryTimeout = primaryTimeout
         self.isOnline = isOnline
+        self.missionTelemetry = missionTelemetry
     }
 
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
@@ -34,7 +39,7 @@ public final class HybridBrain: RoverBrain {
 
         switch primaryResult {
         case .output(let output):
-            logSelection("on_device", reason: "primary")
+            logSelection("on_device", reason: "primary", missionID: context.missionID)
             return output
         case .failure(let error):
             if error is CancellationError {
@@ -59,28 +64,37 @@ public final class HybridBrain: RoverBrain {
     ) async throws -> BrainOutput {
         try Task.checkCancellation()
         guard let cloud, isOnline() else {
-            logSelection("on_device", reason: reason, error: primaryError)
+            logSelection("on_device", reason: reason, missionID: context.missionID, error: primaryError)
             throw primaryError
         }
 
         do {
             let output = try await cloud.nextAction(context)
-            logSelection("cloud", reason: reason, error: primaryError)
+            logSelection("cloud", reason: reason, missionID: context.missionID, error: primaryError)
             return output
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            logSelection("cloud", reason: "cloud_failed", error: error)
+            logSelection("cloud", reason: "cloud_failed", missionID: context.missionID, error: error)
             throw error
         }
     }
 
-    private func logSelection(_ brain: String, reason: String, error: Error? = nil) {
-        var fields = ["brain": brain, "reason": reason]
+    private func logSelection(
+        _ brain: String,
+        reason: String,
+        missionID: Int?,
+        error: Error? = nil
+    ) {
+        var fields = [
+            "mission": missionID.map(String.init) ?? "none",
+            "brain": brain,
+            "reason": reason,
+        ]
         if let error {
             fields["error"] = error.localizedDescription
         }
-        RuntimeFileLog.append("mission_brain_selected", fields: fields)
+        missionTelemetry("mission_brain_selected", fields)
     }
 }
 

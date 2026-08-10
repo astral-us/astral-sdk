@@ -25,6 +25,7 @@ struct ConversationView: View {
     @State private var lastCommand = ConversationView.makeInitialLastCommandState()
     @State private var authorized = false
     @State private var navigationDebug = NavigationDebugSummary()
+    @State private var brainAvailability = ConversationView.makeInitialBrainAvailability()
 
     var body: some View {
         VStack(spacing: 12) {
@@ -36,6 +37,15 @@ struct ConversationView: View {
 
                     LiveCameraDebugPanel(ar: ar, summary: navigationDebug)
                         .frame(maxWidth: 320)
+
+                    if let message = brainAvailability?.operatorMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 320)
+                            .accessibilityIdentifier("brain-availability-message")
+                    }
 
                     Text(speechIn.partialTranscript)
                         .foregroundStyle(.secondary)
@@ -99,7 +109,19 @@ struct ConversationView: View {
             let perception = ARPerceptionSource(ar: ar, detector: detector)
             let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
             let onDevice = OnDeviceBrain()
-            let brain: RoverBrain = cloudBrain.map { HybridBrain(cloud: $0, onDevice: onDevice) } ?? onDevice
+            let availability = Self.brainAvailabilityFixture() ?? onDevice.availability
+            brainAvailability = availability
+            RuntimeFileLog.append("on_device_brain_availability", fields: [
+                "state": availability.logValue,
+            ])
+            let telemetry: MissionTelemetrySink = { event, fields in
+                RuntimeFileLog.append(event, fields: fields)
+            }
+            let brain: RoverBrain = HybridBrain(
+                cloud: cloudBrain,
+                onDevice: onDevice,
+                missionTelemetry: telemetry
+            )
             agent = MissionAgent(
                 motion: nav,
                 perception: perception,
@@ -114,9 +136,23 @@ struct ConversationView: View {
                 },
                 commandStatusDidChange: { status in
                     lastCommand.reduce(status)
-                }
+                },
+                missionTelemetry: telemetry
             ) { brain }
         }
+    }
+
+    private static func makeInitialBrainAvailability() -> OnDeviceBrainAvailability? {
+        brainAvailabilityFixture()
+    }
+
+    private static func brainAvailabilityFixture() -> OnDeviceBrainAvailability? {
+#if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-ui-test-brain-model-not-ready") { return .modelNotReady }
+        if arguments.contains("-ui-test-brain-available") { return .available }
+#endif
+        return nil
     }
 
     private static func makeInitialLastCommandState() -> LastCommandState {

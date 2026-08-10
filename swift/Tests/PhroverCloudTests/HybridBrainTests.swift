@@ -37,6 +37,34 @@ final class HybridBrainTests: XCTestCase {
         XCTAssertEqual(order.names, ["on_device", "cloud"])
     }
 
+    func testSelectionTelemetryIncludesMissionAndFallbackReason() async throws {
+        let order = CallOrder()
+        let onDevice = RecordingBrain(
+            name: "on_device",
+            order: order,
+            result: .failure(RoverBrainError.onDeviceUnavailable(.modelNotReady))
+        )
+        let cloud = RecordingBrain(
+            name: "cloud",
+            order: order,
+            result: .success(.init(decision: .done))
+        )
+        var events: [(name: String, fields: [String: String])] = []
+        let brain = HybridBrain(
+            cloud: cloud,
+            onDevice: onDevice,
+            isOnline: { true },
+            missionTelemetry: { name, fields in events.append((name, fields)) }
+        )
+
+        _ = try await brain.nextAction(MissionContext(missionID: 42))
+
+        XCTAssertEqual(events.map(\.name), ["mission_brain_selected"])
+        XCTAssertEqual(events[0].fields["mission"], "42")
+        XCTAssertEqual(events[0].fields["brain"], "cloud")
+        XCTAssertEqual(events[0].fields["reason"], "on_device_failed")
+    }
+
     func testUsesCloudAfterPrimaryStageTimeout() async throws {
         let order = CallOrder()
         let onDevice = RecordingBrain(
@@ -59,7 +87,9 @@ final class HybridBrainTests: XCTestCase {
 
         XCTAssertEqual(output.decision, .done)
         XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(500))
-        XCTAssertTrue(onDevice.wasCancelled)
+        await assertEventually("primary task observes timeout cancellation") {
+            onDevice.wasCancelled
+        }
         XCTAssertEqual(order.names, ["on_device", "cloud"])
     }
 
@@ -215,6 +245,20 @@ final class HybridBrainTests: XCTestCase {
     private func runtimeLog() -> String {
         guard let url = RuntimeFileLog.logFileURL else { return "" }
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    private func assertEventually(
+        _ message: String,
+        timeout: Duration = .milliseconds(250),
+        condition: @MainActor () -> Bool
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if condition() { return }
+            await Task.yield()
+        }
+        XCTAssertTrue(condition(), message)
     }
 }
 
