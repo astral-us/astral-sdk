@@ -7,10 +7,9 @@ import UIKit
 /// Voice UI. Push-to-talk (hold the mic button) rather than always-on wake-word
 /// listening — simpler and more reliable in noisy environments.
 ///
-/// Backed by `MissionAgent`: there's no command grammar here, just "say whatever you
-/// want" — the agent looks around, asks questions, and navigates as it decides it needs
-/// to. Uses the cloud brain (open-vocabulary grounding) with on-device fallback when a
-/// `PhroverCloud.plist` is configured; on-device only otherwise.
+/// Backed by `MissionAgent`: Apple Intelligence gets the first reasoning attempt, an
+/// optional configured cloud brain is the second stage, and supported object missions
+/// retain a deterministic offline fallback when neither brain produces a usable action.
 struct ConversationView: View {
     let ar: ARSessionManager
     let nav: NavigationController

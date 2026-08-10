@@ -1390,7 +1390,7 @@ public final class MissionAgent {
             return
         }
         guard let intent = OfflineObjectMissionIntentParser.parse(utterance) else {
-            RuntimeFileLog.append("mission_offline_fallback_rejected", fields: [
+            missionTelemetry("mission_offline_fallback_rejected", [
                 "mission": "\(missionID)",
                 "reason": "unsupported_command",
                 "brain_failure": brainFailureReason
@@ -1403,6 +1403,11 @@ public final class MissionAgent {
             return
         }
 
+        missionTelemetry("mission_brain_selected", [
+            "mission": "\(missionID)",
+            "brain": "offline_object_fallback",
+            "reason": brainFailureReason,
+        ])
         missionTelemetry("mission_offline_fallback_started", [
             "mission": "\(missionID)",
             "target": intent.objectQuery,
@@ -1435,6 +1440,16 @@ public final class MissionAgent {
         var roomsSearched = 0
         var requiresFreshScanTurn = false
         var resolvedGoal: Vec2?
+
+        if intent.searchOtherRooms {
+            missionTelemetry("mission_room_search_started", [
+                "mission": "\(missionID)",
+                "reason": "other_room_requested",
+                "target": intent.objectQuery,
+                "room_id": startRoomID?.rawValue ?? "unavailable",
+                "session_generation": sessionGeneration.map(String.init) ?? "unavailable",
+            ])
+        }
 
         while resolvedGoal == nil {
             guard !missionCancellationDetected(missionID) else {
@@ -1498,6 +1513,16 @@ public final class MissionAgent {
                 "target": intent.objectQuery,
                 "target_found": resolvedGoal == nil ? "false" : "true",
             ])
+            if intent.searchOtherRooms {
+                missionTelemetry("mission_room_searched", [
+                    "mission": "\(missionID)",
+                    "reason": resolvedGoal == nil ? "target_not_found" : "target_found",
+                    "room_id": topology?.snapshot.currentRoomID?.rawValue ?? "unavailable",
+                    "room_number": String(roomsSearched),
+                    "scan_steps": String(scanSteps),
+                    "target": intent.objectQuery,
+                ])
+            }
             guard resolvedGoal == nil else { break }
             guard intent.searchOtherRooms else {
                 failOfflineObjectMission(
@@ -1547,6 +1572,13 @@ public final class MissionAgent {
                 }
                 RuntimeFileLog.append("mission_offline_doorway_crossed", fields: [
                     "mission": "\(missionID)",
+                    "doorway_id": step.doorwayID.rawValue,
+                    "from_room_id": step.fromRoomID.rawValue,
+                    "to_room_id": step.toRoomID.rawValue,
+                ])
+                missionTelemetry("mission_doorway_crossed", [
+                    "mission": "\(missionID)",
+                    "reason": "searching_next_room",
                     "doorway_id": step.doorwayID.rawValue,
                     "from_room_id": step.fromRoomID.rawValue,
                     "to_room_id": step.toRoomID.rawValue,
@@ -1681,6 +1713,13 @@ public final class MissionAgent {
                     "step_count": String(returnRoute.count),
                     "outbound_step_count": String(crossedDoorwaySteps.count),
                 ])
+                missionTelemetry("mission_return_route_started", [
+                    "mission": "\(missionID)",
+                    "reason": "explicit_return_requested",
+                    "from_room_id": currentRoomID.rawValue,
+                    "to_room_id": startRoomID.rawValue,
+                    "step_count": String(returnRoute.count),
+                ])
                 for (index, expectedStep) in returnRoute.enumerated() {
                     guard topology.snapshot.sessionGeneration == sessionGeneration else {
                         failOfflineObjectMission(
@@ -1706,6 +1745,21 @@ public final class MissionAgent {
                         RuntimeFileLog.append("mission_offline_return_route_step", fields: [
                             "mission": "\(missionID)",
                             "step": String(index + 1),
+                            "doorway_id": actualStep.doorwayID.rawValue,
+                            "from_room_id": actualStep.fromRoomID.rawValue,
+                            "to_room_id": actualStep.toRoomID.rawValue,
+                        ])
+                        missionTelemetry("mission_return_route_step", [
+                            "mission": "\(missionID)",
+                            "reason": "returning_to_start_room",
+                            "step": String(index + 1),
+                            "doorway_id": actualStep.doorwayID.rawValue,
+                            "from_room_id": actualStep.fromRoomID.rawValue,
+                            "to_room_id": actualStep.toRoomID.rawValue,
+                        ])
+                        missionTelemetry("mission_doorway_crossed", [
+                            "mission": "\(missionID)",
+                            "reason": "returning_to_start_room",
                             "doorway_id": actualStep.doorwayID.rawValue,
                             "from_room_id": actualStep.fromRoomID.rawValue,
                             "to_room_id": actualStep.toRoomID.rawValue,
@@ -1737,6 +1791,12 @@ public final class MissionAgent {
                 }
                 RuntimeFileLog.append("mission_offline_return_route_completed", fields: [
                     "mission": "\(missionID)",
+                    "room_id": startRoomID.rawValue,
+                    "step_count": String(returnRoute.count),
+                ])
+                missionTelemetry("mission_return_route_completed", [
+                    "mission": "\(missionID)",
+                    "reason": "start_room_reached",
                     "room_id": startRoomID.rawValue,
                     "step_count": String(returnRoute.count),
                 ])

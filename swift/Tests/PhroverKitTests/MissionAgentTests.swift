@@ -1844,13 +1844,85 @@ final class MissionAgentTests: XCTestCase {
 
         XCTAssertEqual(events.map(\.name), [
             "mission_brain_selected",
+            "mission_brain_selected",
             "mission_offline_fallback_started",
             "mission_attribute_match",
         ])
-        XCTAssertEqual(events.map { $0.fields["mission"] }, ["1", "1", "1"])
+        XCTAssertEqual(events.map { $0.fields["mission"] }, ["1", "1", "1", "1"])
         XCTAssertEqual(events[0].fields["reason"], "on_device_failed")
+        XCTAssertEqual(events[1].fields["brain"], "offline_object_fallback")
         XCTAssertEqual(events[1].fields["reason"], "brain_error")
-        XCTAssertEqual(events[2].fields["reason"], "matched_required_attributes")
+        XCTAssertEqual(events[2].fields["reason"], "brain_error")
+        XCTAssertEqual(events[3].fields["reason"], "matched_required_attributes")
+    }
+
+    func testOtherRoomFallbackEmitsStructuredSearchAndReturnTelemetry() async {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(generation: 27, initialPose: Pose2D(position: .zero, yaw: 0))
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.frameSequence = 1
+        perception.frontiers = [doorwayFrontier()]
+        perception.observations = crossingObservations(
+            positions: [0.5, 0.65, 1.35, 1.36, 1.37],
+            startingSequence: 10,
+            generation: 27
+        ) + crossingObservations(
+            positions: [1.5, 1.35, 0.65, 0.64, 0.63],
+            startingSequence: 30,
+            generation: 27,
+            yaw: .pi
+        )
+        perception.unprojectResult = Vec2(2, 0)
+        motion.onScanRotate = { _ in
+            perception.frameSequence = (perception.frameSequence ?? 0) + 1
+            guard motion.scanRotateCalls.count == 2 else { return }
+            perception.objects = [self.blackObject(label: "chair")]
+            perception.observations.insert(
+                PoseObservation(
+                    pose: Pose2D(position: Vec2(1.37, 0), yaw: 0),
+                    frameSequence: 20,
+                    timestamp: 20,
+                    trackingQuality: .normal,
+                    sessionGeneration: 27
+                ),
+                at: 0
+            )
+        }
+        motion.onNavigate = { call in
+            guard call == 2 else { return }
+            perception.pose = Pose2D(position: Vec2(2, 0), yaw: .pi)
+        }
+        var events: [(name: String, fields: [String: String])] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 1,
+            roomTopology: topology,
+            roomTransitionPollInterval: 0,
+            missionTelemetry: { events.append(($0, $1)) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the black chair in the other room and come back")
+
+        let names = events.map(\.name)
+        XCTAssertTrue(names.contains("mission_room_search_started"))
+        XCTAssertEqual(names.filter { $0 == "mission_room_searched" }.count, 2)
+        XCTAssertTrue(names.contains("mission_doorway_crossed"))
+        XCTAssertTrue(names.contains("mission_return_route_started"))
+        XCTAssertTrue(names.contains("mission_return_route_step"))
+        XCTAssertTrue(names.contains("mission_return_route_completed"))
+        for event in events where event.name.hasPrefix("mission_room_")
+            || event.name.hasPrefix("mission_doorway_")
+            || event.name.hasPrefix("mission_return_route_") {
+            XCTAssertEqual(event.fields["mission"], "1")
+            XCTAssertNotNil(event.fields["reason"])
+        }
     }
 
     func testBrainFailureAfterUsableOutputDoesNotMixInOfflineFallback() async {

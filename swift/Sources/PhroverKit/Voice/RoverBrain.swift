@@ -343,9 +343,8 @@ extension OnDeviceBrainAvailability {
 }
 
 /// A reasoner that turns a `MissionContext` into the next action (plus an optional plan
-/// rewrite). Two implementations, chosen by `MissionAgent` per think-tick based on
-/// connectivity: `CloudBrain` (primary, open-vocabulary) and `OnDeviceBrain` (fallback,
-/// best-effort).
+/// rewrite). `HybridBrain` attempts `OnDeviceBrain` first and uses a configured cloud
+/// brain only as an optional second stage.
 @MainActor
 public protocol RoverBrain: AnyObject {
     func nextAction(_ context: MissionContext) async throws -> BrainOutput

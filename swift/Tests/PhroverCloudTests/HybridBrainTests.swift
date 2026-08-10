@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import PhroverKit
+import RoverNav
 @testable import PhroverCloud
 
 @MainActor
@@ -242,6 +243,54 @@ final class HybridBrainTests: XCTestCase {
         XCTAssertFalse(selectionLog.contains("brain=cloud"))
     }
 
+    func testUnavailableHybridBrainAndMissionAgentShareFallbackTelemetryOrder() async {
+        let order = CallOrder()
+        let onDevice = RecordingBrain(
+            name: "on_device",
+            order: order,
+            result: .failure(RoverBrainError.onDeviceUnavailable(.modelNotReady))
+        )
+        var events: [(name: String, fields: [String: String])] = []
+        let telemetry: MissionTelemetrySink = { events.append(($0, $1)) }
+        let brain = HybridBrain(
+            cloud: nil,
+            onDevice: onDevice,
+            isOnline: { false },
+            missionTelemetry: telemetry
+        )
+        let motion = IntegrationMotion()
+        let perception = IntegrationPerception()
+        perception.objects = [
+            PerceivedObject(
+                label: "refrigerator",
+                confidence: 0.99,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+            )
+        ]
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: IntegrationVoice(),
+            missionTelemetry: telemetry,
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(events.map(\.name), [
+            "mission_brain_selected",
+            "mission_brain_selected",
+            "mission_offline_fallback_started",
+            "mission_attribute_match",
+        ])
+        XCTAssertEqual(events.map { $0.fields["mission"] }, ["1", "1", "1", "1"])
+        XCTAssertEqual(events[0].fields["brain"], "on_device")
+        XCTAssertEqual(events[0].fields["reason"], "on_device_failed")
+        XCTAssertEqual(events[1].fields["brain"], "offline_object_fallback")
+        XCTAssertEqual(events[1].fields["reason"], "brain_error")
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1, 0)])
+    }
+
     private func runtimeLog() -> String {
         guard let url = RuntimeFileLog.logFileURL else { return "" }
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
@@ -356,6 +405,41 @@ private final class CancellationProbe: @unchecked Sendable {
 @MainActor
 private final class BrainResultBox {
     var value: Result<BrainOutput, Error>?
+}
+
+@MainActor
+private final class IntegrationMotion: RoverMotion {
+    var state: NavigationController.State = .idle
+    private(set) var navigateCalls: [Vec2] = []
+
+    func navigate(to goal: Vec2) {
+        navigateCalls.append(goal)
+        state = .arrived
+    }
+
+    func rotate(by angle: Double) async {
+        state = .arrived
+    }
+
+    func cancel() {
+        state = .idle
+    }
+}
+
+@MainActor
+private final class IntegrationPerception: RoverPerception {
+    var pose: Pose2D? = Pose2D(position: .zero, yaw: 0)
+    var objects: [PerceivedObject] = []
+
+    func detectObjects() -> [PerceivedObject] { objects }
+    func unproject(normalizedPoint: CGPoint) -> Vec2? { Vec2(1, 0) }
+    func capturedFrameJPEG() -> Data? { nil }
+}
+
+@MainActor
+private final class IntegrationVoice: RoverVoice {
+    func speak(_ text: String) {}
+    func ask(_ question: String, timeout: TimeInterval) async -> String? { nil }
 }
 
 @MainActor

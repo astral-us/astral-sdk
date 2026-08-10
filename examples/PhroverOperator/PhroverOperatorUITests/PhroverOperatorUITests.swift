@@ -76,11 +76,19 @@ final class PhroverOperatorUITests: XCTestCase {
         XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
         talkTab.tap()
 
-        XCTAssertFalse(app.staticTexts["brain-availability-message"].exists)
         let mic = app.descendants(matching: .any)
             .matching(identifier: "push-to-talk-control").element
         XCTAssertTrue(mic.waitForExistence(timeout: 10))
         XCTAssertTrue(mic.isHittable)
+        XCTAssertLessThanOrEqual(mic.frame.maxY, talkTab.frame.minY)
+
+        let diagnostic = app.staticTexts["brain-availability-message"]
+        let diagnosticAppears = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true"),
+            object: diagnostic
+        )
+        diagnosticAppears.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [diagnosticAppears], timeout: 0.5), .completed)
     }
 
     /// Gated integration path: drive forward on the D-pad and confirm the command
