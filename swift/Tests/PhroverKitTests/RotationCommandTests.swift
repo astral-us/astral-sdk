@@ -59,34 +59,35 @@ final class RotationCommandTests: XCTestCase {
         await navigation.stopAndWait()
     }
 
-    func testReplacingScanDoesNotLetFirstCompletionEndSecondHeadingMeasurement() async {
+    func testReplacingScanWhileFirstPulseTransportIsSuspendedPreservesSecondHeading() async {
         TestURLProtocol.reset()
-        let firstHeadingStarted = expectation(description: "first scan heading started")
-        let secondHeadingStarted = expectation(description: "second scan heading started")
-        var headingStartCount = 0
+        TestURLProtocol.delay = 0.20
+        let replacementHeadingStarted = expectation(description: "replacement scan heading started")
         let ar = ARSessionManager { event, _ in
-            guard event == "relative_heading_measurement_started" else { return }
-            headingStartCount += 1
-            if headingStartCount == 1 {
-                firstHeadingStarted.fulfill()
-            } else if headingStartCount == 2 {
-                secondHeadingStarted.fulfill()
+            if event == "relative_heading_measurement_started" {
+                replacementHeadingStarted.fulfill()
             }
         }
         ingestTrackedPose(into: ar)
         let navigation = makeNavigation(ar: ar)
 
         let firstScan = Task { await navigation.rotateForScan(by: .pi / 6) }
-        await fulfillment(of: [firstHeadingStarted], timeout: 1)
-        let secondScan = Task { await navigation.rotateForScan(by: -.pi / 6) }
-        await fulfillment(of: [secondHeadingStarted], timeout: 1)
+        await waitForRequestCount(1)
 
+        TestURLProtocol.delay = 0
+        let secondScan = Task { await navigation.rotateForScan(by: -.pi / 6) }
+        await fulfillment(of: [replacementHeadingStarted], timeout: 1)
+
+        XCTAssertTrue(
+            ar.ingestRelativeHeadingSample(Self.reliableHeadingSample()),
+            "the replacement scan must own the heading measurement while the first stop is suspended"
+        )
         firstScan.cancel()
         await firstScan.value
 
         XCTAssertTrue(
             ar.ingestRelativeHeadingSample(Self.reliableHeadingSample()),
-            "the stale first scan must not end the replacement scan's heading measurement"
+            "the stale first stop completion must not end the replacement scan's heading measurement"
         )
 
         secondScan.cancel()
