@@ -1,107 +1,96 @@
+import Foundation
 import XCTest
 import RoverNav
 @testable import PhroverKit
 
 @MainActor
 final class RotationCommandTests: XCTestCase {
-    func testCancellingScanAwaitCancelsIndependentRotationAndAwaitsStop() async {
-        let rotationCancelled = expectation(description: "independent rotation cancelled")
-        let stopCompleted = expectation(description: "transport stop completed")
-        let rotation = Task { @MainActor in
-            do {
-                try await Task.sleep(for: .milliseconds(200))
-            } catch is CancellationError {
-                rotationCancelled.fulfill()
-            } catch {
-                XCTFail("Unexpected scan task error: \(error)")
+    func testCancellingScanPreflightAwaitsFreshTransportStop() async {
+        TestURLProtocol.reset()
+        TestURLProtocol.delay = 0.08
+        let headingStarted = expectation(description: "scan heading preflight started")
+        let ar = ARSessionManager { event, _ in
+            if event == "relative_heading_measurement_started" {
+                headingStarted.fulfill()
             }
         }
-        let scanAwait = Task { @MainActor in
-            await NavigationController.awaitScanRotationTask(rotation) {
-                stopCompleted.fulfill()
-            }
+        ingestTrackedPose(into: ar)
+        let navigation = makeNavigation(ar: ar)
+        let scan = Task { await navigation.rotateForScan(by: .pi / 6) }
+        await fulfillment(of: [headingStarted], timeout: 1)
+        let clock = ContinuousClock()
+
+        let elapsed = await clock.measure {
+            scan.cancel()
+            await scan.value
         }
 
-        await Task.yield()
-        scanAwait.cancel()
-
-        await fulfillment(of: [rotationCancelled, stopCompleted], timeout: 1)
-        _ = await scanAwait.value
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(70))
+        XCTAssertEqual(TestURLProtocol.requestCount, 2)
+        XCTAssertEqual(navigation.state, .idle)
     }
 
-    func testCancellingScanRunsSuspendingTransportStopInFreshTask() async {
-        let rotationCancelled = expectation(description: "independent rotation cancelled")
-        let stopCompleted = expectation(description: "suspending transport stop completed")
-        let rotation = Task { @MainActor in
-            do {
-                try await Task.sleep(for: .seconds(1))
-            } catch is CancellationError {
-                rotationCancelled.fulfill()
-            } catch {
-                XCTFail("Unexpected scan task error: \(error)")
+    func testReplacingScanDuringSuspendedSafetyStopDoesNotFailReplacementNavigation() async {
+        TestURLProtocol.reset()
+        TestURLProtocol.delay = 0.20
+        let headingStarted = expectation(description: "scan relative-heading preflight started")
+        let ar = ARSessionManager { event, _ in
+            if event == "relative_heading_measurement_started" {
+                headingStarted.fulfill()
             }
         }
-        let scanAwait = Task { @MainActor in
-            _ = await NavigationController.awaitScanRotationTask(
-                rotation,
-                isCurrentOperation: { true }
-            ) {
-                XCTAssertFalse(Task.isCancelled)
-                do {
-                    try await Task.sleep(for: .milliseconds(20))
-                    stopCompleted.fulfill()
-                } catch {
-                    XCTFail("Transport stop inherited caller cancellation: \(error)")
-                }
-            }
-        }
+        ingestTrackedPose(into: ar)
+        let navigation = makeNavigation(
+            ar: ar,
+            safetyFeedback: { Self.tippingFeedback }
+        )
 
-        await Task.yield()
-        scanAwait.cancel()
+        let scan = Task { await navigation.rotateForScan(by: .pi / 6) }
+        await fulfillment(of: [headingStarted], timeout: 1)
+        ingestReliableRelativeHeading(into: ar)
+        await waitForRequestCount(2)
 
-        await fulfillment(of: [rotationCancelled, stopCompleted], timeout: 1)
-        await scanAwait.value
+        ingestTrackedPose(into: ar, sequence: 2)
+        navigation.navigate(to: Vec2(1, 0))
+        await waitForNavigationCommandCount(1)
+        await scan.value
+
+        XCTAssertEqual(navigation.state, .driving)
+        await navigation.stopAndWait()
     }
 
-    func testStaleScanCompletionDoesNotStopOrIdleReplacementOperation() async {
-        let rotationCancelled = expectation(description: "stale rotation cancelled")
-        let replacementStarted = expectation(description: "replacement operation started")
-        var activeOperation = 1
-        var state = NavigationController.State.driving
-        var stopCallCount = 0
-        let rotation = Task { @MainActor in
-            do {
-                try await Task.sleep(for: .seconds(1))
-            } catch is CancellationError {
-                rotationCancelled.fulfill()
-                try? await Task.sleep(for: .milliseconds(30))
-            } catch {
-                XCTFail("Unexpected scan task error: \(error)")
+    func testReplacingScanDoesNotLetFirstCompletionEndSecondHeadingMeasurement() async {
+        TestURLProtocol.reset()
+        let firstHeadingStarted = expectation(description: "first scan heading started")
+        let secondHeadingStarted = expectation(description: "second scan heading started")
+        var headingStartCount = 0
+        let ar = ARSessionManager { event, _ in
+            guard event == "relative_heading_measurement_started" else { return }
+            headingStartCount += 1
+            if headingStartCount == 1 {
+                firstHeadingStarted.fulfill()
+            } else if headingStartCount == 2 {
+                secondHeadingStarted.fulfill()
             }
         }
-        let scanAwait = Task { @MainActor in
-            let stillOwnsOperation = await NavigationController.awaitScanRotationTask(
-                rotation,
-                isCurrentOperation: { activeOperation == 1 }
-            ) {
-                stopCallCount += 1
-            }
-            if Task.isCancelled, stillOwnsOperation {
-                state = .idle
-            }
-        }
+        ingestTrackedPose(into: ar)
+        let navigation = makeNavigation(ar: ar)
 
-        await Task.yield()
-        scanAwait.cancel()
-        activeOperation = 2
-        state = .driving
-        replacementStarted.fulfill()
+        let firstScan = Task { await navigation.rotateForScan(by: .pi / 6) }
+        await fulfillment(of: [firstHeadingStarted], timeout: 1)
+        let secondScan = Task { await navigation.rotateForScan(by: -.pi / 6) }
+        await fulfillment(of: [secondHeadingStarted], timeout: 1)
 
-        await fulfillment(of: [rotationCancelled, replacementStarted], timeout: 1)
-        await scanAwait.value
+        firstScan.cancel()
+        await firstScan.value
 
-        XCTAssertEqual(stopCallCount, 0)
-        XCTAssertEqual(state, .driving)
+        XCTAssertTrue(
+            ar.ingestRelativeHeadingSample(Self.reliableHeadingSample()),
+            "the stale first scan must not end the replacement scan's heading measurement"
+        )
+
+        secondScan.cancel()
+        await secondScan.value
     }
 
     func testScanFailureWithoutTrackedPoseAwaitsTransportStop() async {
@@ -265,4 +254,102 @@ final class RotationCommandTests: XCTestCase {
             RoverConfig.maximumScanTurnDuration
         )
     }
+
+    private func makeNavigation(
+        ar: ARSessionManager,
+        safetyFeedback: @escaping () -> RoverFeedback? = { nil }
+    ) -> NavigationController {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TestURLProtocol.self]
+        return NavigationController(
+            ar: ar,
+            control: RoverControl(host: "rover.test", session: URLSession(configuration: configuration)),
+            trackingRecoveryTimeout: 0.5,
+            scanDepthRecoveryTimeout: 0.5,
+            guardLayer: ObstacleGuard(),
+            safetyFeedback: safetyFeedback,
+            depthSafetyObservation: { command in
+                DepthSafetyObservation(
+                    state: .clear,
+                    clearance: .infinity,
+                    supportCount: 1,
+                    sampleAge: 0,
+                    requiredStoppingDistance: 0,
+                    motionClass: DepthSafetyMotionClass.classify(command),
+                    speedLimit: nil
+                )
+            }
+        )
+    }
+
+    private func ingestTrackedPose(into ar: ARSessionManager, sequence: UInt64 = 1) {
+        if sequence == 1 {
+            ar.resetTracking(generation: 1, runSession: false)
+        }
+        XCTAssertTrue(ar.ingest(PoseObservation(
+            pose: Pose2D(position: .zero, yaw: 0),
+            frameSequence: sequence,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            trackingQuality: .normal,
+            sessionGeneration: 1
+        )))
+    }
+
+    private func ingestReliableRelativeHeading(into ar: ARSessionManager) {
+        XCTAssertTrue(ar.ingestRelativeHeadingSample(Self.reliableHeadingSample()))
+    }
+
+    private static func reliableHeadingSample() -> RelativeHeadingSample {
+        RelativeHeadingSample(
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            rotationRate: .zero,
+            gravity: SIMD3<Double>(0, -1, 0)
+        )
+    }
+
+    private func waitForRequestCount(_ expected: Int) async {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while TestURLProtocol.requestCount < expected, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertGreaterThanOrEqual(TestURLProtocol.requestCount, expected)
+    }
+
+    private func waitForNavigationCommandCount(_ expected: Int) async {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while navigationCommandCount < expected, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertGreaterThanOrEqual(navigationCommandCount, expected)
+    }
+
+    private var navigationCommandCount: Int {
+        TestURLProtocol.requestURLs.filter { Self.requestOpcode(from: $0) == RoverConfig.Opcode.speedControl }.count
+    }
+
+    private static func requestOpcode(from url: URL) -> Int? {
+        guard let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "json" })?.value,
+              let data = value.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return payload["T"] as? Int
+    }
+
+    private static let tippingFeedback = RoverFeedback(
+        T: nil,
+        L: nil,
+        R: nil,
+        ax: nil,
+        ay: nil,
+        az: nil,
+        gx: nil,
+        gy: nil,
+        gz: nil,
+        roll: 1,
+        pitch: nil,
+        yaw: nil,
+        v: nil
+    )
 }

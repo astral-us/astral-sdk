@@ -29,32 +29,22 @@ public final class NavigationController {
     private let safetyFeedback: () -> RoverFeedback?
     private let depthSafetyObservation: (WheelCommand) -> DepthSafetyObservation
 
+    private struct OperationToken: Equatable, Sendable {
+        let generation: UInt64
+    }
+
+    private struct OperationHandoff {
+        let token: OperationToken
+        let predecessor: Task<Void, Never>?
+    }
+
     private var loop: Task<Void, Never>?
+    private var loopOwner: OperationToken?
     private var operationGeneration: UInt64 = 0
+    private var relativeHeadingOwner: OperationToken?
     private var replanCounter = 0
     private let trackingRecoveryTimeout: TimeInterval
     private let scanDepthRecoveryTimeout: TimeInterval
-
-    static func awaitScanRotationTask(
-        _ task: Task<Void, Never>,
-        isCurrentOperation: @escaping @MainActor () -> Bool = { true },
-        stop: @escaping @MainActor () async -> Void
-    ) async -> Bool {
-        await withTaskCancellationHandler {
-            await task.value
-            guard Task.isCancelled else { return isCurrentOperation() }
-            task.cancel()
-            await task.value
-            guard isCurrentOperation() else { return false }
-            let stopTask = Task { @MainActor in
-                await stop()
-            }
-            await stopTask.value
-            return isCurrentOperation()
-        } onCancel: {
-            task.cancel()
-        }
-    }
 
     public convenience init(
         ar: ARSessionManager,
@@ -116,14 +106,15 @@ public final class NavigationController {
     }
 
     private func startNavigation(to goal: Vec2, stoppingAtForwardClearance: Double?) {
-        cancel()
-        let operationID = beginOperation()
+        let handoff = claimOperation()
         guard let start = ar.pose?.position else {
             state = .failed("No ARKit pose yet — move the device to establish tracking.")
+            installStopOnlyOperation(handoff)
             return
         }
         guard planAndStore(from: start, to: goal) else {
             state = .failed("No path to goal.")
+            installStopOnlyOperation(handoff)
             return
         }
         RuntimeFileLog.append("nav_goal_start", fields: [
@@ -135,14 +126,31 @@ public final class NavigationController {
             "target_stop_clearance": stoppingAtForwardClearance.map(Self.formatMeters) ?? "none"
         ])
         state = .driving
-        loop = Task { [control] in
-            let stopTask = Task {
-                try? await control.stop()
+        let task = Task {
+            await handoff.predecessor?.value
+            guard self.isOperationActive(handoff.token) else {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+                self.clearLoopIfCurrent(handoff.token)
+                return
             }
-            await stopTask.value
-            guard !Task.isCancelled, self.isCurrentOperation(operationID) else { return }
-            await drive(to: goal, stoppingAtForwardClearance: stoppingAtForwardClearance)
+            self.endAnyRelativeHeadingMeasurementIfCurrent(handoff.token)
+            guard await self.stopTransportIfCurrent(handoff.token),
+                  self.isOperationActive(handoff.token) else {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+            await self.drive(
+                to: goal,
+                stoppingAtForwardClearance: stoppingAtForwardClearance,
+                operation: handoff.token
+            )
+            if Task.isCancelled {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+            }
+            self.clearLoopIfCurrent(handoff.token)
         }
+        installLoop(task, operation: handoff.token)
     }
 
     /// Rotate in place by `angle` radians (CCW positive, matching `Pose2D.yaw`) and wait
@@ -151,142 +159,245 @@ public final class NavigationController {
     /// Uses the same command cadence/watchdog as `drive()`, but does not treat forward
     /// clearance as a hard stop because this is an in-place search turn, not forward motion.
     public func rotate(by angle: Double) async {
-        await stopAndWait()
-        guard !Task.isCancelled else { return }
-        _ = beginOperation()
-        guard let startYaw = ar.pose?.yaw else {
-            state = .failed("No ARKit pose yet — move the device to establish tracking.")
-            return
+        let handoff = claimOperation()
+        let task = Task {
+            await handoff.predecessor?.value
+            guard self.isOperationActive(handoff.token) else {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+            self.endAnyRelativeHeadingMeasurementIfCurrent(handoff.token)
+            guard await self.stopTransportIfCurrent(handoff.token),
+                  self.isOperationActive(handoff.token) else {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+            guard let startYaw = self.ar.pose?.yaw else {
+                self.setStateIfCurrent(
+                    .failed("No ARKit pose yet — move the device to establish tracking."),
+                    operation: handoff.token
+                )
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+            let targetYaw = normalizeAngle(startYaw + angle)
+            self.setStateIfCurrent(.driving, operation: handoff.token)
+            await self.performContinuousRotation(to: targetYaw, operation: handoff.token)
+            if Task.isCancelled {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+            }
+            self.clearLoopIfCurrent(handoff.token)
         }
-        let targetYaw = normalizeAngle(startYaw + angle)
-        state = .driving
-        let task = Task { await performContinuousRotation(to: targetYaw) }
-        loop = task
-        await task.value
+        installLoop(task, operation: handoff.token)
+        await awaitOwnedOperation(task)
     }
 
     /// Rotate in short pulses for camera-based target search. Stopping between pulses
     /// prevents a 30-degree scan step from sweeping past the object before detection can
     /// process a stable frame.
     public func rotateForScan(by angle: Double) async {
-        await stopAndWait()
-        guard !Task.isCancelled else { return }
-        let operationID = beginOperation()
-        guard await waitForUsableTracking(), let startPose = ar.pose else {
-            setStateIfCurrent(
-                .failed("AR tracking is not ready — keep the phone still and try again."),
-                operationID: operationID
-            )
-            return
-        }
-
-        ar.beginRelativeHeadingMeasurement()
-        guard await waitForReliableRelativeHeading() != nil else {
-            ar.endRelativeHeadingMeasurement()
-            setStateIfCurrent(
-                .failed("Relative heading is not ready — keep the phone still and try again."),
-                operationID: operationID
-            )
-            return
-        }
-
-        guard isCurrentOperation(operationID) else { return }
-        state = .driving
+        let handoff = claimOperation()
         let task = Task {
-            await performScanRotation(
+            await handoff.predecessor?.value
+            guard self.isOperationActive(handoff.token) else {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+            self.endAnyRelativeHeadingMeasurementIfCurrent(handoff.token)
+            guard await self.stopTransportIfCurrent(handoff.token),
+                  self.isOperationActive(handoff.token),
+                  await self.waitForUsableTracking(operation: handoff.token),
+                  self.isOperationActive(handoff.token),
+                  let startPose = self.ar.pose else {
+                if self.isOperationActive(handoff.token) {
+                    self.setStateIfCurrent(
+                        .failed("AR tracking is not ready — keep the phone still and try again."),
+                        operation: handoff.token
+                    )
+                } else {
+                    await self.finishCancelledOperationIfCurrent(handoff.token)
+                }
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+
+            guard self.beginRelativeHeadingMeasurementIfCurrent(handoff.token),
+                  await self.waitForReliableRelativeHeading(operation: handoff.token) != nil,
+                  self.isOperationActive(handoff.token) else {
+                self.endRelativeHeadingMeasurementIfOwned(by: handoff.token)
+                if self.isOperationActive(handoff.token) {
+                    self.setStateIfCurrent(
+                        .failed("Relative heading is not ready — keep the phone still and try again."),
+                        operation: handoff.token
+                    )
+                } else {
+                    await self.finishCancelledOperationIfCurrent(handoff.token)
+                }
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+
+            self.setStateIfCurrent(.driving, operation: handoff.token)
+            await self.performScanRotation(
                 from: startPose,
                 requestedScanAngle: normalizeAngle(angle),
-                operationID: operationID
+                operation: handoff.token
             )
-        }
-        loop = task
-        let stillOwnsOperation = await Self.awaitScanRotationTask(
-            task,
-            isCurrentOperation: { [weak self] in
-                self?.isCurrentOperation(operationID) == true
+            self.endRelativeHeadingMeasurementIfOwned(by: handoff.token)
+            if Task.isCancelled {
+                await self.finishCancelledOperationIfCurrent(handoff.token)
+            } else {
+                guard await self.stopTransportForActiveOperation(handoff.token) else {
+                    await self.finishCancelledOperationIfCurrent(handoff.token)
+                    self.clearLoopIfCurrent(handoff.token)
+                    return
+                }
             }
-        ) { [control] in
-            try? await control.stop()
+            self.clearLoopIfCurrent(handoff.token)
         }
-        guard stillOwnsOperation else { return }
-        loop = nil
-        if Task.isCancelled {
-            state = .idle
-        }
+        installLoop(task, operation: handoff.token)
+        await awaitOwnedOperation(task)
     }
 
     /// Stop and clear the current goal.
     public func cancel() {
-        let cancellationID = invalidateCurrentOperation()
-        loop?.cancel()
-        loop = nil
-        Task { [weak self, control] in
-            guard self?.isCurrentOperation(cancellationID) == true else { return }
-            let stopTask = Task {
-                try? await control.stop()
-            }
-            await stopTask.value
-        }
+        let handoff = claimOperation()
         // Without this, an external cancel (e.g. a hard-stop bypassing the brain) leaves
         // `state` at `.driving` forever, so anything polling `state == .driving` to know
         // when motion has settled never returns.
         state = .idle
+        installStopOnlyOperation(handoff)
     }
 
     public func stopAndWait() async {
-        let stopOperationID = invalidateCurrentOperation()
-        let activeLoop = loop
-        activeLoop?.cancel()
-        loop = nil
-        await activeLoop?.value
-        guard isCurrentOperation(stopOperationID) else { return }
-        let stopTask = Task { [control] in
-            try? await control.stop()
-        }
-        await stopTask.value
-        guard isCurrentOperation(stopOperationID) else { return }
+        let handoff = claimOperation()
         state = .idle
+        let task = makeStopOnlyOperation(handoff)
+        installLoop(task, operation: handoff.token)
+        await task.value
     }
 
-    private func beginOperation() -> UInt64 {
+    private func claimOperation() -> OperationHandoff {
         operationGeneration &+= 1
-        return operationGeneration
+        let token = OperationToken(generation: operationGeneration)
+        let predecessor = loop
+        predecessor?.cancel()
+        loop = nil
+        loopOwner = nil
+        return OperationHandoff(token: token, predecessor: predecessor)
     }
 
-    @discardableResult
-    private func invalidateCurrentOperation() -> UInt64 {
-        operationGeneration &+= 1
-        return operationGeneration
+    private func installLoop(_ task: Task<Void, Never>, operation: OperationToken) {
+        guard isCurrentOperation(operation) else {
+            task.cancel()
+            return
+        }
+        loop = task
+        loopOwner = operation
     }
 
-    private func isCurrentOperation(_ operationID: UInt64) -> Bool {
-        operationGeneration == operationID
+    private func clearLoopIfCurrent(_ operation: OperationToken) {
+        guard loopOwner == operation else { return }
+        loop = nil
+        loopOwner = nil
     }
 
-    private func setStateIfCurrent(_ newState: State, operationID: UInt64) {
-        guard isCurrentOperation(operationID) else { return }
+    private func isCurrentOperation(_ operation: OperationToken) -> Bool {
+        operationGeneration == operation.generation
+    }
+
+    private func isOperationActive(_ operation: OperationToken) -> Bool {
+        isCurrentOperation(operation) && !Task.isCancelled
+    }
+
+    private func setStateIfCurrent(_ newState: State, operation: OperationToken) {
+        guard isCurrentOperation(operation) else { return }
         state = newState
     }
 
-    private func stopScanTransportIfCurrent(operationID: UInt64) async {
-        guard isCurrentOperation(operationID) else { return }
-        let stopTask = Task { [control] in
-            try? await control.stop()
+    private func awaitOwnedOperation(_ task: Task<Void, Never>) async {
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
         }
-        await stopTask.value
+    }
+
+    private func installStopOnlyOperation(_ handoff: OperationHandoff) {
+        let task = makeStopOnlyOperation(handoff)
+        installLoop(task, operation: handoff.token)
+    }
+
+    private func makeStopOnlyOperation(_ handoff: OperationHandoff) -> Task<Void, Never> {
+        Task {
+            await handoff.predecessor?.value
+            guard self.isCurrentOperation(handoff.token) else { return }
+            self.endAnyRelativeHeadingMeasurementIfCurrent(handoff.token)
+            _ = await self.stopTransportIfCurrent(handoff.token)
+            self.clearLoopIfCurrent(handoff.token)
+        }
+    }
+
+    @discardableResult
+    private func stopTransportIfCurrent(_ operation: OperationToken) async -> Bool {
+        guard isCurrentOperation(operation) else { return false }
+        let stopTask = Task { @MainActor [weak self, control] in
+            guard self?.isCurrentOperation(operation) == true else { return false }
+            try? await control.stop()
+            return self?.isCurrentOperation(operation) == true
+        }
+        return await stopTask.value
+    }
+
+    private func stopTransportForActiveOperation(_ operation: OperationToken) async -> Bool {
+        guard isOperationActive(operation),
+              await stopTransportIfCurrent(operation) else { return false }
+        return isOperationActive(operation)
+    }
+
+    private func finishCancelledOperationIfCurrent(_ operation: OperationToken) async {
+        guard isCurrentOperation(operation) else { return }
+        endRelativeHeadingMeasurementIfOwned(by: operation)
+        _ = await stopTransportIfCurrent(operation)
+        setStateIfCurrent(.idle, operation: operation)
+    }
+
+    private func beginRelativeHeadingMeasurementIfCurrent(_ operation: OperationToken) -> Bool {
+        guard isCurrentOperation(operation) else { return false }
+        ar.beginRelativeHeadingMeasurement()
+        relativeHeadingOwner = operation
+        return true
+    }
+
+    private func endRelativeHeadingMeasurementIfOwned(by operation: OperationToken) {
+        guard relativeHeadingOwner == operation else { return }
+        ar.endRelativeHeadingMeasurement()
+        relativeHeadingOwner = nil
+    }
+
+    private func endAnyRelativeHeadingMeasurementIfCurrent(_ operation: OperationToken) {
+        guard isCurrentOperation(operation), relativeHeadingOwner != nil else { return }
+        ar.endRelativeHeadingMeasurement()
+        relativeHeadingOwner = nil
     }
 
     // MARK: - Loop
 
-    private func drive(to goal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?) async {
+    private func drive(to goal: Vec2,
+                       stoppingAtForwardClearance targetStopDistance: Double?,
+                       operation: OperationToken) async {
         var hasSentCommand = false
         var consecutiveCommandFailures = 0
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
-        while !Task.isCancelled {
-            guard await waitForUsableTracking(), let pose = ar.pose else {
-                try? await control.stop()
-                if !Task.isCancelled {
-                    state = .failed("AR tracking did not recover in time.")
+        while isOperationActive(operation) {
+            guard await waitForUsableTracking(operation: operation),
+                  isOperationActive(operation),
+                  let pose = ar.pose else {
+                if await stopTransportForActiveOperation(operation) {
+                    setStateIfCurrent(.failed("AR tracking did not recover in time."), operation: operation)
                     RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "tracking_unavailable"])
                 }
                 return
@@ -299,8 +410,8 @@ public final class NavigationController {
             replanCounter += 1
             if replanCounter % 10 == 0,
                !planAndStore(from: pose.position, to: goal) {
-                try? await control.stop()
-                state = .failed("No path to goal after replanning.")
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(.failed("No path to goal after replanning."), operation: operation)
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "replan_failed",
                     "distance_to_goal": Self.formatMeters(distanceToGoal)
@@ -310,6 +421,7 @@ public final class NavigationController {
 
             // Safety gate.
             let lastAck = await control.lastAckAt
+            guard isOperationActive(operation) else { return }
             let now = Date()
             let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
                                                lastAckAt: lastAck,
@@ -321,8 +433,11 @@ public final class NavigationController {
             case .go:
                 break
             case .stopObstacle(let clearance):
-                try? await control.stop()
-                state = Self.stateAfterObstacleStop(pose: pose, goal: goal, clearance: clearance)
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(
+                    Self.stateAfterObstacleStop(pose: pose, goal: goal, clearance: clearance),
+                    operation: operation
+                )
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "obstacle",
                     "clearance": String(format: "%.2f", clearance),
@@ -330,16 +445,16 @@ public final class NavigationController {
                 ])
                 return
             case .stopCommsLost:
-                try? await control.stop()
-                state = .failed("Rover command link lost.")
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(.failed("Rover command link lost."), operation: operation)
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "comms_lost",
                     "ack_age": Self.ackAgeField(lastAckAt: lastAck, now: now)
                 ])
                 return
             case .stopTipping:
-                try? await control.stop()
-                state = .failed("Rover may be tipping.")
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(.failed("Rover may be tipping."), operation: operation)
                 RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "tipping"])
                 return
             }
@@ -352,12 +467,15 @@ public final class NavigationController {
                 let arrivalSafety = ar.depthSafetyObservation(for: arrivalProbe)
                 switch guardLayer.evaluate(command: arrivalProbe, depthSafety: arrivalSafety) {
                 case .allow(_, _):
-                    try? await control.stop()
-                    state = .arrived
+                    guard await stopTransportForActiveOperation(operation) else { return }
+                    setStateIfCurrent(.arrived, operation: operation)
                 case .stopDepth(let observation):
-                    try? await control.stop()
+                    guard await stopTransportForActiveOperation(operation) else { return }
                     let reason = observation.state.telemetryReason
-                    state = .failed("Depth safety stop at arrival: \(reason).")
+                    setStateIfCurrent(
+                        .failed("Depth safety stop at arrival: \(reason)."),
+                        operation: operation
+                    )
                     RuntimeFileLog.append("nav_safety_stop", fields: [
                         "reason": "depth_safety_at_arrival",
                         "depth_state": reason,
@@ -385,8 +503,10 @@ public final class NavigationController {
             if DepthSafetyMotionClass.classify(plannedCommand) == .rotating {
                 guard let recoveredCommand = await rotationSafetyCommand(
                     plannedCommand,
-                    hasSentCommand: hasSentCommand
+                    hasSentCommand: hasSentCommand,
+                    operation: operation
                 ) else { return }
+                guard isOperationActive(operation) else { return }
                 command = recoveredCommand
                 depthSafety = depthSafetyObservation(recoveredCommand)
             } else {
@@ -395,9 +515,9 @@ public final class NavigationController {
                 case .allow(let safeCommand, _):
                     command = safeCommand
                 case .stopDepth(let observation):
-                    try? await control.stop()
+                    guard await stopTransportForActiveOperation(operation) else { return }
                     let reason = observation.state.telemetryReason
-                    state = .failed("Depth safety stop: \(reason).")
+                    setStateIfCurrent(.failed("Depth safety stop: \(reason)."), operation: operation)
                     RuntimeFileLog.append("nav_safety_stop", fields: [
                         "reason": "depth_safety",
                         "depth_state": reason,
@@ -413,8 +533,8 @@ public final class NavigationController {
             if progressWatchdog.observe(distanceToGoal: distanceToGoal,
                                         now: now,
                                         commanded: isCommanded) {
-                try? await control.stop()
-                state = .failed("Navigation stalled.")
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(.failed("Navigation stalled."), operation: operation)
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "no_goal_progress",
                     "distance_to_goal": Self.formatMeters(distanceToGoal),
@@ -435,10 +555,13 @@ public final class NavigationController {
             telemetry["target_approach_slowed"] = command == out.command ? "false" : "true"
             RuntimeFileLog.append("nav_drive_tick", fields: telemetry)
             do {
+                guard isOperationActive(operation) else { return }
                 try await control.sendNavigation(command)
+                guard isOperationActive(operation) else { return }
                 consecutiveCommandFailures = 0
                 hasSentCommand = true
             } catch {
+                guard isOperationActive(operation) else { return }
                 consecutiveCommandFailures += 1
                 RuntimeFileLog.append("nav_command_send_failed", fields: Self.driveTelemetryFields(
                     pose: pose,
@@ -449,26 +572,35 @@ public final class NavigationController {
                     "error": error.localizedDescription,
                     "max_failures": "1"
                 ]) { current, _ in current })
-                try? await control.stop()
-                state = Self.stateAfterCommandFailure(error)
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(Self.stateAfterCommandFailure(error), operation: operation)
                 RuntimeFileLog.append("nav_command_failed", fields: [
                     "error": error.localizedDescription,
                     "state": state.description
                 ])
                 return
             }
-            try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            do {
+                try await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            } catch {
+                break
+            }
         }
-        try? await control.stop()
+        await finishCancelledOperationIfCurrent(operation)
     }
 
-    private func waitForUsableTracking() async -> Bool {
+    private func waitForUsableTracking(operation: OperationToken) async -> Bool {
+        guard isOperationActive(operation) else { return false }
         if Self.isNavigationObservationUsable(ar.latestObservation) { return true }
-        try? await control.stop()
+        guard await stopTransportForActiveOperation(operation) else { return false }
         let deadline = Date().addingTimeInterval(trackingRecoveryTimeout)
-        while !Task.isCancelled, Date() < deadline {
+        while isOperationActive(operation), Date() < deadline {
             if Self.isNavigationObservationUsable(ar.latestObservation) { return true }
-            try? await Task.sleep(for: .seconds(RoverConfig.navigationTrackingPollInterval))
+            do {
+                try await Task.sleep(for: .seconds(RoverConfig.navigationTrackingPollInterval))
+            } catch {
+                return false
+            }
         }
         return false
     }
@@ -492,25 +624,31 @@ public final class NavigationController {
         return true
     }
 
-    private func performContinuousRotation(to targetYaw: Double) async {
+    private func performContinuousRotation(to targetYaw: Double,
+                                           operation: OperationToken) async {
         var hasSentCommand = false
-        while !Task.isCancelled {
+        while isOperationActive(operation) {
             guard let pose = ar.pose else {
-                try? await control.stop()
-                state = .failed("AR tracking pose became unavailable during rotation.")
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(
+                    .failed("AR tracking pose became unavailable during rotation."),
+                    operation: operation
+                )
                 return
             }
             let error = normalizeAngle(targetYaw - pose.yaw)
             if abs(error) <= 0.05 {
-                try? await control.stop()
-                state = .arrived
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(.arrived, operation: operation)
                 return
             }
             let plannedCommand = RotationCommand.command(forYawError: error)
             guard let cmd = await rotationSafetyCommand(
                 plannedCommand,
-                hasSentCommand: hasSentCommand
+                hasSentCommand: hasSentCommand,
+                operation: operation
             ) else { return }
+            guard isOperationActive(operation) else { return }
             RuntimeFileLog.append("nav_rotate_tick", fields: [
                 "pose_x": Self.formatMeters(pose.position.x),
                 "pose_y": Self.formatMeters(pose.position.y),
@@ -524,43 +662,47 @@ public final class NavigationController {
             ])
             do {
                 try await control.sendNavigation(cmd)
+                guard isOperationActive(operation) else { return }
                 hasSentCommand = true
             } catch {
-                try? await control.stop()
-                state = Self.stateAfterCommandFailure(error)
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(Self.stateAfterCommandFailure(error), operation: operation)
                 RuntimeFileLog.append("nav_command_failed", fields: [
                     "error": error.localizedDescription,
                     "state": state.description
                 ])
                 return
             }
-            try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            do {
+                try await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            } catch {
+                break
+            }
         }
-        try? await control.stop()
+        await finishCancelledOperationIfCurrent(operation)
     }
 
     private func performScanRotation(from scanStartPose: Pose2D,
                                      requestedScanAngle: Double,
-                                     operationID: UInt64) async {
-        defer { ar.endRelativeHeadingMeasurement() }
+                                     operation: OperationToken) async {
         var scanPulseCount = 0
         var hasSentCommand = false
 
-        while !Task.isCancelled, isCurrentOperation(operationID) {
+        while isOperationActive(operation) {
             guard let pose = ar.pose else {
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 setStateIfCurrent(
                     .failed("AR tracking pose became unavailable during rotation."),
-                    operationID: operationID
+                    operation: operation
                 )
                 return
             }
             let measurement = ar.relativeHeadingMeasurement()
             guard measurement.reliability == .reliable else {
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 setStateIfCurrent(
                     .failed(Self.relativeHeadingFailureMessage(measurement.reliability)),
-                    operationID: operationID
+                    operation: operation
                 )
                 RuntimeFileLog.append("nav_scan_heading_unreliable", fields: [
                     "reason": Self.relativeHeadingReliabilityDescription(measurement.reliability),
@@ -574,7 +716,7 @@ public final class NavigationController {
                 accumulatedAngle: measurement.accumulatedAngle,
                 tolerance: RoverConfig.scanTurnYawTolerance
             ) {
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 let directedTurn = requestedScanAngle >= 0
                     ? measurement.accumulatedAngle
                     : -measurement.accumulatedAngle
@@ -584,7 +726,7 @@ public final class NavigationController {
                     "overshoot_deg": Self.formatDegrees(max(0, directedTurn - abs(requestedScanAngle))),
                     "pulses": "\(scanPulseCount)"
                 ])
-                setStateIfCurrent(.arrived, operationID: operationID)
+                setStateIfCurrent(.arrived, operation: operation)
                 return
             }
 
@@ -592,10 +734,10 @@ public final class NavigationController {
                 requestedAngle: requestedScanAngle,
                 accumulatedAngle: measurement.accumulatedAngle
             ) {
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 setStateIfCurrent(
                     .failed("Scan turn moved opposite the requested direction."),
-                    operationID: operationID
+                    operation: operation
                 )
                 RuntimeFileLog.append("nav_scan_opposite_direction", fields: [
                     "requested_deg": Self.formatDegrees(requestedScanAngle),
@@ -605,10 +747,10 @@ public final class NavigationController {
             }
 
             if Self.scanPulseLimitReached(scanPulseCount) {
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 setStateIfCurrent(
                     .failed("Scan turn could not establish a reliable heading."),
-                    operationID: operationID
+                    operation: operation
                 )
                 RuntimeFileLog.append("nav_scan_pulse_limit", fields: [
                     "pulses": "\(scanPulseCount)",
@@ -627,9 +769,10 @@ public final class NavigationController {
             let plannedCommand = RotationCommand.command(forYawError: error)
             guard let command = await rotationSafetyCommand(
                 plannedCommand,
-                hasSentCommand: hasSentCommand
+                hasSentCommand: hasSentCommand,
+                operation: operation
             ) else { return }
-            guard !Task.isCancelled, isCurrentOperation(operationID) else { return }
+            guard isOperationActive(operation) else { return }
             let pulseDuration = Self.scanPulseDuration()
             RuntimeFileLog.append("nav_rotate_tick", fields: [
                 "pose_x": Self.formatMeters(pose.position.x),
@@ -648,10 +791,11 @@ public final class NavigationController {
 
             do {
                 try await control.sendNavigation(command)
+                guard isOperationActive(operation) else { return }
                 hasSentCommand = true
             } catch {
-                await stopScanTransportIfCurrent(operationID: operationID)
-                setStateIfCurrent(Self.stateAfterCommandFailure(error), operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
+                setStateIfCurrent(Self.stateAfterCommandFailure(error), operation: operation)
                 RuntimeFileLog.append("nav_command_failed", fields: [
                     "error": error.localizedDescription,
                     "state": state.description
@@ -668,8 +812,7 @@ public final class NavigationController {
             } catch {
                 return
             }
-            guard isCurrentOperation(operationID) else { return }
-            await stopScanTransportIfCurrent(operationID: operationID)
+            guard await stopTransportForActiveOperation(operation) else { return }
             RuntimeFileLog.append("nav_scan_turn_settle", fields: [
                 "pulse_seconds": Self.formatSeconds(pulseDuration),
                 "settle_seconds": Self.formatSeconds(RoverConfig.scanTurnSettleDuration)
@@ -681,15 +824,17 @@ public final class NavigationController {
             } catch {
                 return
             }
-            guard isCurrentOperation(operationID) else { return }
+            guard isOperationActive(operation) else { return }
 
-            guard let freshPose = await waitForFreshScanPose(afterFrame: frameBeforePulse) else {
+            guard let freshPose = await waitForFreshScanPose(
+                afterFrame: frameBeforePulse,
+                operation: operation
+            ), isOperationActive(operation) else {
                 if Task.isCancelled { return }
-                guard isCurrentOperation(operationID) else { return }
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 setStateIfCurrent(
                     .failed("ARKit did not provide a fresh tracked frame after scan turn."),
-                    operationID: operationID
+                    operation: operation
                 )
                 RuntimeFileLog.append("nav_scan_frame_unavailable", fields: [
                     "timeout_seconds": Self.formatSeconds(RoverConfig.scanFrameFreshnessTimeout)
@@ -699,10 +844,10 @@ public final class NavigationController {
 
             let settledMeasurement = ar.relativeHeadingMeasurement()
             guard settledMeasurement.reliability == .reliable else {
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 setStateIfCurrent(
                     .failed(Self.relativeHeadingFailureMessage(settledMeasurement.reliability)),
-                    operationID: operationID
+                    operation: operation
                 )
                 RuntimeFileLog.append("nav_scan_heading_unreliable", fields: [
                     "reason": Self.relativeHeadingReliabilityDescription(settledMeasurement.reliability),
@@ -730,12 +875,12 @@ public final class NavigationController {
                 to: freshPose,
                 accumulatedAngle: settledMeasurement.accumulatedAngle
             ) else {
-                await stopScanTransportIfCurrent(operationID: operationID)
+                guard await stopTransportForActiveOperation(operation) else { return }
                 let translation = scanStartPose.position.distance(to: freshPose.position)
                 if translation >= RoverConfig.scanPoseJumpTranslation {
                     setStateIfCurrent(
                         .failed("Rover moved unexpectedly during an in-place scan."),
-                        operationID: operationID
+                        operation: operation
                     )
                     RuntimeFileLog.append("nav_scan_translation_jump", fields: [
                         "meters": Self.formatMeters(translation)
@@ -743,7 +888,7 @@ public final class NavigationController {
                 } else {
                     setStateIfCurrent(
                         .failed("AR and inertial scan headings disagreed after settling."),
-                        operationID: operationID
+                        operation: operation
                     )
                     RuntimeFileLog.append("nav_scan_heading_disagreement", fields: [
                         "ar_rotation_deg": Self.formatDegrees(arRotation),
@@ -754,16 +899,19 @@ public final class NavigationController {
                 return
             }
         }
-        guard !Task.isCancelled else { return }
-        await stopScanTransportIfCurrent(operationID: operationID)
+        _ = await stopTransportForActiveOperation(operation)
     }
 
     private func rotationSafetyCommand(_ command: WheelCommand,
-                                       hasSentCommand: Bool) async -> WheelCommand? {
+                                       hasSentCommand: Bool,
+                                       operation: OperationToken) async -> WheelCommand? {
+        guard isOperationActive(operation) else { return nil }
         guard await rotationGeneralSafetyAllowsMotion(
             command,
-            requireFreshAck: hasSentCommand
+            requireFreshAck: hasSentCommand,
+            operation: operation
         ) else { return nil }
+        guard isOperationActive(operation) else { return nil }
 
         let depthSafety = depthSafetyObservation(command)
         switch guardLayer.evaluate(command: command, depthSafety: depthSafety) {
@@ -773,7 +921,7 @@ public final class NavigationController {
             var stoppingObservation = observation
             if observation.state == .unavailable(.blindSweptVolume),
                observation.motionClass == .rotating {
-                try? await control.stop()
+                guard await stopTransportForActiveOperation(operation) else { return nil }
                 let depthVersion = ar.depthSnapshotVersion
                 RuntimeFileLog.append("nav_scan_depth_retry_started", fields: [
                     "depth_version": String(depthVersion),
@@ -782,14 +930,19 @@ public final class NavigationController {
                 let deadline = Date().addingTimeInterval(scanDepthRecoveryTimeout)
                 while ar.depthSnapshotVersion <= depthVersion,
                       Date() < deadline,
-                      !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(RoverConfig.scanDepthRecoveryPollInterval))
+                      isOperationActive(operation) {
+                    do {
+                        try await Task.sleep(for: .seconds(RoverConfig.scanDepthRecoveryPollInterval))
+                    } catch {
+                        return nil
+                    }
                 }
-                guard !Task.isCancelled else { return nil }
+                guard isOperationActive(operation) else { return nil }
                 guard ar.depthSnapshotVersion > depthVersion else {
-                    try? await control.stop()
-                    state = .failed(
-                        "I can’t safely see the space needed to turn. Reposition the rover or camera and try again."
+                    guard await stopTransportForActiveOperation(operation) else { return nil }
+                    setStateIfCurrent(
+                        .failed("I can’t safely see the space needed to turn. Reposition the rover or camera and try again."),
+                        operation: operation
                     )
                     RuntimeFileLog.append("nav_scan_depth_retry_timeout", fields: [
                         "depth_version": String(depthVersion),
@@ -810,8 +963,10 @@ public final class NavigationController {
                 case .allow(let safeCommand, let safeObservation):
                     guard await rotationGeneralSafetyAllowsMotion(
                         safeCommand,
-                        requireFreshAck: true
+                        requireFreshAck: true,
+                        operation: operation
                     ) else { return nil }
+                    guard isOperationActive(operation) else { return nil }
                     RuntimeFileLog.append("nav_scan_depth_original_authorized", fields: [
                         "depth_state": safeObservation.state.telemetryReason,
                         "support_count": String(safeObservation.supportCount),
@@ -830,8 +985,10 @@ public final class NavigationController {
                     case .allow(let safeArcCommand, let safeObservation):
                         guard await rotationGeneralSafetyAllowsMotion(
                             safeArcCommand,
-                            requireFreshAck: true
+                            requireFreshAck: true,
+                            operation: operation
                         ) else { return nil }
+                        guard isOperationActive(operation) else { return nil }
                         RuntimeFileLog.append("nav_scan_depth_visible_arc", fields: [
                             "original_depth_state": observation.state.telemetryReason,
                             "arc_depth_state": safeObservation.state.telemetryReason,
@@ -850,14 +1007,16 @@ public final class NavigationController {
                     }
                 }
             }
-            try? await control.stop()
+            guard await stopTransportForActiveOperation(operation) else { return nil }
             if observation.state == .unavailable(.blindSweptVolume) {
-                state = .failed(
-                    "I can’t safely see the space needed to turn. Reposition the rover or camera and try again."
+                setStateIfCurrent(
+                    .failed("I can’t safely see the space needed to turn. Reposition the rover or camera and try again."),
+                    operation: operation
                 )
             } else {
-                state = .failed(
-                    "Depth safety stop while rotating: \(stoppingObservation.state.telemetryReason)."
+                setStateIfCurrent(
+                    .failed("Depth safety stop while rotating: \(stoppingObservation.state.telemetryReason)."),
+                    operation: operation
                 )
             }
             RuntimeFileLog.append("nav_safety_stop", fields: [
@@ -873,9 +1032,12 @@ public final class NavigationController {
 
     private func rotationGeneralSafetyAllowsMotion(
         _ command: WheelCommand,
-        requireFreshAck: Bool
+        requireFreshAck: Bool,
+        operation: OperationToken
     ) async -> Bool {
+        guard isOperationActive(operation) else { return false }
         let lastAck = await control.lastAckAt
+        guard isOperationActive(operation) else { return false }
         let now = Date()
         let motionClass = DepthSafetyMotionClass.classify(command)
         let decision = guardLayer.evaluate(
@@ -890,30 +1052,32 @@ public final class NavigationController {
         case .go:
             return true
         case .stopObstacle(let clearance):
-            try? await control.stop()
-            state = .failed(Self.obstacleMessage(clearance: clearance))
+            guard await stopTransportForActiveOperation(operation) else { return false }
+            setStateIfCurrent(.failed(Self.obstacleMessage(clearance: clearance)), operation: operation)
             RuntimeFileLog.append("nav_safety_stop", fields: [
                 "reason": "obstacle_while_rotating",
                 "clearance": String(format: "%.2f", clearance)
             ])
         case .stopCommsLost:
-            try? await control.stop()
-            state = .failed("Rover command link lost.")
+            guard await stopTransportForActiveOperation(operation) else { return false }
+            setStateIfCurrent(.failed("Rover command link lost."), operation: operation)
             RuntimeFileLog.append("nav_safety_stop", fields: [
                 "reason": "comms_lost_while_rotating",
                 "ack_age": Self.ackAgeField(lastAckAt: lastAck, now: now)
             ])
         case .stopTipping:
-            try? await control.stop()
-            state = .failed("Rover may be tipping.")
+            guard await stopTransportForActiveOperation(operation) else { return false }
+            setStateIfCurrent(.failed("Rover may be tipping."), operation: operation)
             RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "tipping_while_rotating"])
         }
         return false
     }
 
-    private func waitForReliableRelativeHeading() async -> RelativeHeadingMeasurement? {
+    private func waitForReliableRelativeHeading(
+        operation: OperationToken
+    ) async -> RelativeHeadingMeasurement? {
         let deadline = Date().addingTimeInterval(RoverConfig.scanFrameFreshnessTimeout)
-        while !Task.isCancelled, Date() < deadline {
+        while isOperationActive(operation), Date() < deadline {
             let measurement = ar.relativeHeadingMeasurement()
             if measurement.reliability == .reliable {
                 return measurement
@@ -923,14 +1087,21 @@ public final class NavigationController {
                reason != .staleSample {
                 return nil
             }
-            try? await Task.sleep(for: .seconds(RoverConfig.scanFramePollInterval))
+            do {
+                try await Task.sleep(for: .seconds(RoverConfig.scanFramePollInterval))
+            } catch {
+                return nil
+            }
         }
         return nil
     }
 
-    private func waitForFreshScanPose(afterFrame baseline: UInt64) async -> Pose2D? {
+    private func waitForFreshScanPose(
+        afterFrame baseline: UInt64,
+        operation: OperationToken
+    ) async -> Pose2D? {
         let deadline = Date().addingTimeInterval(RoverConfig.scanFrameFreshnessTimeout)
-        while !Task.isCancelled, Date() < deadline {
+        while isOperationActive(operation), Date() < deadline {
             let currentFrame = ar.frameSequence
             let pose = ar.pose
             if Self.isScanFrameReady(
@@ -941,7 +1112,11 @@ public final class NavigationController {
             ), let pose {
                 return pose
             }
-            try? await Task.sleep(for: .seconds(RoverConfig.scanFramePollInterval))
+            do {
+                try await Task.sleep(for: .seconds(RoverConfig.scanFramePollInterval))
+            } catch {
+                return nil
+            }
         }
         return nil
     }
