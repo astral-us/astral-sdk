@@ -1457,6 +1457,55 @@ final class MissionAgentTests: XCTestCase {
         )
     }
 
+    func testCallerCancellationDuringBlockedReturnRecoveryStopsIndependentRotation() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.arrived, .failed("Obstacle ahead")]
+        motion.scanRotationUsesIndependentTask = true
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.unprojectResult = Vec2(1, 0)
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(1, 0), yaw: .pi)
+        }
+        let recoveryStarted = expectation(description: "blocked return recovery started")
+        let recoveryCancelled = expectation(description: "blocked return recovery cancelled")
+        motion.onScanRotate = { _ in recoveryStarted.fulfill() }
+        motion.onCancel = { recoveryCancelled.fulfill() }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            blockedHeadingRecoveryTimeout: 0.15,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        let mission = Task { @MainActor in
+            await agent.handle("Go to the refrigerator and come back")
+        }
+        await fulfillment(of: [recoveryStarted], timeout: 1)
+        mission.cancel()
+        await fulfillment(of: [recoveryCancelled], timeout: 0.1)
+        if motion.cancelCallCount == 0 {
+            motion.cancel()
+        }
+        await mission.value
+
+        XCTAssertEqual(motion.navigateCalls.count, 2)
+        XCTAssertEqual(
+            statuses.first { $0.id == 1 && $0.isTerminal },
+            .cancelled(id: 1, command: "Go to the refrigerator and come back")
+        )
+    }
+
     func testCallerCancellationImmediatelyBeforeOfflineReturnSuccessWinsTerminalBoundary() async {
         let motion = FakeMotion()
         motion.navigateOutcomes = [.arrived, .arrived]

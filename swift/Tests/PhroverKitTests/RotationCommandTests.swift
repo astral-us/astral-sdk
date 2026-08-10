@@ -26,7 +26,82 @@ final class RotationCommandTests: XCTestCase {
         scanAwait.cancel()
 
         await fulfillment(of: [rotationCancelled, stopCompleted], timeout: 1)
+        _ = await scanAwait.value
+    }
+
+    func testCancellingScanRunsSuspendingTransportStopInFreshTask() async {
+        let rotationCancelled = expectation(description: "independent rotation cancelled")
+        let stopCompleted = expectation(description: "suspending transport stop completed")
+        let rotation = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch is CancellationError {
+                rotationCancelled.fulfill()
+            } catch {
+                XCTFail("Unexpected scan task error: \(error)")
+            }
+        }
+        let scanAwait = Task { @MainActor in
+            _ = await NavigationController.awaitScanRotationTask(
+                rotation,
+                isCurrentOperation: { true }
+            ) {
+                XCTAssertFalse(Task.isCancelled)
+                do {
+                    try await Task.sleep(for: .milliseconds(20))
+                    stopCompleted.fulfill()
+                } catch {
+                    XCTFail("Transport stop inherited caller cancellation: \(error)")
+                }
+            }
+        }
+
+        await Task.yield()
+        scanAwait.cancel()
+
+        await fulfillment(of: [rotationCancelled, stopCompleted], timeout: 1)
         await scanAwait.value
+    }
+
+    func testStaleScanCompletionDoesNotStopOrIdleReplacementOperation() async {
+        let rotationCancelled = expectation(description: "stale rotation cancelled")
+        let replacementStarted = expectation(description: "replacement operation started")
+        var activeOperation = 1
+        var state = NavigationController.State.driving
+        var stopCallCount = 0
+        let rotation = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch is CancellationError {
+                rotationCancelled.fulfill()
+                try? await Task.sleep(for: .milliseconds(30))
+            } catch {
+                XCTFail("Unexpected scan task error: \(error)")
+            }
+        }
+        let scanAwait = Task { @MainActor in
+            let stillOwnsOperation = await NavigationController.awaitScanRotationTask(
+                rotation,
+                isCurrentOperation: { activeOperation == 1 }
+            ) {
+                stopCallCount += 1
+            }
+            if Task.isCancelled, stillOwnsOperation {
+                state = .idle
+            }
+        }
+
+        await Task.yield()
+        scanAwait.cancel()
+        activeOperation = 2
+        state = .driving
+        replacementStarted.fulfill()
+
+        await fulfillment(of: [rotationCancelled, replacementStarted], timeout: 1)
+        await scanAwait.value
+
+        XCTAssertEqual(stopCallCount, 0)
+        XCTAssertEqual(state, .driving)
     }
 
     func testScanFailureWithoutTrackedPoseAwaitsTransportStop() async {

@@ -232,6 +232,11 @@ public final class MissionAgent {
         case cancelled
     }
 
+    private enum BlockedHeadingRecoveryOutcome: Equatable {
+        case completed
+        case cancelled
+    }
+
     public private(set) var phase: Phase = .idle {
         didSet {
             guard phase != oldValue else { return }
@@ -2205,7 +2210,10 @@ public final class MissionAgent {
                     "reason": reason,
                     "recovery": recoveryDescription
                 ])
-                await rotateForBlockedHeadingRecovery(missionID: missionID)
+                guard await rotateForBlockedHeadingRecovery(missionID: missionID) == .completed else {
+                    cancelActiveMotion(missionID: missionID, reason: "cancelled_during_return_recovery")
+                    return .cancelled
+                }
                 guard !missionCancellationDetected(missionID) else {
                     cancelActiveMotion(missionID: missionID, reason: "cancelled_during_return_recovery")
                     return .cancelled
@@ -2376,7 +2384,10 @@ public final class MissionAgent {
                 "reason": reason,
                 "recovery": recoveryDescription
             ])
-            await rotateForBlockedHeadingRecovery(missionID: missionID)
+            guard await rotateForBlockedHeadingRecovery(missionID: missionID) == .completed else {
+                cancelActiveMotion(missionID: missionID, reason: "cancelled_during_blocked_recovery")
+                return true
+            }
             guard case .failed(let recoveryReason) = motion.state else { return false }
             voice.speak(recoveryReason)
             phase = .idle
@@ -2413,7 +2424,13 @@ public final class MissionAgent {
         String(format: "rotate_%.0fdeg", blockedHeadingRecoveryAngle * 180 / .pi)
     }
 
-    private func rotateForBlockedHeadingRecovery(missionID: Int) async {
+    private func rotateForBlockedHeadingRecovery(
+        missionID: Int
+    ) async -> BlockedHeadingRecoveryOutcome {
+        guard !missionCancellationDetected(missionID) else {
+            cancelActiveMotion(missionID: missionID, reason: "cancelled_before_blocked_recovery")
+            return .cancelled
+        }
         let angle = blockedHeadingRecoveryAngle
         let timeout = blockedHeadingRecoveryTimeout
         let initialState = motion.state
@@ -2424,6 +2441,13 @@ public final class MissionAgent {
         let deadline = Date().addingTimeInterval(timeout)
         var sawDriving = false
         while Date() < deadline {
+            guard !missionCancellationDetected(missionID) else {
+                return await cancelBlockedHeadingRecovery(
+                    rotation,
+                    missionID: missionID,
+                    reason: "cancelled_during_blocked_recovery"
+                )
+            }
             let currentState = motion.state
             if currentState == .driving {
                 sawDriving = true
@@ -2432,9 +2456,30 @@ public final class MissionAgent {
                         || (currentState != initialState && currentState != .idle) {
                 break
             }
-            try? await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            do {
+                try await Task.sleep(for: .seconds(RoverConfig.commandInterval))
+            } catch is CancellationError {
+                return await cancelBlockedHeadingRecovery(
+                    rotation,
+                    missionID: missionID,
+                    reason: "cancelled_while_waiting_for_blocked_recovery"
+                )
+            } catch {
+                return await cancelBlockedHeadingRecovery(
+                    rotation,
+                    missionID: missionID,
+                    reason: "blocked_recovery_wait_interrupted"
+                )
+            }
         }
 
+        guard !missionCancellationDetected(missionID) else {
+            return await cancelBlockedHeadingRecovery(
+                rotation,
+                missionID: missionID,
+                reason: "cancelled_after_blocked_recovery"
+            )
+        }
         if motion.state == .driving || motion.state == initialState {
             RuntimeFileLog.append("mission_blocked_heading_recovery_timeout", fields: [
                 "mission": "\(missionID)",
@@ -2442,6 +2487,7 @@ public final class MissionAgent {
                 "timeout": String(format: "%.2f", timeout)
             ])
             motion.cancel()
+            rotation.cancel()
         } else {
             RuntimeFileLog.append("mission_blocked_heading_recovery_settled", fields: [
                 "mission": "\(missionID)",
@@ -2449,6 +2495,22 @@ public final class MissionAgent {
             ])
         }
         await rotation.value
+        guard !missionCancellationDetected(missionID) else {
+            cancelActiveMotion(missionID: missionID, reason: "cancelled_after_blocked_recovery_settled")
+            return .cancelled
+        }
+        return .completed
+    }
+
+    private func cancelBlockedHeadingRecovery(
+        _ rotation: Task<Void, Never>,
+        missionID: Int,
+        reason: String
+    ) async -> BlockedHeadingRecoveryOutcome {
+        cancelActiveMotion(missionID: missionID, reason: reason)
+        rotation.cancel()
+        await rotation.value
+        return .cancelled
     }
 
     private static func isBlockedHeading(_ reason: String) -> Bool {
