@@ -212,10 +212,9 @@ public final class SpeechRoverVoice: RoverVoice {
 /// execute it, and repeat — until the brain says `.stop`/`.done`, or it asks a question
 /// that goes unanswered and has nothing left to try.
 ///
-/// There is deliberately no special-cased command grammar here (no "and back" parsing, no
-/// place-naming syntax). The operator's words and the rover's `MissionMemory` are just
-/// inputs to whichever `RoverBrain` is current; behaviors like returning to a remembered
-/// pose emerge from the brain reading that memory, not from code in this class.
+/// Normal missions remain brain-driven. When every configured brain fails before a first
+/// decision, a bounded deterministic parser handles the supported offline object-navigation
+/// contract, including optional color, other-room search, and explicitly requested return.
 @Observable
 @MainActor
 public final class MissionAgent {
@@ -237,6 +236,7 @@ public final class MissionAgent {
     private enum BlockedHeadingRecoveryOutcome: Equatable {
         case completed
         case cancelled
+        case sessionGenerationChanged
     }
 
     private enum RoomTraversalOutcome {
@@ -672,10 +672,38 @@ public final class MissionAgent {
                 guard remainingScanSteps > 0 else { break }
                 remainingScanSteps -= 1
                 phase = .acting
-                await motion.rotateForScan(by: .pi / 6)
+                let frameBeforeTurn = perception.frameSequence
+                switch await rotateForScanRespectingCancellation(
+                    by: .pi / 6,
+                    expectedSessionGeneration: sessionGeneration
+                ) {
+                case .completed:
+                    break
+                case .cancelled:
+                    return .cancelled
+                case .sessionGenerationChanged:
+                    roomTraversalExhaustionFields = ["scan_step": String(scanStep)]
+                    return .exhausted("session_generation_changed")
+                }
                 if case .failed(let reason) = motion.state {
                     roomTraversalExhaustionFields = ["scan_step": String(scanStep)]
                     return .exhausted(reason)
+                }
+                switch await waitForFreshTrackedPerceptionFrame(
+                    newerThan: frameBeforeTurn,
+                    expectedSessionGeneration: sessionGeneration,
+                    missionID: missionID
+                ) {
+                case .ready:
+                    break
+                case .cancelled:
+                    return .cancelled
+                case .sessionGenerationChanged:
+                    roomTraversalExhaustionFields = ["scan_step": String(scanStep)]
+                    return .exhausted("session_generation_changed")
+                case .timedOut:
+                    roomTraversalExhaustionFields = ["scan_step": String(scanStep)]
+                    return .exhausted("fresh_frame_timeout")
                 }
                 continue
             }
@@ -1460,8 +1488,7 @@ public final class MissionAgent {
                 ])
                 return
             }
-            if intent.searchOtherRooms,
-               topology?.snapshot.sessionGeneration != sessionGeneration {
+            if sessionGenerationChanged(from: sessionGeneration) {
                 failOfflineObjectMission(
                     missionID: missionID,
                     message: failureMessage,
@@ -1480,7 +1507,7 @@ public final class MissionAgent {
                     missionID: missionID,
                     scanSteps: &scanSteps,
                     requireNewFrameAfterInitialTurn: requiresFreshScanTurn,
-                    expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil,
+                    expectedSessionGeneration: sessionGeneration,
                     requireTrackedFrame: requiresFreshScanTurn
                 ) {
                 case .found(let scannedGoal):
@@ -1629,9 +1656,9 @@ public final class MissionAgent {
         navigate(to: goal, for: target)
         guard await waitForMotionToSettle(
             missionID: missionID,
-            expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil
+            expectedSessionGeneration: sessionGeneration
         ) else {
-            if sessionGenerationChanged(from: intent.searchOtherRooms ? sessionGeneration : nil) {
+            if sessionGenerationChanged(from: sessionGeneration) {
                 failOfflineObjectMission(
                     missionID: missionID,
                     message: failureMessage,
@@ -1671,8 +1698,7 @@ public final class MissionAgent {
             "stop_distance": String(format: "%.2f", RoverConfig.visualTargetStopDistance)
         ])
 
-        if intent.searchOtherRooms,
-           topology?.snapshot.sessionGeneration != sessionGeneration {
+        if sessionGenerationChanged(from: sessionGeneration) {
             failOfflineObjectMission(
                 missionID: missionID,
                 message: failureMessage,
@@ -1809,7 +1835,7 @@ public final class MissionAgent {
             switch await alignHeadingForReturn(
                 to: start.position,
                 missionID: missionID,
-                expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil
+                expectedSessionGeneration: sessionGeneration
             ) {
             case .cancelled:
                 RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
@@ -1840,7 +1866,7 @@ public final class MissionAgent {
             switch await navigateReturn(
                 to: start.position,
                 missionID: missionID,
-                expectedSessionGeneration: intent.searchOtherRooms ? sessionGeneration : nil
+                expectedSessionGeneration: sessionGeneration
             ) {
             case .cancelled:
                 RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
@@ -2369,6 +2395,59 @@ public final class MissionAgent {
         case sessionGenerationChanged
     }
 
+    private enum FreshTrackedFrameWaitOutcome {
+        case ready
+        case timedOut
+        case cancelled
+        case sessionGenerationChanged
+    }
+
+    private func waitForFreshTrackedPerceptionFrame(
+        newerThan baseline: UInt64?,
+        expectedSessionGeneration: UInt64?,
+        missionID: Int
+    ) async -> FreshTrackedFrameWaitOutcome {
+        guard let expectedSessionGeneration else { return .ready }
+        guard !missionCancellationDetected(missionID) else { return .cancelled }
+        guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+            await motion.stopAndWait()
+            return .sessionGenerationChanged
+        }
+        guard let baseline else {
+            RuntimeFileLog.append("mission_fresh_frame_unavailable", fields: [
+                "mission": "\(missionID)",
+                "reason": "missing_frame_sequence"
+            ])
+            return .timedOut
+        }
+        let deadline = Date().addingTimeInterval(RoverConfig.scanFrameFreshnessTimeout)
+
+        while Date() < deadline {
+            guard !missionCancellationDetected(missionID) else { return .cancelled }
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                await motion.stopAndWait()
+                return .sessionGenerationChanged
+            }
+            if let observation = perception.latestObservation,
+               observation.frameSequence > baseline,
+               observation.trackingQuality == .normal,
+               observation.sessionGeneration == expectedSessionGeneration {
+                return .ready
+            }
+            if roomTransitionPollInterval > 0 {
+                do {
+                    try await Task.sleep(for: .seconds(roomTransitionPollInterval))
+                } catch {
+                    return .cancelled
+                }
+            } else {
+                await Task.yield()
+            }
+        }
+
+        return .timedOut
+    }
+
     private func waitForVisualTarget(query: String,
                                      missionID: Int,
                                      newerThanFrame frameBaseline: UInt64? = nil,
@@ -2761,9 +2840,17 @@ public final class MissionAgent {
                     "reason": reason,
                     "recovery": recoveryDescription
                 ])
-                guard await rotateForBlockedHeadingRecovery(missionID: missionID) == .completed else {
+                switch await rotateForBlockedHeadingRecovery(
+                    missionID: missionID,
+                    expectedSessionGeneration: expectedSessionGeneration
+                ) {
+                case .completed:
+                    break
+                case .cancelled:
                     cancelActiveMotion(missionID: missionID, reason: "cancelled_during_return_recovery")
                     return .cancelled
+                case .sessionGenerationChanged:
+                    return .sessionGenerationChanged
                 }
                 guard !missionCancellationDetected(missionID) else {
                     cancelActiveMotion(missionID: missionID, reason: "cancelled_during_return_recovery")
@@ -3000,92 +3087,71 @@ public final class MissionAgent {
     }
 
     private func rotateForBlockedHeadingRecovery(
-        missionID: Int
+        missionID: Int,
+        expectedSessionGeneration: UInt64? = nil
     ) async -> BlockedHeadingRecoveryOutcome {
         guard !missionCancellationDetected(missionID) else {
             cancelActiveMotion(missionID: missionID, reason: "cancelled_before_blocked_recovery")
             return .cancelled
         }
-        let angle = blockedHeadingRecoveryAngle
-        let timeout = blockedHeadingRecoveryTimeout
-        let initialState = motion.state
-        let rotation = Task { @MainActor in
-            await motion.rotateForScan(by: angle)
+        guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+            await motion.stopAndWait()
+            return .sessionGenerationChanged
+        }
+        let race = BlockedHeadingRecoveryRace()
+        let outcome = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                race.start(
+                    motion: motion,
+                    topology: roomTopology,
+                    expectedSessionGeneration: expectedSessionGeneration,
+                    missionIsCancelled: { [weak self] in
+                        self?.missionCancellationDetected(missionID) ?? true
+                    },
+                    angle: blockedHeadingRecoveryAngle,
+                    timeout: blockedHeadingRecoveryTimeout,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { @MainActor in race.cancel() }
         }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        var sawDriving = false
-        while Date() < deadline {
-            guard !missionCancellationDetected(missionID) else {
-                return await cancelBlockedHeadingRecovery(
-                    rotation,
-                    missionID: missionID,
-                    reason: "cancelled_during_blocked_recovery"
-                )
-            }
-            let currentState = motion.state
-            if currentState == .driving {
-                sawDriving = true
-            } else if currentState == .arrived
-                        || (sawDriving && currentState == .idle)
-                        || (currentState != initialState && currentState != .idle) {
-                break
-            }
-            do {
-                try await Task.sleep(for: .seconds(RoverConfig.commandInterval))
-            } catch is CancellationError {
-                return await cancelBlockedHeadingRecovery(
-                    rotation,
-                    missionID: missionID,
-                    reason: "cancelled_while_waiting_for_blocked_recovery"
-                )
-            } catch {
-                return await cancelBlockedHeadingRecovery(
-                    rotation,
-                    missionID: missionID,
-                    reason: "blocked_recovery_wait_interrupted"
-                )
-            }
-        }
-
-        guard !missionCancellationDetected(missionID) else {
-            return await cancelBlockedHeadingRecovery(
-                rotation,
+        switch outcome {
+        case .cancelled:
+            cancelActiveMotion(
                 missionID: missionID,
-                reason: "cancelled_after_blocked_recovery"
+                reason: "cancelled_during_blocked_recovery"
             )
-        }
-        if motion.state == .driving || motion.state == initialState {
+            return .cancelled
+        case .sessionGenerationChanged:
+            cancelActiveMotion(
+                missionID: missionID,
+                reason: "session_generation_changed_during_blocked_recovery"
+            )
+            return .sessionGenerationChanged
+        case .timedOut:
             RuntimeFileLog.append("mission_blocked_heading_recovery_timeout", fields: [
                 "mission": "\(missionID)",
                 "recovery": recoveryDescription,
-                "timeout": String(format: "%.2f", timeout)
+                "timeout": String(format: "%.2f", blockedHeadingRecoveryTimeout)
             ])
-            motion.cancel()
-            rotation.cancel()
-        } else {
+        case .completed:
             RuntimeFileLog.append("mission_blocked_heading_recovery_settled", fields: [
                 "mission": "\(missionID)",
                 "recovery": recoveryDescription
             ])
         }
-        await rotation.value
+
         guard !missionCancellationDetected(missionID) else {
             cancelActiveMotion(missionID: missionID, reason: "cancelled_after_blocked_recovery_settled")
             return .cancelled
         }
+        guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+            await motion.stopAndWait()
+            return .sessionGenerationChanged
+        }
         return .completed
-    }
-
-    private func cancelBlockedHeadingRecovery(
-        _ rotation: Task<Void, Never>,
-        missionID: Int,
-        reason: String
-    ) async -> BlockedHeadingRecoveryOutcome {
-        cancelActiveMotion(missionID: missionID, reason: reason)
-        rotation.cancel()
-        await rotation.value
-        return .cancelled
     }
 
     private static func isBlockedHeading(_ reason: String) -> Bool {
@@ -3156,6 +3222,82 @@ private enum ScanRotationOutcome: Equatable {
     case completed
     case cancelled
     case sessionGenerationChanged
+}
+
+private enum BlockedHeadingRecoveryRaceOutcome {
+    case completed
+    case timedOut
+    case cancelled
+    case sessionGenerationChanged
+}
+
+@MainActor
+private final class BlockedHeadingRecoveryRace {
+    private var continuation: CheckedContinuation<BlockedHeadingRecoveryRaceOutcome, Never>?
+    private var tasks: [Task<Void, Never>] = []
+    private weak var motion: RoverMotion?
+
+    func start(
+        motion: RoverMotion,
+        topology: (any RoomTopologyManaging)?,
+        expectedSessionGeneration: UInt64?,
+        missionIsCancelled: @escaping @MainActor () -> Bool,
+        angle: Double,
+        timeout: TimeInterval,
+        continuation: CheckedContinuation<BlockedHeadingRecoveryRaceOutcome, Never>
+    ) {
+        self.motion = motion
+        self.continuation = continuation
+        tasks = [
+            Task { @MainActor in
+                await motion.rotateForScan(by: angle)
+                self.finish(Task.isCancelled ? .cancelled : .completed)
+            },
+            Task { @MainActor in
+                do {
+                    try await Task.sleep(for: .seconds(timeout))
+                } catch {
+                    return
+                }
+                motion.cancel()
+                self.finish(.timedOut)
+            },
+            Task { @MainActor in
+                while !Task.isCancelled {
+                    if missionIsCancelled() {
+                        motion.cancel()
+                        self.finish(.cancelled)
+                        return
+                    }
+                    if let expectedSessionGeneration,
+                       topology?.snapshot.sessionGeneration != expectedSessionGeneration {
+                        motion.cancel()
+                        self.finish(.sessionGenerationChanged)
+                        return
+                    }
+                    do {
+                        try await Task.sleep(for: .milliseconds(10))
+                    } catch {
+                        return
+                    }
+                }
+            }
+        ]
+    }
+
+    func cancel() {
+        motion?.cancel()
+        finish(.cancelled)
+    }
+
+    private func finish(_ outcome: BlockedHeadingRecoveryRaceOutcome) {
+        guard let continuation else { return }
+        self.continuation = nil
+        let runningTasks = tasks
+        tasks.removeAll()
+        runningTasks.forEach { $0.cancel() }
+        continuation.resume(returning: outcome)
+    }
 }
 
 @MainActor

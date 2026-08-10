@@ -650,7 +650,14 @@ final class RoomTransitionMissionTests: XCTestCase {
         roomTransitionTelemetry: @escaping RoomTopologyTelemetrySink = { _, _ in },
         commandStatusDidChange: ((MissionCommandStatus) -> Void)? = nil
     ) -> MissionAgent {
-        MissionAgent(
+        let existingOnRotate = motion.onRotate
+        motion.onRotate = {
+            existingOnRotate?()
+            perception.publishScanFrame(
+                sessionGeneration: topology.snapshot.sessionGeneration
+            )
+        }
+        return MissionAgent(
             motion: motion,
             perception: perception,
             voice: voice,
@@ -735,6 +742,8 @@ private final class RoomMissionPerception: RoverPerception {
     }
     var frontiers: [Frontier]
     var observationQueue: [PoseObservation]
+    private var currentFrameSequence: UInt64 = 0
+    private var pendingScanObservation: PoseObservation?
     var refreshCount = 0
     var onObservationQueueEmpty: (() -> Void)?
 
@@ -745,14 +754,32 @@ private final class RoomMissionPerception: RoverPerception {
     }
 
     var latestObservation: PoseObservation? {
-        guard !observationQueue.isEmpty else {
-            onObservationQueueEmpty?()
-            return nil
+        if !observationQueue.isEmpty {
+            let observation = observationQueue.removeFirst()
+            currentFrameSequence = max(currentFrameSequence, observation.frameSequence)
+            return observation
         }
-        return observationQueue.removeFirst()
+        if let pendingScanObservation {
+            self.pendingScanObservation = nil
+            return pendingScanObservation
+        }
+        onObservationQueueEmpty?()
+        return nil
     }
 
-    var frameSequence: UInt64? { nil }
+    var frameSequence: UInt64? { currentFrameSequence }
+
+    func publishScanFrame(sessionGeneration: UInt64?) {
+        guard let sessionGeneration else { return }
+        currentFrameSequence += 1
+        pendingScanObservation = PoseObservation(
+            pose: storedPose ?? Pose2D(position: .zero, yaw: 0),
+            frameSequence: currentFrameSequence,
+            timestamp: Double(currentFrameSequence),
+            trackingQuality: .normal,
+            sessionGeneration: sessionGeneration
+        )
+    }
     func detectObjects() -> [PerceivedObject] { [] }
     func unproject(normalizedPoint: CGPoint) -> Vec2? { nil }
     func capturedFrameJPEG() -> Data? { nil }
