@@ -59,10 +59,11 @@ final class RotationCommandTests: XCTestCase {
         await navigation.stopAndWait()
     }
 
-    func testReplacingScanWhileFirstPulseTransportIsSuspendedPreservesSecondHeading() async {
+    func testReplacingScanDuringSuspendedPreflightStopHandsOffActiveState() async {
         TestURLProtocol.reset()
         TestURLProtocol.delay = 0.20
         let replacementHeadingStarted = expectation(description: "replacement scan heading started")
+        let replacementInvocationStarted = expectation(description: "replacement scan invocation started")
         let ar = ARSessionManager { event, _ in
             if event == "relative_heading_measurement_started" {
                 replacementHeadingStarted.fulfill()
@@ -73,22 +74,47 @@ final class RotationCommandTests: XCTestCase {
 
         let firstScan = Task { await navigation.rotateForScan(by: .pi / 6) }
         await waitForRequestCount(1)
+        XCTAssertEqual(TestURLProtocol.requestRecords.count, 1)
+        XCTAssertEqual(
+            Self.requestOpcode(from: TestURLProtocol.requestRecords[0].url),
+            RoverConfig.Opcode.emergencyStop,
+            "scan A's first request must be its preflight transport stop"
+        )
+        XCTAssertNil(
+            TestURLProtocol.requestRecords[0].statusCode,
+            "scan A's preflight stop must still be suspended"
+        )
 
         TestURLProtocol.delay = 0
-        let secondScan = Task { await navigation.rotateForScan(by: -.pi / 6) }
-        await fulfillment(of: [replacementHeadingStarted], timeout: 1)
-
-        XCTAssertTrue(
-            ar.ingestRelativeHeadingSample(Self.reliableHeadingSample()),
-            "the replacement scan must own the heading measurement while the first stop is suspended"
+        let secondScan = Task { @MainActor in
+            replacementInvocationStarted.fulfill()
+            await navigation.rotateForScan(by: -.pi / 6)
+        }
+        await fulfillment(of: [replacementInvocationStarted], timeout: 1)
+        XCTAssertNil(
+            TestURLProtocol.requestRecords[0].statusCode,
+            "scan B must claim ownership while scan A's preflight stop is suspended"
         )
-        firstScan.cancel()
+
+        await waitForRequestStatus(at: 0, expected: 200)
         await firstScan.value
+        await fulfillment(of: [replacementHeadingStarted], timeout: 1)
+        await waitForRequestCount(2)
+        XCTAssertEqual(TestURLProtocol.requestRecords.count, 2)
+        XCTAssertEqual(
+            Self.requestOpcode(from: TestURLProtocol.requestRecords[1].url),
+            RoverConfig.Opcode.emergencyStop,
+            "scan B must perform its own preflight transport stop after the handoff"
+        )
+        XCTAssertEqual(TestURLProtocol.requestRecords[1].statusCode, 200)
 
         XCTAssertTrue(
             ar.ingestRelativeHeadingSample(Self.reliableHeadingSample()),
-            "the stale first stop completion must not end the replacement scan's heading measurement"
+            "scan B must own an active relative-heading measurement after the handoff"
         )
+        await waitForNavigationState(.driving, navigation: navigation)
+        XCTAssertEqual(ar.relativeHeadingMeasurement().reliability, .reliable)
+        XCTAssertEqual(navigation.state, .driving)
 
         secondScan.cancel()
         await secondScan.value
@@ -314,6 +340,32 @@ final class RotationCommandTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(2))
         }
         XCTAssertGreaterThanOrEqual(TestURLProtocol.requestCount, expected)
+    }
+
+    private func waitForRequestStatus(at index: Int, expected: Int) async {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < deadline {
+            let requests = TestURLProtocol.requestRecords
+            if requests.indices.contains(index), requests[index].statusCode == expected {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        let status = TestURLProtocol.requestRecords.indices.contains(index)
+            ? TestURLProtocol.requestRecords[index].statusCode
+            : nil
+        XCTAssertEqual(status, expected)
+    }
+
+    private func waitForNavigationState(
+        _ expected: NavigationController.State,
+        navigation: NavigationController
+    ) async {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while navigation.state != expected, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(navigation.state, expected)
     }
 
     private func waitForNavigationCommandCount(_ expected: Int) async {
