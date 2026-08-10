@@ -80,6 +80,50 @@ public final class SessionRoomTopology: RoomTopologyManaging {
         telemetry("room_session_reset", ["generation": String(generation)])
     }
 
+    public func shortestDoorwayPath(
+        from startRoomID: RoomID,
+        to destinationRoomID: RoomID
+    ) -> [DoorwayRouteStep]? {
+        guard sessionGeneration != nil,
+              rooms[startRoomID] != nil,
+              rooms[destinationRoomID] != nil else {
+            return nil
+        }
+        guard startRoomID != destinationRoomID else { return [] }
+
+        var visited: Set<RoomID> = [startRoomID]
+        var queue: [(roomID: RoomID, route: [DoorwayRouteStep])] = [
+            (startRoomID, []),
+        ]
+        var nextIndex = 0
+
+        while nextIndex < queue.count {
+            let current = queue[nextIndex]
+            nextIndex += 1
+
+            let nextSteps = doorways.values.compactMap { doorway -> DoorwayRouteStep? in
+                guard let nextRoomID = oppositeRoom(to: current.roomID, through: doorway) else {
+                    return nil
+                }
+                return DoorwayRouteStep(
+                    doorwayID: doorway.id,
+                    fromRoomID: current.roomID,
+                    toRoomID: nextRoomID
+                )
+            }.sorted { $0.doorwayID < $1.doorwayID }
+
+            for step in nextSteps where visited.insert(step.toRoomID).inserted {
+                let route = current.route + [step]
+                if step.toRoomID == destinationRoomID {
+                    return route
+                }
+                queue.append((step.toRoomID, route))
+            }
+        }
+
+        return nil
+    }
+
     public func refreshCandidates(
         from frontiers: [Frontier],
         referencePose: Pose2D

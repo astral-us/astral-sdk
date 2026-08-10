@@ -437,6 +437,48 @@ final class SessionRoomTopologyTests: XCTestCase {
         XCTAssertEqual(topology.snapshot.doorways.count, 1)
     }
 
+    func testShortestDoorwayPathReturnsForwardAndReverseStepsWithoutCycles() throws {
+        let topology = startedTopology()
+        let room1 = try XCTUnwrap(topology.snapshot.currentRoomID)
+        let firstCandidate = try XCTUnwrap(topology.refreshCandidates(
+            from: [frontier()],
+            referencePose: initialPose
+        ).first)
+        XCTAssertEqual(
+            topology.beginTransition(candidateID: firstCandidate.id, approachPose: initialPose),
+            .started
+        )
+        makeReady(topology)
+        let room2 = try XCTUnwrap(topology.confirmTransition())
+
+        let room2Pose = Pose2D(position: Vec2(0.37, 0), yaw: 0)
+        let secondCandidate = try XCTUnwrap(topology.refreshCandidates(
+            from: [frontier(x: 1)],
+            referencePose: room2Pose
+        ).first { $0.doorwayID == nil })
+        XCTAssertEqual(
+            topology.beginTransition(candidateID: secondCandidate.id, approachPose: room2Pose),
+            .started
+        )
+        makeReady(topology, positions: [0.65, 1.35, 1.36, 1.37])
+        let room3 = try XCTUnwrap(topology.confirmTransition())
+
+        let outward = topology.shortestDoorwayPath(from: room1, to: room3)
+        XCTAssertEqual(outward?.map(\.doorwayID), [DoorwayID("doorway_1"), DoorwayID("doorway_2")])
+        XCTAssertEqual(outward?.map(\.fromRoomID), [room1, room2])
+        XCTAssertEqual(outward?.map(\.toRoomID), [room2, room3])
+
+        let returning = topology.shortestDoorwayPath(from: room3, to: room1)
+        XCTAssertEqual(returning, outward?.reversed().map(\.reversed))
+        XCTAssertEqual(topology.shortestDoorwayPath(from: room2, to: room2), [])
+        XCTAssertNil(topology.shortestDoorwayPath(from: room1, to: RoomID("unknown_room")))
+
+        topology.reset(forSessionGeneration: 2)
+        topology.startSession(generation: 2, initialPose: initialPose)
+        XCTAssertNil(topology.shortestDoorwayPath(from: room3, to: room1),
+                     "routes must not survive a room-mapping session generation change")
+    }
+
     func testRejectAndAbandonClearPendingTransitionWithoutGraphMutation() throws {
         var events: [String] = []
         let (topology, candidate) = try topologyWithCandidate { event, _ in events.append(event) }

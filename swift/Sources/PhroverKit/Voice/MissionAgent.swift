@@ -237,6 +237,12 @@ public final class MissionAgent {
         case cancelled
     }
 
+    private enum RoomTraversalOutcome {
+        case crossed(DoorwayRouteStep)
+        case exhausted(String)
+        case cancelled
+    }
+
     public private(set) var phase: Phase = .idle {
         didSet {
             guard phase != oldValue else { return }
@@ -276,6 +282,7 @@ public final class MissionAgent {
     private let brainErrorLogger: (Error, MissionContext) -> Void
 
     private var roomTransitionDebugState: RoomTransitionDebugState = .idle
+    private var roomTraversalExhaustionFields: [String: String] = [:]
     private var lastAnswerWasInconclusive = false
     private var nextCandidateNumber = 1
     private var isHandlingMission = false
@@ -482,9 +489,61 @@ public final class MissionAgent {
     }
 
     private func runRoomTransitionMission(missionID: Int) async {
+        let sessionGeneration = roomTopology?.snapshot.sessionGeneration
+        switch await traverseNextDoorway(missionID: missionID) {
+        case .crossed(let step):
+            let candidateID = roomTopology?.snapshot.doorways.first {
+                $0.id == step.doorwayID
+            }?.candidateID
+            roomTransitionTelemetry("room_transition_mission_completed", [
+                "candidate_id": candidateID?.rawValue ?? "unknown",
+                "doorway_id": step.doorwayID.rawValue,
+                "room_id": step.toRoomID.rawValue,
+                "mission_id": String(missionID),
+                "session_generation": sessionGeneration.map(String.init) ?? "none",
+            ])
+            publishRoomTransitionState(.completed(
+                doorwayID: step.doorwayID,
+                roomID: step.toRoomID
+            ))
+            publishMissionTerminal(
+                { .succeeded(id: $0, command: $1, message: "Entered another room.") },
+                missionID: missionID
+            )
+            phase = .idle
+        case .exhausted(let reason):
+            let fields = roomTraversalExhaustionFields
+            roomTraversalExhaustionFields = [:]
+            if reason == "search_exhausted" || reason == "missing_topology" {
+                finishRoomTransitionExhausted(
+                    missionID: missionID,
+                    sessionGeneration: sessionGeneration,
+                    fields: fields
+                )
+            } else {
+                let message = reason == "missing_pose"
+                    ? "I don’t have my bearings yet."
+                    : reason
+                finishRoomTransitionFailed(
+                    reason,
+                    message: message,
+                    missionID: missionID,
+                    sessionGeneration: sessionGeneration,
+                    fields: fields
+                )
+            }
+        case .cancelled:
+            phase = .idle
+        }
+    }
+
+    private func traverseNextDoorway(
+        preferredDoorwayID: DoorwayID? = nil,
+        excluding initiallyExcludedCandidateIDs: Set<DoorwayCandidateID> = [],
+        missionID: Int
+    ) async -> RoomTraversalOutcome {
         guard let roomTopology else {
-            finishRoomTransitionExhausted(missionID: missionID)
-            return
+            return .exhausted("missing_topology")
         }
 
         let totalScanSteps = 12
@@ -493,21 +552,21 @@ public final class MissionAgent {
             "mission_id": String(missionID),
             "session_generation": sessionGeneration.map(String.init) ?? "none",
         ]
-        var excludedCandidateIDs: Set<DoorwayCandidateID> = []
+        var excludedCandidateIDs = initiallyExcludedCandidateIDs
         var remainingScanSteps = totalScanSteps
         var candidateAttempts = 0
+        roomTraversalExhaustionFields = [:]
 
         while isCurrentMission(missionID), !Task.isCancelled, candidateAttempts < 3 {
+            guard roomTopology.snapshot.sessionGeneration == sessionGeneration else {
+                await motion.stopAndWait()
+                roomTopology.abandonTransition()
+                return .exhausted("session_generation_changed")
+            }
             let scanStep = totalScanSteps - remainingScanSteps
             let frontiers = perception.explorationFrontiers()
             guard let referencePose = perception.pose else {
-                finishRoomTransitionFailed(
-                    "missing_pose",
-                    message: "I don’t have my bearings yet.",
-                    missionID: missionID,
-                    sessionGeneration: sessionGeneration
-                )
-                return
+                return .exhausted("missing_pose")
             }
             let candidates = roomTopology.refreshCandidates(
                 from: frontiers,
@@ -562,9 +621,17 @@ public final class MissionAgent {
                 ]) { _, new in new })
             }
 
-            let selected = ranked.first { $0.assessment.isReachable }
+            let selected: RankedDoorwayCandidate?
+            if let preferredDoorwayID {
+                selected = ranked.first {
+                    $0.assessment.isReachable
+                        && $0.candidate.doorwayID == preferredDoorwayID
+                }
+            } else {
+                selected = ranked.first { $0.assessment.isReachable }
+            }
             if selected == nil {
-                for item in ranked {
+                for item in ranked where !item.assessment.isReachable {
                     excludedCandidateIDs.insert(item.candidate.id)
                     roomTransitionTelemetry("doorway_candidate_unreachable", missionFields.merging([
                         "scan_step": String(scanStep),
@@ -584,7 +651,9 @@ public final class MissionAgent {
                 } else if candidates.isEmpty {
                     reason = "no_admitted_candidates"
                 } else if !ranked.isEmpty {
-                    reason = "no_reachable_candidates"
+                    reason = preferredDoorwayID == nil
+                        ? "no_reachable_candidates"
+                        : "preferred_doorway_unavailable"
                 } else {
                     reason = "no_ranked_candidates"
                 }
@@ -598,14 +667,8 @@ public final class MissionAgent {
                 phase = .acting
                 await motion.rotateForScan(by: .pi / 6)
                 if case .failed(let reason) = motion.state {
-                    finishRoomTransitionFailed(
-                        reason,
-                        message: reason,
-                        missionID: missionID,
-                        sessionGeneration: sessionGeneration,
-                        fields: ["scan_step": String(scanStep)]
-                    )
-                    return
+                    roomTraversalExhaustionFields = ["scan_step": String(scanStep)]
+                    return .exhausted(reason)
                 }
                 continue
             }
@@ -624,14 +687,10 @@ public final class MissionAgent {
                 reachable: true
             ))
             guard let approachPose = perception.pose else {
-                finishRoomTransitionFailed(
-                    "missing_pose",
-                    message: "I don’t have my bearings yet.",
-                    missionID: missionID,
-                    sessionGeneration: sessionGeneration,
-                    fields: ["candidate_id": selected.candidate.id.rawValue]
-                )
-                return
+                roomTraversalExhaustionFields = [
+                    "candidate_id": selected.candidate.id.rawValue,
+                ]
+                return .exhausted("missing_pose")
             }
             var startResult = roomTopology.beginTransition(
                 candidateID: selected.candidate.id,
@@ -697,6 +756,11 @@ public final class MissionAgent {
             var lastFrameSequence: UInt64?
             var trackingRecoveryDeadline: Date?
             while isCurrentMission(missionID), !Task.isCancelled {
+                guard roomTopology.snapshot.sessionGeneration == sessionGeneration else {
+                    await motion.stopAndWait()
+                    roomTopology.abandonTransition()
+                    return .exhausted("session_generation_changed")
+                }
                 if let observation = perception.latestObservation,
                    observation.sessionGeneration == roomTopology.snapshot.sessionGeneration,
                    lastFrameSequence.map({ observation.frameSequence > $0 }) ?? true {
@@ -729,27 +793,34 @@ public final class MissionAgent {
                         guard isCurrentMission(missionID), !Task.isCancelled else {
                             roomTopology.abandonTransition()
                             publishRoomTransitionState(.idle)
-                            return
+                            return .cancelled
                         }
                         if let roomID = roomTopology.confirmTransition(),
                            let doorwayID = roomTopology.snapshot.doorways.first(where: {
                                $0.candidateID == selected.candidate.id
                            })?.id {
-                            roomTransitionTelemetry("room_transition_mission_completed", missionFields.merging([
-                                "candidate_id": selected.candidate.id.rawValue,
-                                "doorway_id": doorwayID.rawValue,
-                                "room_id": roomID.rawValue,
-                            ]) { _, new in new })
-                            publishRoomTransitionState(.completed(
-                                doorwayID: doorwayID,
-                                roomID: roomID
-                            ))
-                            publishMissionTerminal(
-                                { .succeeded(id: $0, command: $1, message: "Entered another room.") },
-                                missionID: missionID
+                            guard let fromRoomID = roomTopology.snapshot.doorways.first(where: {
+                                $0.id == doorwayID
+                            }).flatMap({ doorway in
+                                doorway.firstRoomID == roomID
+                                    ? doorway.secondRoomID
+                                    : doorway.firstRoomID
+                            }) else {
+                                publishRoomTransitionFailure(
+                                    "crossing_route_step_failed",
+                                    missionID: missionID,
+                                    sessionGeneration: sessionGeneration,
+                                    fields: ["candidate_id": selected.candidate.id.rawValue]
+                                )
+                                break
+                            }
+                            return .crossed(
+                                DoorwayRouteStep(
+                                    doorwayID: doorwayID,
+                                    fromRoomID: fromRoomID,
+                                    toRoomID: roomID
+                                )
                             )
-                            phase = .idle
-                            return
                         }
                         publishRoomTransitionFailure(
                             "crossing_confirmation_failed",
@@ -813,18 +884,15 @@ public final class MissionAgent {
             roomTopology.abandonTransition()
             publishRoomTransitionState(.idle)
             phase = .idle
-            return
+            return .cancelled
         }
         await motion.stopAndWait()
         roomTopology.abandonTransition()
-        finishRoomTransitionExhausted(
-            missionID: missionID,
-            sessionGeneration: sessionGeneration,
-            fields: [
-                "candidate_attempts": String(candidateAttempts),
-                "scan_steps_used": String(totalScanSteps - remainingScanSteps),
-            ]
-        )
+        roomTraversalExhaustionFields = [
+            "candidate_attempts": String(candidateAttempts),
+            "scan_steps_used": String(totalScanSteps - remainingScanSteps),
+        ]
+        return .exhausted("search_exhausted")
     }
 
     private func publishRoomTransitionFailure(
@@ -1342,27 +1410,19 @@ public final class MissionAgent {
         failureMessage: String
     ) async {
         let target = NavigationTarget.visualQuery(intent.objectQuery)
-        var scanSteps = 0
-        let goal: Vec2
+        let topology = roomTopology
+        let sessionGeneration = topology?.snapshot.sessionGeneration
+        let startRoomID = topology?.snapshot.currentRoomID
+        let maximumRoomSearches = 3
+        let maximumDoorwayCrossings = 2
+        var searchedCandidateIDs: Set<DoorwayCandidateID> = []
+        var crossedDoorwaySteps: [DoorwayRouteStep] = []
+        var roomsSearched = 0
+        var requiresFreshScanTurn = false
+        var resolvedGoal: Vec2?
 
-        if let visibleGoal = resolve(target, missionID: missionID) {
-            goal = visibleGoal
-        } else {
-            switch await scanForUnresolvedVisualTarget(
-                target,
-                missionID: missionID,
-                scanSteps: &scanSteps
-            ) {
-            case .found(let scannedGoal):
-                goal = scannedGoal
-            case .notFound:
-                failOfflineObjectMission(
-                    missionID: missionID,
-                    message: failureMessage,
-                    reason: "target_not_found"
-                )
-                return
-            case .cancelled:
+        while resolvedGoal == nil {
+            guard !missionCancellationDetected(missionID) else {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_while_scanning")
                 RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
                     "mission": "\(missionID)",
@@ -1370,6 +1430,134 @@ public final class MissionAgent {
                 ])
                 return
             }
+            if intent.searchOtherRooms,
+               topology?.snapshot.sessionGeneration != sessionGeneration {
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "session_generation_changed"
+                )
+                return
+            }
+
+            var scanSteps = 0
+            if !requiresFreshScanTurn,
+               let visibleGoal = resolve(target, missionID: missionID) {
+                resolvedGoal = visibleGoal
+            } else {
+                switch await scanForUnresolvedVisualTarget(
+                    target,
+                    missionID: missionID,
+                    scanSteps: &scanSteps,
+                    requireNewFrameAfterInitialTurn: requiresFreshScanTurn
+                ) {
+                case .found(let scannedGoal):
+                    resolvedGoal = scannedGoal
+                case .notFound:
+                    break
+                case .cancelled:
+                    cancelActiveMotion(missionID: missionID, reason: "cancelled_while_scanning")
+                    RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                        "mission": "\(missionID)",
+                        "reason": "cancelled_while_scanning"
+                    ])
+                    return
+                }
+            }
+
+            roomsSearched += 1
+            RuntimeFileLog.append("mission_offline_room_searched", fields: [
+                "mission": "\(missionID)",
+                "room_id": topology?.snapshot.currentRoomID?.rawValue ?? "unavailable",
+                "room_number": String(roomsSearched),
+                "scan_steps": String(scanSteps),
+                "target": intent.objectQuery,
+                "target_found": resolvedGoal == nil ? "false" : "true",
+            ])
+            guard resolvedGoal == nil else { break }
+            guard intent.searchOtherRooms else {
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "target_not_found"
+                )
+                return
+            }
+            guard let topology,
+                  sessionGeneration != nil,
+                  startRoomID != nil,
+                  roomsSearched < maximumRoomSearches,
+                  crossedDoorwaySteps.count < maximumDoorwayCrossings else {
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: "search_exhausted"
+                )
+                return
+            }
+
+            switch await traverseNextDoorway(
+                excluding: searchedCandidateIDs,
+                missionID: missionID
+            ) {
+            case .crossed(let step):
+                guard topology.snapshot.sessionGeneration == sessionGeneration else {
+                    failOfflineObjectMission(
+                        missionID: missionID,
+                        message: failureMessage,
+                        reason: "session_generation_changed"
+                    )
+                    return
+                }
+                crossedDoorwaySteps.append(step)
+                let candidateID = topology.snapshot.doorways.first {
+                    $0.id == step.doorwayID
+                }?.candidateID
+                if let candidateID {
+                    searchedCandidateIDs.insert(candidateID)
+                    RuntimeFileLog.append("mission_offline_doorway_marked_searched", fields: [
+                        "mission": "\(missionID)",
+                        "candidate_id": candidateID.rawValue,
+                        "doorway_id": step.doorwayID.rawValue,
+                    ])
+                }
+                RuntimeFileLog.append("mission_offline_doorway_crossed", fields: [
+                    "mission": "\(missionID)",
+                    "doorway_id": step.doorwayID.rawValue,
+                    "from_room_id": step.fromRoomID.rawValue,
+                    "to_room_id": step.toRoomID.rawValue,
+                ])
+                publishRoomTransitionState(.completed(
+                    doorwayID: step.doorwayID,
+                    roomID: step.toRoomID
+                ))
+                requiresFreshScanTurn = true
+            case .exhausted(let reason):
+                failOfflineObjectMission(
+                    missionID: missionID,
+                    message: failureMessage,
+                    reason: reason == "session_generation_changed"
+                        ? reason
+                        : "search_exhausted"
+                )
+                return
+            case .cancelled:
+                cancelActiveMotion(missionID: missionID, reason: "cancelled_during_room_traversal")
+                RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                    "mission": "\(missionID)",
+                    "reason": "cancelled_during_room_traversal"
+                ])
+                return
+            }
+        }
+
+        guard let goal = resolvedGoal else {
+            failOfflineObjectMission(
+                missionID: missionID,
+                message: failureMessage,
+                reason: "search_exhausted"
+            )
+            return
         }
 
         guard !missionCancellationDetected(missionID) else {
@@ -1416,6 +1604,16 @@ public final class MissionAgent {
             "stop_distance": String(format: "%.2f", RoverConfig.visualTargetStopDistance)
         ])
 
+        if intent.searchOtherRooms,
+           topology?.snapshot.sessionGeneration != sessionGeneration {
+            failOfflineObjectMission(
+                missionID: missionID,
+                message: failureMessage,
+                reason: "session_generation_changed"
+            )
+            return
+        }
+
         if intent.shouldReturn {
             guard let start = memory.missionStartPose else {
                 failOfflineObjectMission(
@@ -1424,6 +1622,89 @@ public final class MissionAgent {
                     reason: "missing_start_pose"
                 )
                 return
+            }
+            if !crossedDoorwaySteps.isEmpty {
+                guard let topology,
+                      let startRoomID,
+                      topology.snapshot.sessionGeneration == sessionGeneration,
+                      let currentRoomID = topology.snapshot.currentRoomID,
+                      let returnRoute = topology.shortestDoorwayPath(
+                          from: currentRoomID,
+                          to: startRoomID
+                      ) else {
+                    failOfflineObjectMission(
+                        missionID: missionID,
+                        message: failureMessage,
+                        reason: "return_route_unavailable"
+                    )
+                    return
+                }
+                RuntimeFileLog.append("mission_offline_return_route_started", fields: [
+                    "mission": "\(missionID)",
+                    "from_room_id": currentRoomID.rawValue,
+                    "to_room_id": startRoomID.rawValue,
+                    "step_count": String(returnRoute.count),
+                    "outbound_step_count": String(crossedDoorwaySteps.count),
+                ])
+                for (index, expectedStep) in returnRoute.enumerated() {
+                    guard topology.snapshot.sessionGeneration == sessionGeneration else {
+                        failOfflineObjectMission(
+                            missionID: missionID,
+                            message: failureMessage,
+                            reason: "session_generation_changed"
+                        )
+                        return
+                    }
+                    switch await traverseNextDoorway(
+                        preferredDoorwayID: expectedStep.doorwayID,
+                        missionID: missionID
+                    ) {
+                    case .crossed(let actualStep):
+                        guard actualStep == expectedStep else {
+                            failOfflineObjectMission(
+                                missionID: missionID,
+                                message: failureMessage,
+                                reason: "return_route_changed"
+                            )
+                            return
+                        }
+                        RuntimeFileLog.append("mission_offline_return_route_step", fields: [
+                            "mission": "\(missionID)",
+                            "step": String(index + 1),
+                            "doorway_id": actualStep.doorwayID.rawValue,
+                            "from_room_id": actualStep.fromRoomID.rawValue,
+                            "to_room_id": actualStep.toRoomID.rawValue,
+                        ])
+                        publishRoomTransitionState(.completed(
+                            doorwayID: actualStep.doorwayID,
+                            roomID: actualStep.toRoomID
+                        ))
+                    case .exhausted(let reason):
+                        failOfflineObjectMission(
+                            missionID: missionID,
+                            message: failureMessage,
+                            reason: reason == "session_generation_changed"
+                                ? reason
+                                : "return_route_failed"
+                        )
+                        return
+                    case .cancelled:
+                        cancelActiveMotion(
+                            missionID: missionID,
+                            reason: "cancelled_during_return_route"
+                        )
+                        RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                            "mission": "\(missionID)",
+                            "reason": "cancelled_during_return_route"
+                        ])
+                        return
+                    }
+                }
+                RuntimeFileLog.append("mission_offline_return_route_completed", fields: [
+                    "mission": "\(missionID)",
+                    "room_id": startRoomID.rawValue,
+                    "step_count": String(returnRoute.count),
+                ])
             }
             RuntimeFileLog.append("mission_offline_fallback_return_started", fields: [
                 "mission": "\(missionID)",
@@ -1857,19 +2138,25 @@ public final class MissionAgent {
 
     private func scanForUnresolvedVisualTarget(_ target: NavigationTarget,
                                                missionID: Int,
-                                               scanSteps: inout Int) async -> VisualTargetScanResult {
+                                               scanSteps: inout Int,
+                                               requireNewFrameAfterInitialTurn: Bool = false) async
+        -> VisualTargetScanResult {
         guard case .visualQuery(let query) = target else { return .notFound }
+        var shouldEvaluateBeforeTurn = !requireNewFrameAfterInitialTurn
         while scanSteps < maxVisualTargetScanSteps {
-            switch await waitForVisualTarget(query: query, missionID: missionID) {
-            case .found(let goal):
-                return .found(goal)
-            case .noVisibleObjects:
-                break
-            case .cancelled:
-                return .cancelled
-            case .timedOut:
-                break
+            if shouldEvaluateBeforeTurn {
+                switch await waitForVisualTarget(query: query, missionID: missionID) {
+                case .found(let goal):
+                    return .found(goal)
+                case .noVisibleObjects:
+                    break
+                case .cancelled:
+                    return .cancelled
+                case .timedOut:
+                    break
+                }
             }
+            shouldEvaluateBeforeTurn = true
             guard !missionCancellationDetected(missionID) else {
                 cancelActiveMotion(missionID: missionID, reason: "cancelled_before_scan_turn")
                 return .cancelled

@@ -1166,6 +1166,303 @@ final class MissionAgentTests: XCTestCase {
         }
     }
 
+    func testBrainUnavailableSearchesAnotherRoomWithFreshScansAndLockedTarget() async throws {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(
+            generation: 7,
+            initialPose: Pose2D(position: .zero, yaw: 0)
+        )
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.frameSequence = 1
+        perception.frontiers = [doorwayFrontier()]
+        perception.observations = crossingObservations(
+            positions: [0.5, 0.65, 1.35, 1.36, 1.37],
+            startingSequence: 10,
+            generation: 7
+        )
+        perception.unprojectResult = Vec2(2, 0)
+        motion.onScanRotate = { _ in
+            perception.frameSequence = (perception.frameSequence ?? 0) + 1
+            if motion.scanRotateCalls.count == 1 {
+                perception.objects = [self.blackObject(label: "refrigerator")]
+            } else {
+                perception.objects = [self.blackObject(label: "chair",
+                                                       confidence: 0.90,
+                                                       colorConfidence: 0.70)]
+            }
+        }
+        let brain = ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+        var statuses: [MissionCommandStatus] = []
+        let logBefore = runtimeLog()
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 1,
+            roomTopology: topology,
+            roomTransitionPollInterval: 0,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the black chair in the other room")
+
+        XCTAssertEqual(brain.callCount, 1, "offline room search must not ask another brain")
+        XCTAssertEqual(motion.scanRotateCalls, [.pi / 6, .pi / 6])
+        XCTAssertTrue(motion.scanRotateCalls.allSatisfy {
+            (20.0...30.0).contains(abs($0 * 180 / .pi))
+        })
+        XCTAssertEqual(perception.unprojectFrameSequences, [15],
+                       "the other-room match must come from a frame newer than its scan turn")
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1.6, 0), Vec2(2, 0)])
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+        XCTAssertEqual(topology.snapshot.currentRoomID, RoomID("room_2"))
+        XCTAssertEqual(topology.snapshot.doorways.map(\.id), [DoorwayID("doorway_1")])
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected other-room target navigation to succeed")
+        }
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("mission_offline_room_searched"))
+        XCTAssertTrue(logDelta.contains("mission_offline_doorway_crossed"))
+        XCTAssertTrue(logDelta.contains("target=black chair"))
+        XCTAssertFalse(logDelta.contains("mission_offline_return_route_started"))
+    }
+
+    func testExplicitOfflineReturnUsesReverseDoorwayRouteThenStartPose() async throws {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(
+            generation: 9,
+            initialPose: Pose2D(position: .zero, yaw: 0)
+        )
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.frameSequence = 1
+        perception.frontiers = [doorwayFrontier()]
+        perception.observations = crossingObservations(
+            positions: [0.5, 0.65, 1.35, 1.36, 1.37],
+            startingSequence: 10,
+            generation: 9
+        ) + crossingObservations(
+            positions: [1.5, 1.35, 0.65, 0.64, 0.63],
+            startingSequence: 20,
+            generation: 9,
+            yaw: .pi
+        )
+        perception.unprojectResult = Vec2(2, 0)
+        motion.onScanRotate = { _ in
+            perception.frameSequence = (perception.frameSequence ?? 0) + 1
+            guard motion.scanRotateCalls.count == 2 else { return }
+            perception.objects = [self.blackObject(label: "chair")]
+        }
+        motion.onNavigate = { call in
+            guard call == 2 else { return }
+            perception.pose = Pose2D(position: Vec2(2, 0), yaw: .pi)
+        }
+        let brain = ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+        var statuses: [MissionCommandStatus] = []
+        let logBefore = runtimeLog()
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 1,
+            roomTopology: topology,
+            roomTransitionPollInterval: 0,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the black chair in the other room and come back")
+
+        XCTAssertEqual(brain.callCount, 1)
+        XCTAssertEqual(
+            motion.navigateCalls,
+            [Vec2(1.6, 0), Vec2(2, 0), Vec2(0.4, 0), .zero]
+        )
+        XCTAssertEqual(topology.snapshot.currentRoomID, RoomID("room_1"))
+        XCTAssertEqual(topology.snapshot.doorways.count, 1)
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected explicit doorway return to succeed")
+        }
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("mission_offline_return_route_started"))
+        XCTAssertTrue(logDelta.contains("mission_offline_return_route_step"))
+        XCTAssertTrue(logDelta.contains("mission_offline_return_route_completed"))
+        XCTAssertTrue(logDelta.contains("doorway_id=doorway_1"))
+    }
+
+    func testOfflineOtherRoomSearchExhaustionStopsWithoutRecrossingSearchedDoorway() async {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(
+            generation: 11,
+            initialPose: Pose2D(position: .zero, yaw: 0)
+        )
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.frameSequence = 1
+        perception.frontiers = [doorwayFrontier()]
+        perception.observations = crossingObservations(
+            positions: [0.5, 0.65, 1.35, 1.36, 1.37],
+            startingSequence: 10,
+            generation: 11
+        )
+        motion.onScanRotate = { _ in
+            perception.frameSequence = (perception.frameSequence ?? 0) + 1
+        }
+        let brain = ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+        let voice = FakeVoice()
+        var statuses: [MissionCommandStatus] = []
+        let logBefore = runtimeLog()
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: voice,
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 1,
+            roomTopology: topology,
+            roomTransitionPollInterval: 0,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the black chair in the other room")
+
+        XCTAssertEqual(brain.callCount, 1)
+        XCTAssertEqual(motion.scanRotateCalls, Array(repeating: .pi / 6, count: 14),
+                       "two room scans plus one bounded twelve-turn opening search")
+        XCTAssertTrue(motion.scanRotateCalls.allSatisfy {
+            (20.0...30.0).contains(abs($0 * 180 / .pi))
+        })
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1.6, 0)],
+                       "the searched doorway must not be selected again from room_2")
+        XCTAssertGreaterThanOrEqual(motion.cancelCallCount, 1)
+        XCTAssertEqual(topology.snapshot.currentRoomID, RoomID("room_2"))
+        guard case .failed = statuses.last else {
+            return XCTFail("Expected bounded room search exhaustion to fail")
+        }
+        XCTAssertFalse(voice.spoken.isEmpty)
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("mission_offline_doorway_marked_searched"))
+        XCTAssertTrue(logDelta.contains("mission_offline_fallback_failed"))
+        XCTAssertTrue(logDelta.contains("reason=search_exhausted"))
+    }
+
+    func testOfflineOtherRoomSearchAbortsWhenSessionGenerationChangesDuringCrossing() async {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(
+            generation: 13,
+            initialPose: Pose2D(position: .zero, yaw: 0)
+        )
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.frameSequence = 1
+        perception.frontiers = [doorwayFrontier()]
+        motion.onScanRotate = { _ in
+            perception.frameSequence = (perception.frameSequence ?? 0) + 1
+        }
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            topology.reset(forSessionGeneration: 14)
+        }
+        var statuses: [MissionCommandStatus] = []
+        let logBefore = runtimeLog()
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 1,
+            roomTopology: topology,
+            roomTransitionPollInterval: 0,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the black chair in the other room")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1.6, 0)])
+        XCTAssertGreaterThanOrEqual(motion.cancelCallCount, 1)
+        XCTAssertEqual(topology.snapshot.sessionGeneration, 14)
+        XCTAssertTrue(topology.snapshot.doorways.isEmpty)
+        guard case .failed = statuses.last else {
+            return XCTFail("Expected session replacement to abort the fallback mission")
+        }
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("mission_offline_fallback_failed"))
+        XCTAssertTrue(logDelta.contains("reason=session_generation_changed"))
+    }
+
+    func testOfflineOtherRoomSearchStopsStaleTraversalBeforeMotionSettles() async {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(
+            generation: 15,
+            initialPose: Pose2D(position: .zero, yaw: 0)
+        )
+        let motion = FakeMotion()
+        motion.navigateOutcome = .driving
+        let perception = FakePerception()
+        perception.frameSequence = 1
+        perception.frontiers = [doorwayFrontier()]
+        motion.onScanRotate = { _ in
+            perception.frameSequence = (perception.frameSequence ?? 0) + 1
+        }
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            topology.reset(forSessionGeneration: 16)
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 1,
+            roomTopology: topology,
+            roomTransitionPollInterval: 0,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+        let staleTraversalStopped = expectation(
+            description: "stale traversal stops without waiting for motion to settle"
+        )
+        let stopObserver = Task { @MainActor in
+            while !Task.isCancelled {
+                if motion.stopAndWaitCallCount > 0 {
+                    staleTraversalStopped.fulfill()
+                    return
+                }
+                do {
+                    try await Task.sleep(for: .milliseconds(5))
+                } catch {
+                    return
+                }
+            }
+        }
+        let mission = Task { @MainActor in
+            await agent.handle("Go to the black chair in the other room")
+        }
+
+        await fulfillment(of: [staleTraversalStopped], timeout: 0.25)
+        stopObserver.cancel()
+        if motion.stopAndWaitCallCount == 0 {
+            mission.cancel()
+        }
+        await mission.value
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1.6, 0)])
+        XCTAssertGreaterThanOrEqual(motion.stopAndWaitCallCount, 1)
+        guard case .failed = statuses.last else {
+            return XCTFail("Expected stale room traversal to fail after its session changes")
+        }
+    }
+
     func testBrainUnavailableRejectsUnsupportedCommandWithoutMotion() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -1688,6 +1985,48 @@ final class MissionAgentTests: XCTestCase {
         guard let url = RuntimeFileLog.logFileURL else { return "" }
         return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
+
+    private func doorwayFrontier() -> Frontier {
+        Frontier(
+            centroid: Vec2(1, 0),
+            widthMeters: 1,
+            cellCount: 6,
+            outwardDirection: Vec2(1, 0)
+        )
+    }
+
+    private func crossingObservations(
+        positions: [Double],
+        startingSequence: UInt64,
+        generation: UInt64,
+        yaw: Double = 0
+    ) -> [PoseObservation] {
+        positions.enumerated().map { index, x in
+            let sequence = startingSequence + UInt64(index)
+            return PoseObservation(
+                pose: Pose2D(position: Vec2(x, 0), yaw: yaw),
+                frameSequence: sequence,
+                timestamp: TimeInterval(sequence),
+                trackingQuality: .normal,
+                sessionGeneration: generation
+            )
+        }
+    }
+
+    private func blackObject(
+        label: String,
+        confidence: Float = 0.95,
+        colorConfidence: Float = 0.90
+    ) -> PerceivedObject {
+        PerceivedObject(
+            label: label,
+            confidence: confidence,
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5),
+            colorEvidence: [
+                ObjectColorEvidence(color: .black, confidence: colorConfidence),
+            ]
+        )
+    }
 }
 
 // MARK: - Fakes
@@ -1725,10 +2064,12 @@ private final class OutputBrain: RoverBrain {
 @MainActor
 private final class ThrowingBrain: RoverBrain {
     private let error: Error
+    private(set) var callCount = 0
 
     init(error: Error) { self.error = error }
 
     func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        callCount += 1
         throw error
     }
 }
@@ -1920,7 +2261,16 @@ private final class FakePerception: RoverPerception {
     var frontiers: [Frontier] = []
     var unprojectResult: Vec2? = Vec2(1, 2)
     var frameSequence: UInt64? = nil
+    var observations: [PoseObservation] = []
     private(set) var unprojectFrameSequences: [UInt64?] = []
+
+    var latestObservation: PoseObservation? {
+        guard !observations.isEmpty else { return nil }
+        let observation = observations.removeFirst()
+        pose = observation.pose
+        frameSequence = observation.frameSequence
+        return observation
+    }
 
     func detectObjects() -> [PerceivedObject] { objects }
     func unproject(normalizedPoint: CGPoint) -> Vec2? {

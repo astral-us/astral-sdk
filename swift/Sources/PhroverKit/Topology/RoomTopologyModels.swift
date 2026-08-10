@@ -88,6 +88,26 @@ public struct Doorway: Equatable, Sendable {
     }
 }
 
+public struct DoorwayRouteStep: Equatable, Sendable {
+    public let doorwayID: DoorwayID
+    public let fromRoomID: RoomID
+    public let toRoomID: RoomID
+
+    public init(doorwayID: DoorwayID, fromRoomID: RoomID, toRoomID: RoomID) {
+        self.doorwayID = doorwayID
+        self.fromRoomID = fromRoomID
+        self.toRoomID = toRoomID
+    }
+
+    public var reversed: DoorwayRouteStep {
+        DoorwayRouteStep(
+            doorwayID: doorwayID,
+            fromRoomID: toRoomID,
+            toRoomID: fromRoomID
+        )
+    }
+}
+
 public struct TransitionObservation: Equatable, Sendable {
     public let pose: Pose2D
     public let frameSequence: UInt64
@@ -222,6 +242,8 @@ public protocol RoomTopologyManaging: AnyObject {
     func startSession(generation: UInt64, initialPose: Pose2D)
     func ingestStablePose(_ pose: Pose2D, sessionGeneration generation: UInt64)
     func reset(forSessionGeneration generation: UInt64)
+    func shortestDoorwayPath(from startRoomID: RoomID, to destinationRoomID: RoomID)
+        -> [DoorwayRouteStep]?
     func refreshCandidates(from frontiers: [Frontier], referencePose: Pose2D) -> [DoorwayCandidate]
     func rankedCandidates(
         assessments: [DoorwayCandidateAssessment],
@@ -238,4 +260,11 @@ public protocol RoomTopologyManaging: AnyObject {
     func confirmTransition() -> RoomID?
     func rejectTransition(reason: String)
     func abandonTransition()
+}
+
+public extension RoomTopologyManaging {
+    func shortestDoorwayPath(from startRoomID: RoomID, to destinationRoomID: RoomID)
+        -> [DoorwayRouteStep]? {
+        nil
+    }
 }
