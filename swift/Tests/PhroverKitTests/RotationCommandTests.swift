@@ -74,14 +74,20 @@ final class RotationCommandTests: XCTestCase {
 
         let firstScan = Task { await navigation.rotateForScan(by: .pi / 6) }
         await waitForRequestCount(1)
+        guard let firstRequest = TestURLProtocol.requestRecords.first else {
+            firstScan.cancel()
+            await firstScan.value
+            XCTFail("Expected scan A's preflight request")
+            return
+        }
         XCTAssertEqual(TestURLProtocol.requestRecords.count, 1)
         XCTAssertEqual(
-            Self.requestOpcode(from: TestURLProtocol.requestRecords[0].url),
+            Self.requestOpcode(from: firstRequest.url),
             RoverConfig.Opcode.emergencyStop,
             "scan A's first request must be its preflight transport stop"
         )
         XCTAssertNil(
-            TestURLProtocol.requestRecords[0].statusCode,
+            firstRequest.statusCode,
             "scan A's preflight stop must still be suspended"
         )
 
@@ -91,8 +97,16 @@ final class RotationCommandTests: XCTestCase {
             await navigation.rotateForScan(by: -.pi / 6)
         }
         await fulfillment(of: [replacementInvocationStarted], timeout: 1)
+        guard let suspendedFirstRequest = TestURLProtocol.requestRecords.first else {
+            secondScan.cancel()
+            await secondScan.value
+            firstScan.cancel()
+            await firstScan.value
+            XCTFail("Expected scan A's preflight request while scan B was invoked")
+            return
+        }
         XCTAssertNil(
-            TestURLProtocol.requestRecords[0].statusCode,
+            suspendedFirstRequest.statusCode,
             "scan B must claim ownership while scan A's preflight stop is suspended"
         )
 
@@ -100,13 +114,19 @@ final class RotationCommandTests: XCTestCase {
         await firstScan.value
         await fulfillment(of: [replacementHeadingStarted], timeout: 1)
         await waitForRequestCount(2)
+        guard let secondRequest = TestURLProtocol.requestRecords.dropFirst().first else {
+            secondScan.cancel()
+            await secondScan.value
+            XCTFail("Expected scan B's preflight request")
+            return
+        }
         XCTAssertEqual(TestURLProtocol.requestRecords.count, 2)
         XCTAssertEqual(
-            Self.requestOpcode(from: TestURLProtocol.requestRecords[1].url),
+            Self.requestOpcode(from: secondRequest.url),
             RoverConfig.Opcode.emergencyStop,
             "scan B must perform its own preflight transport stop after the handoff"
         )
-        XCTAssertEqual(TestURLProtocol.requestRecords[1].statusCode, 200)
+        XCTAssertEqual(secondRequest.statusCode, 200)
 
         XCTAssertTrue(
             ar.ingestRelativeHeadingSample(Self.reliableHeadingSample()),
