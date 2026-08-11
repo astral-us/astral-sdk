@@ -57,7 +57,7 @@ Rebuilt frontier observations within 0.30 m of an existing mission candidate ret
 
 The explorer navigates to one frontier at a time, settles, performs a visual scan, then rebuilds the candidate set. A candidate with no safe path is rejected and exploration continues. Exhaustion returns the rover to rendezvous rather than crossing into its peer's sector.
 
-`NavigationController` gains a path-admissibility policy applied to the initial plan and every periodic replan before wheel commands are sent. A path entering the center band or opposite sector is rejected with a distinct policy-failure result even when its destination remains in the correct sector.
+`NavigationController` gains a path-admissibility policy applied to the initial plan and every periodic replan before wheel commands are sent. Search and return paths entering the center band or opposite sector are rejected with a distinct policy-failure result even when their destination remains in the correct sector. This policy is released only after the acknowledged convergence commit, because the peer must be allowed to reach a target found in the other search sector.
 
 ### `TargetTracker`
 
@@ -143,7 +143,7 @@ Additional behavior:
 - Every optical step times out after 30 seconds and offers Retry or Abort. Retry never advances sequence state until a valid message is scanned.
 - A missing peer keeps the waiting rover stopped. The mission fails 60 seconds after the search deadline.
 - Neither rover begins convergence until both statuses, the rendezvous decision, the convergence commit, and its acknowledgement are complete.
-- No fallback permits crossing the assigned sector, accepting a lower-confidence target, or moving with an invalid shared frame.
+- No search or return fallback permits crossing the assigned sector. Only acknowledged convergence releases that boundary; no phase accepts a lower-confidence target or moves with an invalid shared frame.
 
 ## Operator Experience
 
