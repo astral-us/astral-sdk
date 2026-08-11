@@ -80,9 +80,53 @@ final class FakeSilentSearchCalibration: SilentSearchCalibrating {
 
 @MainActor
 final class FakeSilentSearchOpticalExchange: SilentSearchOpticalExchanging {
-    func present(payload: Data) async throws {}
-    func scan(until deadline: SilentSearchInstant) async throws -> Data { Data() }
-    func cancel() {}
+    enum Failure: Error { case cancelled }
+
+    private var incoming: [Data] = []
+    private var scanContinuations: [CheckedContinuation<Data, Error>] = []
+    private(set) var presentedPayloads: [Data] = []
+    var peer: FakeSilentSearchOpticalExchange?
+    var suspendPresent = false
+    private var presentContinuations: [CheckedContinuation<Void, Error>] = []
+
+    func present(payload: Data) async throws {
+        presentedPayloads.append(payload)
+        peer?.deliver(payload)
+        guard suspendPresent else { return }
+        try await withCheckedThrowingContinuation { presentContinuations.append($0) }
+    }
+
+    func scan(until deadline: SilentSearchInstant) async throws -> Data {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return try await withCheckedThrowingContinuation { scanContinuations.append($0) }
+    }
+
+    func cancel() {
+        let scans = scanContinuations
+        scanContinuations.removeAll()
+        scans.forEach { $0.resume(throwing: Failure.cancelled) }
+        let presentations = presentContinuations
+        presentContinuations.removeAll()
+        presentations.forEach { $0.resume(throwing: Failure.cancelled) }
+    }
+
+    func resumePresentations() {
+        let continuations = presentContinuations
+        presentContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+    }
+
+    func sendToScanner(_ payload: Data) {
+        deliver(payload)
+    }
+
+    private func deliver(_ payload: Data) {
+        if scanContinuations.isEmpty {
+            incoming.append(payload)
+        } else {
+            scanContinuations.removeFirst().resume(returning: payload)
+        }
+    }
 }
 
 @MainActor
@@ -107,10 +151,12 @@ final class FakeSilentSearchMotion: SilentSearchMotion {
     var currentMissionPath: [MissionPoint] = []
     var result: SilentSearchMotionResult = .arrived
     private(set) var stopCount = 0
+    private(set) var navigationRequests: [(MissionPoint, SilentSearchMotionPolicy)] = []
     var onStop: (() -> Void)?
 
     func navigate(to target: MissionPoint, policy: SilentSearchMotionPolicy) async -> SilentSearchMotionResult {
-        result
+        navigationRequests.append((target, policy))
+        return result
     }
 
     func rotate(to heading: Double, tolerance: Double) async -> SilentSearchMotionResult {
@@ -163,12 +209,16 @@ struct SilentSearchTestHarness {
     let clock = ManualSilentSearchClock()
     let readiness = FakeSilentSearchReadiness()
     let calibration = FakeSilentSearchCalibration()
-    let optical = FakeSilentSearchOpticalExchange()
+    let optical: FakeSilentSearchOpticalExchange
     let explorer = FakeSilentSearchExplorer()
     let targetObserver = FakeSilentSearchTargetObserver()
     let motion = FakeSilentSearchMotion()
     let safety = FakeSilentSearchSafetyMonitor()
     let events = RecordingSilentSearchEventSink()
+
+    init(optical: FakeSilentSearchOpticalExchange = FakeSilentSearchOpticalExchange()) {
+        self.optical = optical
+    }
 
     func coordinator() -> SilentSearchCoordinator {
         SilentSearchCoordinator(dependencies: SilentSearchDependencies(

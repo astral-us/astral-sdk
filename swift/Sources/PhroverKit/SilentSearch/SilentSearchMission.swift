@@ -89,6 +89,7 @@ public enum SilentSearchReadinessRequirement: String, Equatable, Sendable {
 public enum SilentSearchCoordinatorDiagnostic: Equatable, Sendable {
     case notReady([SilentSearchReadinessRequirement])
     case calibrationRejected(SharedMissionCalibrationDiagnostic)
+    case opticalTimedOut
 }
 
 public enum SilentSearchTransitionError: Error, Equatable, Sendable {
