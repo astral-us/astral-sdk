@@ -19,11 +19,24 @@ public final class Detector {
     }
 
     private var request: VNCoreMLRequest?
+    private let primaryDetection: ((CVPixelBuffer) -> [Detection])?
+    private let screenLocalizer: ScreenLocalizing?
+    private let now: () -> TimeInterval
+    private let fallbackInterval: TimeInterval
+    private let inferenceStateLock = NSLock()
+    private var inferenceEnabled = true
+    private var screenInferenceRunning = false
+    private var lastScreenInferenceAt: TimeInterval?
     public var isLoaded: Bool { request != nil }
+    public var isScreenFallbackLoaded: Bool { screenLocalizer?.isLoaded == true }
 
     /// Loads Xcode's compiled `.mlmodelc` when available, with source model fallback for
     /// package contexts that still ship `.mlpackage`/`.mlmodel` resources.
     public init(modelName: String = "RoverYOLO") async {
+        primaryDetection = nil
+        screenLocalizer = await VisionScreenLocalizer()
+        now = { ProcessInfo.processInfo.systemUptime }
+        fallbackInterval = 0.5
         guard let modelURL = Self.modelResourceURL(modelName: modelName) else {
             request = nil
             RuntimeFileLog.append("detector_unavailable", fields: [
@@ -58,6 +71,17 @@ public final class Detector {
         }
     }
 
+    init(primaryDetection: @escaping (CVPixelBuffer) -> [Detection],
+         screenLocalizer: ScreenLocalizing?,
+         now: @escaping () -> TimeInterval,
+         fallbackInterval: TimeInterval = 0.5) {
+        request = nil
+        self.primaryDetection = primaryDetection
+        self.screenLocalizer = screenLocalizer
+        self.now = now
+        self.fallbackInterval = fallbackInterval
+    }
+
     static func modelResourceURL(modelName: String, bundle: Bundle = .module) -> URL? {
         bundle.url(forResource: modelName, withExtension: "mlmodelc")
             ?? bundle.url(forResource: modelName, withExtension: "mlpackage")
@@ -74,12 +98,65 @@ public final class Detector {
     }
 
     public func detect(_ pixelBuffer: CVPixelBuffer) -> [Detection] {
-        guard let request else { return [] }
-        for orientation in Self.detectionOrientations(preferred: .right) {
-            let detections = detect(pixelBuffer, request: request, orientation: orientation)
-            if !detections.isEmpty { return detections }
+        let primary: [Detection]
+        if let primaryDetection {
+            primary = primaryDetection(pixelBuffer)
+        } else if let request {
+            var detected: [Detection] = []
+            for orientation in Self.detectionOrientations(preferred: .right) {
+                detected = detect(pixelBuffer, request: request, orientation: orientation)
+                if !detected.isEmpty { break }
+            }
+            primary = detected
+        } else {
+            primary = []
         }
-        return []
+
+        guard ScreenDetectionPolicy.shouldRunFallback(for: primary),
+              let screenLocalizer,
+              screenLocalizer.isLoaded,
+              beginScreenInferenceIfAllowed() else {
+            return primary
+        }
+        defer { finishScreenInference() }
+
+        RuntimeFileLog.append("screen_detector_inference_started", fields: [
+            "primary_count": "\(primary.count)",
+        ])
+        let fallback = screenLocalizer.detect(pixelBuffer)
+        guard isInferenceEnabled else {
+            RuntimeFileLog.append("screen_detector_result_discarded", fields: [
+                "reason": "inference_disabled",
+            ])
+            return primary
+        }
+
+        let merged = ScreenDetectionPolicy.merge(primary: primary, fallback: fallback)
+        let accepted = merged.dropFirst(primary.count)
+        if accepted.isEmpty {
+            RuntimeFileLog.append("screen_detector_candidate_rejected", fields: [
+                "candidate_count": "\(fallback.count)",
+                "reason": fallback.isEmpty ? "no_candidate" : "confidence_label_or_box",
+            ])
+        } else {
+            for detection in accepted {
+                RuntimeFileLog.append("screen_detector_candidate_accepted", fields: [
+                    "box": Self.boundingBoxDescription(detection.boundingBox),
+                    "confidence": String(format: "%.2f", detection.confidence),
+                    "label": detection.label,
+                ])
+            }
+        }
+        return merged
+    }
+
+    public func setInferenceEnabled(_ enabled: Bool) {
+        inferenceStateLock.lock()
+        inferenceEnabled = enabled
+        inferenceStateLock.unlock()
+        RuntimeFileLog.append("detector_inference_state_changed", fields: [
+            "enabled": enabled ? "true" : "false",
+        ])
     }
 
     static func detectionOrientations(preferred: CGImagePropertyOrientation) -> [CGImagePropertyOrientation] {
@@ -109,5 +186,50 @@ public final class Detector {
                       confidence: $0.labels.first?.confidence ?? 0,
                       boundingBox: $0.boundingBox)
         }
+    }
+
+    private var isInferenceEnabled: Bool {
+        inferenceStateLock.lock()
+        defer { inferenceStateLock.unlock() }
+        return inferenceEnabled
+    }
+
+    private func beginScreenInferenceIfAllowed() -> Bool {
+        let timestamp = now()
+        inferenceStateLock.lock()
+        defer { inferenceStateLock.unlock() }
+        guard inferenceEnabled else { return false }
+        guard !screenInferenceRunning else {
+            RuntimeFileLog.append("screen_detector_inference_skipped", fields: [
+                "reason": "request_in_progress",
+            ])
+            return false
+        }
+        if let lastScreenInferenceAt,
+           timestamp - lastScreenInferenceAt < fallbackInterval {
+            RuntimeFileLog.append("screen_detector_inference_skipped", fields: [
+                "reason": "rate_limited",
+            ])
+            return false
+        }
+        lastScreenInferenceAt = timestamp
+        screenInferenceRunning = true
+        return true
+    }
+
+    private func finishScreenInference() {
+        inferenceStateLock.lock()
+        screenInferenceRunning = false
+        inferenceStateLock.unlock()
+    }
+
+    private static func boundingBoxDescription(_ box: CGRect) -> String {
+        String(
+            format: "x=%.3f,y=%.3f,w=%.3f,h=%.3f",
+            box.minX,
+            box.minY,
+            box.width,
+            box.height
+        )
     }
 }

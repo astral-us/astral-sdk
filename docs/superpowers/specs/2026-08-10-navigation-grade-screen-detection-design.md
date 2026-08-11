@@ -4,9 +4,9 @@
 
 Recognize computer monitors, displays, televisions, and screens in the live iPhone camera view and provide a localized bounding box that the rover can use as a navigation target. Detection and navigation must work offline.
 
-## Current Limitation
+## Root Cause
 
-The bundled COCO YOLO model recognizes `tv` and `laptop`, but it does not contain `monitor`, `display`, or `screen` classes. It can return no detections for an angled or partially framed computer monitor even though the detector is loaded and processing frames. Apple Intelligence only receives the resulting text summary, so it cannot recover a missing visual bounding box.
+The bundled COCO YOLO model recognizes `tv` and `laptop`, but it does not contain `monitor`, `display`, or `screen` classes. The detector used to stop orientation fallback after the first nonempty result, even when that result was unrelated to the requested screen category. On the supplied screenshot, `.right` produced a false `stop sign`, while `.up` correctly localized the monitor as `laptop` at 95.9%. The early exit therefore hid a valid offline detection from both the Talk diagnostics and navigation.
 
 ## Rejected Built-In Vision Fallback
 
@@ -16,16 +16,9 @@ Promoting those classifications to `screen` would create uncalibrated false targ
 
 ## Approach
 
-Keep the existing COCO YOLO model as the primary detector. Add a dedicated CoreML screen object detector that runs only when the primary detector does not already produce a screen-like object.
+Keep the existing COCO YOLO model as the primary detector. When its preferred orientation returns no screen-like object, run a screen-only fallback over all supported image orientations using the same bundled `RoverYOLO` model. Ignore unrelated labels during this fallback, continue until a `tv` or `laptop` candidate is found, then canonicalize an accepted result to `screen`.
 
-The secondary model will:
-
-1. Be trained to localize computer monitors, displays, televisions, and projection screens as one canonical `screen` class.
-2. Include hard-negative examples containing printed documents, posters, windows, picture frames, whiteboards, and empty walls.
-3. Export as a Vision-compatible CoreML package with normalized bounding boxes and calibrated confidence.
-4. Run fully on-device with CPU and Neural Engine compute units.
-
-Keeping screen localization in a separate model minimizes regressions to the existing 80-class detector and allows the fallback to run only when needed.
+This preserves the existing 80-class detector, works fully offline, and fixes the observed failure without shipping an unvalidated model.
 
 ## Components
 
@@ -35,12 +28,12 @@ Add a small protocol representing the secondary detector:
 
 - Input: a camera `CVPixelBuffer`.
 - Output: zero or more `Detector.Detection` values.
-- Production implementation: a Vision request backed by the dedicated `ScreenYOLO.mlpackage` model.
+- Production implementation: a Vision request backed by the bundled `RoverYOLO.mlpackage`, filtered to screen-like labels for each orientation.
 - Tests can supply deterministic candidate regions and labels without invoking Vision models.
 
-### Screen Model Asset And Provenance
+### Dedicated Model Experiment
 
-Add `ScreenYOLO.mlpackage` as a PhroverKit resource. The repository must also record:
+A reproducible Open Images/Create ML training path was evaluated for a dedicated `ScreenYOLO` model. The repository tooling records:
 
 - Training source and image/annotation licenses.
 - Training and validation class counts.
@@ -48,7 +41,7 @@ Add `ScreenYOLO.mlpackage` as a PhroverKit resource. The repository must also re
 - Input dimensions and confidence/IoU defaults.
 - Validation precision, recall, and false-positive results for hard-negative scenes.
 
-The model is not accepted solely because it recognizes the supplied frame. It must pass a held-out validation set that includes both screens and visually similar non-screen rectangles.
+The 30-iteration transfer-learning candidate failed acceptance with held-out mAP of 0 and was not packaged. A dedicated model may replace the current fallback only after it passes a held-out validation set containing both screens and visually similar non-screen rectangles.
 
 ### Dataset And Export Pipeline
 
@@ -60,9 +53,9 @@ Use the Open Images V7 bounding-box annotations as the reproducible starting dat
 
 Include angled, truncated, partially occluded, bright, dark, and content-heavy screens in the positive set. Collapse both positive source classes into the single `screen` training label. Keep negative images annotation-free unless they contain a positive-class screen.
 
-Add a repository script that downloads the explicitly listed Open Images image IDs and annotations, verifies file hashes, and converts the normalized boxes into Create ML object-detector annotations. Keep train, validation, and test image-ID manifests in source control. Split by source image ID so near-duplicate frames cannot cross partitions.
+The repository script downloads explicitly selected Open Images image IDs and annotations and converts normalized boxes into Create ML object-detector annotations. Split by source image ID so near-duplicate frames cannot cross partitions.
 
-Train with Create ML's `MLObjectDetector` and export a Vision-compatible `ScreenYOLO.mlpackage`. The export notes must record the macOS/Xcode version, Create ML parameters, dataset manifest revision, and resulting model checksum. Source images are not committed to the SDK repository. Every included image must have its license and attribution recorded; images whose license cannot be verified are excluded.
+Train with Create ML's `MLObjectDetector` and evaluate before packaging. Source images are not committed to the SDK repository. Every included image must have its license and attribution recorded; images whose license cannot be verified are excluded.
 
 ### Detector
 
@@ -70,7 +63,7 @@ Train with Create ML's `MLObjectDetector` and export a Vision-compatible `Screen
 
 - Run YOLO using the current orientation fallback.
 - If YOLO returns `tv`, `laptop`, or `screen`, return those detections without running the secondary localizer.
-- Otherwise run the dedicated screen localizer and append accepted `screen` detections to the YOLO results.
+- Otherwise run the screen-only orientation localizer and append accepted `screen` detections to the primary results.
 - Suppress overlapping duplicate screen detections.
 - Preserve all existing non-screen YOLO detections.
 
@@ -124,7 +117,7 @@ The Talk screen's `Visible` line continues to summarize `RoverPerception.detectO
 
 Use test-driven development with focused tests for:
 
-1. Screen-model results produce a canonical `screen` detection.
+1. Screen-only fallback results produce a canonical `screen` detection.
 2. Unrelated or below-threshold labels are rejected.
 3. Accepted detections preserve normalized bounding boxes and confidence.
 4. Existing YOLO `tv`, `laptop`, or `screen` results skip secondary localization.
@@ -132,8 +125,8 @@ Use test-driven development with focused tests for:
 6. Overlapping screen detections are deduplicated.
 7. Voice aliases match `screen`, `tv`, and `laptop` detections.
 8. Secondary model load or inference failure leaves existing YOLO detections intact.
-9. The packaged model resource loads successfully on iOS.
-10. A curated integration fixture set meets the documented positive and hard-negative expectations.
+9. The bundled model resource loads successfully on iOS.
+10. The supplied monitor regression fixture is found after unrelated results from other orientations are filtered out.
 
 The model acceptance report must demonstrate, at the configured 0.90 threshold:
 

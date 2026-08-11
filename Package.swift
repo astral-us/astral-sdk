@@ -42,7 +42,12 @@ let package = Package(
             path: "swift/Sources/PhroverKit",
             resources: [.copy("Resources/RoverYOLO.mlpackage")]
         ),
-        .testTarget(name: "PhroverKitTests", dependencies: ["PhroverKit"], path: "swift/Tests/PhroverKitTests"),
+        .testTarget(
+            name: "PhroverKitTests",
+            dependencies: ["PhroverKit"],
+            path: "swift/Tests/PhroverKitTests",
+            resources: [.copy("Fixtures/ScreenDetector")]
+        ),
 
         // Deliberately separate from PhroverKitTests: makes real, slow, non-deterministic
         // model calls — the on-device Foundation Model (needs Apple Intelligence ready on

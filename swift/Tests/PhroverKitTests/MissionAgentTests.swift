@@ -722,6 +722,39 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(MissionAgent.visualTargetDirection(for: CGPoint(x: 0.8, y: 0.5)), "right")
     }
 
+    func testScreenRequestMatchesScreenTvAndLaptopCategories() {
+        for label in ["screen", "tv", "television", "laptop"] {
+            let object = PerceivedObject(
+                label: label,
+                confidence: 0.95,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+            )
+
+            XCTAssertEqual(
+                MissionAgent.bestVisualTargetMatch(
+                    query: "the monitor",
+                    objects: [object],
+                    minimumConfidence: 0.90
+                ),
+                object,
+                label
+            )
+        }
+
+        let poster = PerceivedObject(
+            label: "poster",
+            confidence: 0.99,
+            normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+        )
+        XCTAssertNil(
+            MissionAgent.bestVisualTargetMatch(
+                query: "the monitor",
+                objects: [poster],
+                minimumConfidence: 0.90
+            )
+        )
+    }
+
     func testBlackChairRequiresCategoryAndBlackConfidenceThresholds() {
         let intent = OfflineObjectMissionIntent(
             objectQuery: "black chair",

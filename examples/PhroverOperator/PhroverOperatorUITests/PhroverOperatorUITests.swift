@@ -47,6 +47,23 @@ final class PhroverOperatorUITests: XCTestCase {
         screenshot(app, name: "talk_failed_command_retry")
     }
 
+    func testTalkShowsLiveDetectorDiagnostics() throws {
+        let app = XCUIApplication()
+        app.launchArguments.append("-ui-test-perception-diagnostics")
+        app.launch()
+
+        let talkTab = app.buttons["Talk"]
+        XCTAssertTrue(talkTab.waitForExistence(timeout: 15))
+        talkTab.tap()
+
+        let detector = app.staticTexts["detector-status-text"]
+        let visible = app.staticTexts["visible-objects-text"]
+        XCTAssertTrue(detector.waitForExistence(timeout: 10))
+        XCTAssertEqual(detector.label, "Detector: loaded")
+        XCTAssertTrue(visible.waitForExistence(timeout: 10))
+        XCTAssertEqual(visible.label, "Visible: refrigerator 99%")
+    }
+
     func testTalkShowsModelNotReadyDiagnostic() throws {
         let app = XCUIApplication()
         app.launchArguments.append("-ui-test-brain-model-not-ready")

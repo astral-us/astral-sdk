@@ -113,6 +113,9 @@ public enum OfflineObjectMissionIntentParser {
         switch label {
         case "fridge": return "refrigerator"
         case "couch": return "sofa"
+        case "monitor", "computer monitor", "display", "computer display",
+             "screen", "computer screen", "television", "tv":
+            return "screen"
         default: return label
         }
     }

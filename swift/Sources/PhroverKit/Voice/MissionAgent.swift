@@ -2250,7 +2250,14 @@ public final class MissionAgent {
     private static func canonicalVisualLabel(_ value: String) -> String {
         let tokens = normalizedVisualQueryTokens(value)
         guard !tokens.isEmpty else { return "" }
-        return tokens.joined(separator: " ")
+        let normalized = tokens.joined(separator: " ")
+        switch normalized {
+        case "monitor", "computer monitor", "display", "computer display",
+             "screen", "computer screen", "tv", "laptop":
+            return "screen"
+        default:
+            return normalized
+        }
     }
 
     private static func normalizedVisualQuery(_ value: String) -> String {

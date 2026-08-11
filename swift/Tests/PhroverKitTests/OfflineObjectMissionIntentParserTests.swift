@@ -42,6 +42,21 @@ final class OfflineObjectMissionIntentParserTests: XCTestCase {
         XCTAssertTrue(intent.shouldReturn)
     }
 
+    func testScreenAliasesParseToCanonicalScreenTarget() throws {
+        for command in [
+            "Go to the monitor",
+            "Go to the computer monitor",
+            "Go to the display",
+            "Go to the computer screen",
+            "Go to the television",
+            "Go to the TV",
+        ] {
+            let intent = try XCTUnwrap(OfflineObjectMissionIntentParser.parse(command), command)
+            XCTAssertEqual(intent.objectQuery, "screen", command)
+            XCTAssertEqual(intent.targetLabel, "screen", command)
+        }
+    }
+
     func testRejectsCommandsOutsideObjectNavigationContract() {
         XCTAssertNil(OfflineObjectMissionIntentParser.parse("Tell me a joke"))
         XCTAssertNil(OfflineObjectMissionIntentParser.parse("Go to the chair and bring me a book"))

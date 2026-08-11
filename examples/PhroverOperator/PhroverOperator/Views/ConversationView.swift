@@ -17,6 +17,7 @@ struct ConversationView: View {
     let cloudBrain: CloudBrain?
     let doorwayEvidenceProvider: CloudDoorwayEvidenceProvider?
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var speechIn = SpeechIn()
     @State private var speechOut = SpeechOut()
     @State private var agent: MissionAgent?
@@ -25,6 +26,9 @@ struct ConversationView: View {
     @State private var authorized = false
     @State private var navigationDebug = NavigationDebugSummary()
     @State private var brainAvailability = ConversationView.makeInitialBrainAvailability()
+    @State private var perception: ARPerceptionSource?
+    @State private var detector: Detector?
+    @State private var detectorLoaded = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -34,7 +38,13 @@ struct ConversationView: View {
                         Text(statusLabel).font(.headline)
                     }
 
-                    LiveCameraDebugPanel(ar: ar, summary: navigationDebug)
+                    LiveCameraDebugPanel(
+                        ar: ar,
+                        summary: navigationDebug,
+                        perception: perception,
+                        detectorLoaded: detectorLoaded,
+                        fixtureVisibleObjects: Self.perceptionDiagnosticsFixture()
+                    )
                         .frame(maxWidth: 320)
 
                     if let message = brainAvailability?.operatorMessage {
@@ -105,7 +115,11 @@ struct ConversationView: View {
         .task {
             authorized = await speechIn.requestAuthorization()
             let detector = await Detector()
+            detector.setInferenceEnabled(scenePhase == .active)
             let perception = ARPerceptionSource(ar: ar, detector: detector)
+            self.detector = detector
+            self.perception = perception
+            detectorLoaded = detector.isLoaded
             let voice = SpeechRoverVoice(out: speechOut, speechIn: speechIn)
             let onDevice = OnDeviceBrain()
             let availability = Self.brainAvailabilityFixture() ?? onDevice.availability
@@ -139,6 +153,9 @@ struct ConversationView: View {
                 missionTelemetry: telemetry
             ) { brain }
         }
+        .onChange(of: scenePhase) { _, phase in
+            detector?.setInferenceEnabled(phase == .active)
+        }
     }
 
     private static func makeInitialBrainAvailability() -> OnDeviceBrainAvailability? {
@@ -167,6 +184,15 @@ struct ConversationView: View {
         }
 #endif
         return state
+    }
+
+    private static func perceptionDiagnosticsFixture() -> String? {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-ui-test-perception-diagnostics") {
+            return "refrigerator 99%"
+        }
+#endif
+        return nil
     }
 
     private var statusLabel: String {
@@ -227,8 +253,14 @@ struct ConversationView: View {
 private struct LiveCameraDebugPanel: View {
     let ar: ARSessionManager
     let summary: NavigationDebugSummary
+    let perception: ARPerceptionSource?
+    let detectorLoaded: Bool
+    let fixtureVisibleObjects: String?
 
+    @Environment(\.displayScale) private var displayScale
     @State private var previewImage: UIImage?
+    @State private var visibleObjects = "none"
+    @State private var lastDetectionAt = Date.distantPast
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -262,6 +294,11 @@ private struct LiveCameraDebugPanel: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Tracking: \(trackingLabel)")
                 Text(String(format: "Clearance: %.2f m", ar.forwardClearance))
+                Text("Detector: \(effectiveDetectorLoaded ? "loaded" : "unavailable")")
+                    .accessibilityIdentifier("detector-status-text")
+                Text("Visible: \(effectiveVisibleObjects)")
+                    .lineLimit(1)
+                    .accessibilityIdentifier("visible-objects-text")
                 Text("Openings: \(summary.openingsText)")
                 Text("Doorway candidates: \(summary.doorwayCandidatesText)")
                 Text("Target: \(summary.targetText)")
@@ -285,6 +322,14 @@ private struct LiveCameraDebugPanel: View {
         }
     }
 
+    private var effectiveDetectorLoaded: Bool {
+        fixtureVisibleObjects != nil || detectorLoaded
+    }
+
+    private var effectiveVisibleObjects: String {
+        fixtureVisibleObjects ?? visibleObjects
+    }
+
     @MainActor
     private func refreshLoop() async {
         while !Task.isCancelled {
@@ -299,13 +344,19 @@ private struct LiveCameraDebugPanel: View {
             previewImage = nil
             return
         }
-        previewImage = Self.previewImage(from: buffer)
+        previewImage = Self.previewImage(from: buffer, scale: displayScale)
+        guard fixtureVisibleObjects == nil,
+              detectorLoaded,
+              let perception,
+              Date().timeIntervalSince(lastDetectionAt) >= 1 else { return }
+        lastDetectionAt = Date()
+        visibleObjects = PerceptionDebugSummary.visibleObjects(perception.detectObjects())
     }
 
-    private static func previewImage(from pixelBuffer: CVPixelBuffer) -> UIImage? {
+    private static func previewImage(from pixelBuffer: CVPixelBuffer, scale: CGFloat) -> UIImage? {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let context = CIContext()
         guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
-        return UIImage(cgImage: cgImage, scale: UIScreen.main.scale, orientation: .right)
+        return UIImage(cgImage: cgImage, scale: scale, orientation: .right)
     }
 }
