@@ -20,6 +20,11 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var lastIncomingPayload: Data?
     @ObservationIgnored private var retryAction: OpticalAction?
     @ObservationIgnored private var trackingRecovery: TrackingRecovery?
+    @ObservationIgnored private var searchDeadline: SilentSearchInstant?
+    @ObservationIgnored private var rendezvousTimedOut = false
+    @ObservationIgnored private var localStatus: StatusBody?
+    @ObservationIgnored private var rendezvousDecision: DecisionBody?
+    @ObservationIgnored private var lastPresentedPayload: Data?
 
     private enum OpticalAction {
         case present(Data)
@@ -33,6 +38,10 @@ public final class SilentSearchCoordinator {
     }
 
     private struct OpticalTimeout: Error {}
+    private struct PartnerTimeout: Error {}
+    private struct RendezvousMotionError: Error {
+        let failure: SilentSearchMotionFailure
+    }
 
     public init(dependencies: SilentSearchDependencies) {
         self.dependencies = dependencies
@@ -135,6 +144,11 @@ public final class SilentSearchCoordinator {
         retryAction = nil
         trackingRecovery = nil
         targetConfirmation = nil
+        searchDeadline = nil
+        rendezvousTimedOut = false
+        localStatus = nil
+        rendezvousDecision = nil
+        lastPresentedPayload = nil
         searchDeadlineTask?.cancel()
         searchDeadlineTask = nil
         calibrationProgress = 0
@@ -352,6 +366,7 @@ public final class SilentSearchCoordinator {
 
     func startSearch(until deadline: SilentSearchInstant) {
         guard phase == .searching else { return }
+        searchDeadline = deadline
         searchDeadlineTask?.cancel()
         searchDeadlineTask = Task { [weak self] in
             guard let self else { return }
@@ -449,6 +464,7 @@ public final class SilentSearchCoordinator {
             await dependencies.motion.stop()
             guard phase == .returning else { return }
             try? transition(to: .rendezvous(.waiting))
+            startRendezvous()
         case let .failed(failure):
             await finish(with: .motionFailure(failure))
         case .cancelled:
@@ -458,6 +474,255 @@ public final class SilentSearchCoordinator {
 
     private var sector: SearchSector {
         mission?.role.searchSector ?? .west
+    }
+
+    private func startRendezvous() {
+        missionTask = Task { [weak self] in await self?.runRendezvous() }
+    }
+
+    private func runRendezvous() async {
+        guard var session = protocolSession else { return }
+        do {
+            try session.beginRendezvous()
+            protocolSession = session
+            localStatus = try makeStatus()
+
+            while !Task.isCancelled {
+                switch session.phase {
+                case .readyToSendStatus:
+                    guard let localStatus else { throw OpticalProtocolRejection.invalidDecision }
+                    let payload = try session.prepareOutgoing(body: .status(localStatus),
+                                                              at: dependencies.clock.wallNowMilliseconds)
+                    protocolSession = session
+                    try await rendezvousPresent(payload, heading: .pi / 2)
+                case .awaitingAStatus:
+                    let payload = try await rendezvousScan(heading: .pi / 2)
+                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                    lastIncomingPayload = payload
+                    protocolSession = session
+                case .readyToSendBStatus:
+                    let status = try status(linkedTo: linkHashOfLastIncoming())
+                    localStatus = status
+                    let payload = try session.prepareOutgoing(body: .status(status),
+                                                              at: dependencies.clock.wallNowMilliseconds)
+                    protocolSession = session
+                    try await rendezvousPresent(payload, heading: -.pi / 2)
+                case .awaitingBStatus:
+                    let payload = try await rendezvousScan(heading: -.pi / 2)
+                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                    lastIncomingPayload = payload
+                    protocolSession = session
+                case .readyToSendDecision:
+                    guard let aStatus = localStatus,
+                          let bStatus = try decodedBody(lastIncomingPayload, as: StatusBody.self),
+                          let aPayload = lastPresentedPayload else {
+                        throw OpticalProtocolRejection.invalidDecision
+                    }
+                    let decision = OpticalProtocolSession.decision(
+                        roverA: aStatus,
+                        roverB: bStatus,
+                        roverAHash: OpticalMessageCodec().messageLinkHash(for: aPayload),
+                        roverBHash: linkHashOfLastIncoming()
+                    )
+                    rendezvousDecision = decision
+                    let payload = try session.prepareOutgoing(body: .decision(decision),
+                                                              at: dependencies.clock.wallNowMilliseconds)
+                    protocolSession = session
+                    try await rendezvousPresent(payload, heading: .pi / 2)
+                case .awaitingDecision:
+                    let payload = try await rendezvousScan(heading: .pi / 2)
+                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                    rendezvousDecision = try decodedBody(payload, as: DecisionBody.self)
+                    lastIncomingPayload = payload
+                    protocolSession = session
+                case .readyToSendConverge:
+                    guard let decision = rendezvousDecision,
+                          let decisionPayload = lastPresentedPayload else {
+                        throw OpticalProtocolRejection.invalidDecision
+                    }
+                    let release = dependencies.clock.wallNowMilliseconds.addingReportingOverflow(30_000)
+                    guard !release.overflow else { throw OpticalProtocolRejection.invalidSchedule }
+                    let payload = try session.prepareOutgoing(body: .converge(ConvergeBody(
+                        decisionHash: OpticalMessageCodec().messageLinkHash(for: decisionPayload),
+                        releaseMilliseconds: release.partialValue,
+                        x: decision.x,
+                        y: decision.y
+                    )), at: dependencies.clock.wallNowMilliseconds)
+                    protocolSession = session
+                    try await rendezvousPresent(payload, heading: .pi / 2)
+                case .awaitingConverge:
+                    let payload = try await rendezvousScan(heading: .pi / 2)
+                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                    lastIncomingPayload = payload
+                    protocolSession = session
+                case .readyToSendConvergeAck:
+                    let payload = try session.prepareOutgoing(body: .convergeAck(HashAcknowledgementBody(
+                        hash: linkHashOfLastIncoming()
+                    )), at: dependencies.clock.wallNowMilliseconds)
+                    protocolSession = session
+                    try await rendezvousPresent(payload, heading: -.pi / 2)
+                case .awaitingConvergeAck:
+                    let payload = try await rendezvousScan(heading: -.pi / 2)
+                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                    lastIncomingPayload = payload
+                    protocolSession = session
+                case .terminalConflict:
+                    await finish(with: .protocolFailure(.convergenceAfterConflict))
+                    return
+                case .terminalNotFound:
+                    await finish(with: .notFound)
+                    return
+                case let .convergenceScheduled(_, release, x?, y?):
+                    try transition(to: .waitingForConvergence)
+                    try await dependencies.clock.sleep(until: monotonicInstant(forWallMilliseconds: release))
+                    guard !Task.isCancelled, phase == .waitingForConvergence else { return }
+                    try transition(to: .converging)
+                    await converge(to: MissionPoint(x: Double(x) / 1_000, y: Double(y) / 1_000)!)
+                    return
+                default:
+                    throw OpticalProtocolRejection.unexpectedPhase
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch is PartnerTimeout {
+            await finish(with: .partnerTimeout)
+        } catch let error as RendezvousMotionError {
+            await finish(with: .motionFailure(error.failure))
+        } catch let rejection as OpticalProtocolRejection {
+            await finish(with: .protocolFailure(rejection))
+        } catch {
+            if !Task.isCancelled { await finish(with: .safetyFailure(.transport)) }
+        }
+    }
+
+    private func makeStatus() throws -> StatusBody {
+        try status(linkedTo: nil)
+    }
+
+    private func status(linkedTo previousHash: String?) throws -> StatusBody {
+        guard let confirmation = targetConfirmation else {
+            return StatusBody(found: false, previousStatusHash: previousHash)
+        }
+        guard let x = Int32(exactly: (confirmation.coordinate.x * 1_000).rounded()),
+              let y = Int32(exactly: (confirmation.coordinate.y * 1_000).rounded()),
+              let confidence = UInt16(exactly: (confirmation.meanConfidence * 10_000).rounded()),
+              let sampleCount = UInt16(exactly: confirmation.sampleCount),
+              confidence <= 10_000, sampleCount > 0 else {
+            throw OpticalProtocolRejection.codec(.invalidBody)
+        }
+        return StatusBody(
+            found: true,
+            previousStatusHash: previousHash,
+            label: confirmation.label,
+            x: x,
+            y: y,
+            confidenceBasisPoints: confidence,
+            sampleCount: sampleCount
+        )
+    }
+
+    private func rendezvousPresent(_ payload: Data, heading: Double) async throws {
+        try await prepareRendezvousExchange(heading: heading, phase: .presenting)
+        try await partnerTimed { try await self.dependencies.opticalExchange.present(payload: payload) }
+        lastPresentedPayload = payload
+    }
+
+    private func rendezvousScan(heading: Double) async throws -> Data {
+        try await prepareRendezvousExchange(heading: heading, phase: .scanning)
+        return try await partnerTimed {
+            try await self.dependencies.opticalExchange.scan(until: self.partnerDeadline())
+        }
+    }
+
+    private func prepareRendezvousExchange(heading: Double, phase step: SilentSearchRendezvousStep) async throws {
+        let result = await dependencies.motion.rotate(to: heading, tolerance: SilentSearchGeometry.headingTolerance)
+        switch result {
+        case .arrived:
+            try transition(to: .rendezvous(step))
+        case let .failed(failure):
+            throw RendezvousMotionError(failure: failure)
+        case .cancelled:
+            throw CancellationError()
+        }
+    }
+
+    private func partnerTimed<T: Sendable>(
+        _ operation: @escaping @MainActor () async throws -> T
+    ) async throws -> T {
+        let deadline = partnerDeadline()
+        if dependencies.clock.monotonicNow >= deadline { throw PartnerTimeout() }
+        rendezvousTimedOut = false
+        let timeoutTask = Task { [weak self] in
+            guard let self else { return }
+            do { try await self.dependencies.clock.sleep(until: deadline) } catch { return }
+            self.rendezvousTimedOut = true
+            self.dependencies.opticalExchange.cancel()
+        }
+        do {
+            let result = try await operation()
+            timeoutTask.cancel()
+            return result
+        } catch {
+            timeoutTask.cancel()
+            if rendezvousTimedOut { throw PartnerTimeout() }
+            throw error
+        }
+    }
+
+    private func partnerDeadline() -> SilentSearchInstant {
+        guard let searchDeadline else { return dependencies.clock.monotonicNow }
+        let deadline = searchDeadline.addingReportingOverflow(60_000_000_000)
+        return deadline.overflow ? Int64.max : deadline.partialValue
+    }
+
+    private func decodedBody<T>(_ payload: Data?, as type: T.Type) throws -> T? {
+        guard let payload else { return nil }
+        let body = try OpticalMessageCodec().decode(payload).body
+        return switch body {
+        case let .status(value): value as? T
+        case let .decision(value): value as? T
+        default: nil
+        }
+    }
+
+    private func converge(to target: MissionPoint) async {
+        guard let mission else { return }
+        let xOffset = mission.role == .a ? -SilentSearchGeometry.targetOffset : SilentSearchGeometry.targetOffset
+        let standOff = MissionPoint(x: target.x + xOffset, y: target.y)!
+        let navigation = await dependencies.motion.navigate(to: standOff, policy: .unrestrictedConvergence)
+        guard phase == .converging else { return }
+        switch navigation {
+        case let .failed(failure):
+            await finish(with: .motionFailure(failure))
+            return
+        case .cancelled:
+            return
+        case .arrived:
+            break
+        }
+        let heading = atan2(-(target.x - standOff.x), target.y - standOff.y)
+        let rotation = await dependencies.motion.rotate(to: heading, tolerance: SilentSearchGeometry.headingTolerance)
+        guard phase == .converging else { return }
+        switch rotation {
+        case let .failed(failure):
+            await finish(with: .motionFailure(failure))
+        case .cancelled:
+            return
+        case .arrived:
+            guard poseIsAtStandOff(standOff, heading: heading) else {
+                await finish(with: .motionFailure(.noPose))
+                return
+            }
+            await finish(with: .success)
+        }
+    }
+
+    private func poseIsAtStandOff(_ point: MissionPoint, heading: Double) -> Bool {
+        guard let pose = dependencies.motion.currentMissionPose else { return false }
+        return hypot(pose.position.x - point.x, pose.position.y - point.y) <= SilentSearchGeometry.positionTolerance &&
+            abs(atan2(sin(pose.heading - heading), cos(pose.heading - heading))) <=
+                SilentSearchGeometry.headingTolerance
     }
 
     private func monotonicInstant(forWallMilliseconds wall: Int64) throws -> SilentSearchInstant {

@@ -86,12 +86,13 @@ final class FakeSilentSearchOpticalExchange: SilentSearchOpticalExchanging {
     private var scanContinuations: [CheckedContinuation<Data, Error>] = []
     private(set) var presentedPayloads: [Data] = []
     var peer: FakeSilentSearchOpticalExchange?
+    var shouldRelay: (Data) -> Bool = { _ in true }
     var suspendPresent = false
     private var presentContinuations: [CheckedContinuation<Void, Error>] = []
 
     func present(payload: Data) async throws {
         presentedPayloads.append(payload)
-        peer?.deliver(payload)
+        if shouldRelay(payload) { peer?.deliver(payload) }
         guard suspendPresent else { return }
         try await withCheckedThrowingContinuation { presentContinuations.append($0) }
     }
@@ -171,19 +172,36 @@ final class FakeSilentSearchMotion: SilentSearchMotion {
     var suspendStop = false
     private(set) var stopCount = 0
     private(set) var navigationRequests: [(MissionPoint, SilentSearchMotionPolicy)] = []
+    private(set) var rotationRequests: [(heading: Double, tolerance: Double)] = []
+    var updatePoseOnArrival = false
     var onStop: (() -> Void)?
     private var navigationContinuations: [CheckedContinuation<SilentSearchMotionResult, Never>] = []
     private var stopContinuations: [CheckedContinuation<Void, Never>] = []
 
     func navigate(to target: MissionPoint, policy: SilentSearchMotionPolicy) async -> SilentSearchMotionResult {
         navigationRequests.append((target, policy))
-        if !results.isEmpty { return results.removeFirst() }
-        guard suspendNavigation else { return result }
+        if !results.isEmpty {
+            let next = results.removeFirst()
+            if next == .arrived, updatePoseOnArrival {
+                currentMissionPose = MissionPose(position: target, heading: currentMissionPose?.heading ?? 0)
+            }
+            return next
+        }
+        guard suspendNavigation else {
+            if result == .arrived, updatePoseOnArrival {
+                currentMissionPose = MissionPose(position: target, heading: currentMissionPose?.heading ?? 0)
+            }
+            return result
+        }
         return await withCheckedContinuation { navigationContinuations.append($0) }
     }
 
     func rotate(to heading: Double, tolerance: Double) async -> SilentSearchMotionResult {
-        result
+        rotationRequests.append((heading, tolerance))
+        if result == .arrived, updatePoseOnArrival, let pose = currentMissionPose {
+            currentMissionPose = MissionPose(position: pose.position, heading: heading)
+        }
+        return result
     }
 
     func stop() async {
@@ -241,7 +259,7 @@ final class RecordingSilentSearchEventSink: SilentSearchEventSink {
 
 @MainActor
 struct SilentSearchTestHarness {
-    let clock = ManualSilentSearchClock()
+    let clock: ManualSilentSearchClock
     let readiness = FakeSilentSearchReadiness()
     let calibration = FakeSilentSearchCalibration()
     let optical: FakeSilentSearchOpticalExchange
@@ -251,7 +269,11 @@ struct SilentSearchTestHarness {
     let safety = FakeSilentSearchSafetyMonitor()
     let events = RecordingSilentSearchEventSink()
 
-    init(optical: FakeSilentSearchOpticalExchange = FakeSilentSearchOpticalExchange()) {
+    init(
+        clock: ManualSilentSearchClock = ManualSilentSearchClock(),
+        optical: FakeSilentSearchOpticalExchange = FakeSilentSearchOpticalExchange()
+    ) {
+        self.clock = clock
         self.optical = optical
     }
 
