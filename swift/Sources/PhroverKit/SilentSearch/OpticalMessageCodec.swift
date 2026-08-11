@@ -32,6 +32,12 @@ public struct OpticalMessageCodec: Sendable {
     }
 
     public func decode(_ data: Data, nowMilliseconds: Int64) throws -> OpticalMessage {
+        let message = try decode(data)
+        try validateTimestamp(of: message, nowMilliseconds: nowMilliseconds)
+        return message
+    }
+
+    public func decode(_ data: Data) throws -> OpticalMessage {
         guard data.count <= Self.maximumPayloadBytes else { throw OpticalMessageCodecError.payloadTooLarge }
         guard String(data: data, encoding: .utf8) != nil else { throw OpticalMessageCodecError.malformedUTF8 }
         let value: Any
@@ -50,11 +56,14 @@ public struct OpticalMessageCodec: Sendable {
 
         let message = try parse(envelope)
         try validate(message)
+        return message
+    }
+
+    public func validateTimestamp(of message: OpticalMessage, nowMilliseconds: Int64) throws {
         let age = nowMilliseconds.subtractingReportingOverflow(message.timestampMilliseconds)
         guard !age.overflow else { throw OpticalMessageCodecError.stale }
         if age.partialValue > Self.maximumAgeMilliseconds { throw OpticalMessageCodecError.stale }
         if age.partialValue < -Self.maximumFutureMilliseconds { throw OpticalMessageCodecError.future }
-        return message
     }
 
     public func messageLinkHash(for message: OpticalMessage) throws -> String {
