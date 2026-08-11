@@ -33,24 +33,17 @@ The coordinator exposes state and diagnostics suitable for SwiftUI without impor
 
 ### `SharedMissionFrame`
 
-Represents a session-local rigid transform between ARKit's navigation plane and mission coordinates. The printed floor marker's center is `(0, 0)`. The marker's printed forward arrow defines mission north; mission west/east are the negative/positive perpendicular axes used for sector filtering.
+Represents a session-local rigid transform between ARKit's navigation plane and mission coordinates. The printed floor marker's center is `(0, 0)`. Mission `x` increases east, mission `y` increases north along the marker's printed arrow, and heading zero points north with positive angles counterclockwise. Rover A's west sector is `x < -0.25 m`; Rover B's east sector is `x > 0.25 m`. The center exclusion band is not searchable.
 
-Calibration detects the marker's QR corners, grounds them with LiDAR, and derives origin, heading, and observed physical size. It accepts calibration only after three samples agree within 0.10 m of origin, 5 degrees of heading, and 15 percent of the configured marker width. The transform is invalidated by an AR session reset or unrecovered tracking loss and is never persisted across sessions.
+Calibration detects the marker's oriented QR corners, grounds them with LiDAR, and derives origin, heading, and observed physical size. It uses exactly one observation per AR frame and accepts after three observations from distinct frames within two seconds. Every observed origin must be within 0.10 m of the component-wise median origin, every heading within 5 degrees of the circular mean heading, and every observed width within 15 percent of the configured 0.20 m marker width. The transform is invalidated by an AR session reset or unrecovered tracking loss and is never persisted across sessions.
 
 ### `OpticalMessageCodec`
 
-Encodes and validates compact, versioned QR payloads. Every message contains:
+Encodes and validates compact, versioned QR payloads as canonical JSON. Keys are serialized lexicographically with `JSONEncoder.OutputFormatting.sortedKeys`; coordinates and dimensions are signed integer millimeters, headings are signed integer millidegrees, and timestamps are Unix epoch milliseconds. The checksum is the first 16 bytes of SHA-256 over the UTF-8 canonical JSON with the checksum field omitted, encoded as lowercase hexadecimal.
 
-- protocol version;
-- mission UUID;
-- message kind and monotonically increasing sequence;
-- sender role;
-- calibration marker ID;
-- timestamp;
-- message-specific body;
-- checksum over the canonical payload.
+Every message contains protocol version, mission UUID, message kind, a sequence that increases globally per sender, sender role, calibration marker ID, timestamp, message-specific body, and checksum. Message kinds are mission offer, acceptance, search commit, search-commit acknowledgement, rover status, rendezvous decision, convergence commit, and convergence-commit acknowledgement.
 
-Message kinds are mission offer, acceptance, search commit, rover status, target report, report acknowledgement, and convergence commit. The codec rejects malformed, stale, duplicated, out-of-order, wrong-role, wrong-marker, wrong-mission, and unsupported-version messages.
+Except where a phase applies a narrower deadline, messages are stale 120 seconds after their timestamp and invalid more than 5 seconds in the future. The codec rejects malformed, stale, duplicated, out-of-order, wrong-role, wrong-marker, wrong-mission, and unsupported-version messages.
 
 ### `OpticalExchangeService`
 
@@ -60,15 +53,17 @@ Generates high-contrast QR images and scans QR observations from rear-camera fra
 
 Builds a costmap from the current AR mesh, obtains candidate frontiers, converts their centroids into the shared mission frame, and keeps only candidates in the assigned half-plane. A 0.25 m exclusion band around the center line prevents path jitter from producing accidental sector crossings.
 
-Eligible frontiers are ranked by path reachability, distance, width, and whether they have already been visited or rejected. The explorer navigates to one frontier at a time, settles, performs a visual scan, then rebuilds the candidate set. A candidate with no safe path is rejected and exploration continues. Exhaustion returns the rover to rendezvous rather than crossing into its peer's sector.
+Rebuilt frontier observations within 0.30 m of an existing mission candidate retain that candidate's identity. Visited and rejected state lasts for the mission. The explorer excludes visited, rejected, unreachable, and out-of-sector candidates, then sorts lexicographically by shortest safe path length ascending, frontier width descending, mission `x` ascending, and mission `y` ascending. This ordering is the deterministic ranking policy.
 
-The planned path is also validated in mission coordinates. A path entering the opposite sector is rejected even when its destination remains in the correct sector.
+The explorer navigates to one frontier at a time, settles, performs a visual scan, then rebuilds the candidate set. A candidate with no safe path is rejected and exploration continues. Exhaustion returns the rover to rendezvous rather than crossing into its peer's sector.
+
+`NavigationController` gains a path-admissibility policy applied to the initial plan and every periodic replan before wheel commands are sent. A path entering the center band or opposite sector is rejected with a distinct policy-failure result even when its destination remains in the correct sector.
 
 ### `TargetTracker`
 
-Consumes RoverYOLO detections and LiDAR grounding. It confirms the configured canonical object class only after at least three recent detections each have confidence at or above `0.90`, valid depth, and shared-frame positions clustered within `0.35 m`.
+Consumes RoverYOLO detections and LiDAR grounding. It considers at most one best matching detection per AR frame and confirms the configured canonical object class only after three detections from distinct frames within two seconds. Every accepted detection must have confidence at or above `0.90`, valid depth, and a shared-frame position within `0.35 m` of the component-wise median position.
 
-The confirmed coordinate is the component-wise median of accepted shared-frame positions. A first sighting, an ungrounded detection, or a differently labelled object never triggers return or reporting.
+The confirmed coordinate is that median. A first sighting, repeated inference over one frame, an ungrounded detection, or a differently labelled object never triggers return or reporting.
 
 ## Mission State Machine
 
@@ -82,13 +77,14 @@ Each rover scans the same physical floor marker independently. The coordinator s
 
 ### 3. Handshake
 
-The app guides a three-message exchange:
+The app guides a four-message exchange:
 
 1. Rover A displays a mission offer containing target, role assignment, marker ID, sector policy, search duration, and rendezvous geometry. Rover B scans and validates it.
 2. Rover B displays acceptance with its complementary role, calibration identity, and wall-clock reading. Rover A scans and validates it.
-3. Rover A displays a search commit with a start time at least five seconds in the future and an absolute deadline. Rover B scans it.
+3. Rover A displays a search commit with a start time at least 30 seconds in the future and an absolute deadline. Rover B scans it.
+4. Rover B displays a search-commit acknowledgement containing the commit hash. Rover A scans it.
 
-The handshake rejects clock disagreement greater than two seconds. Both coordinators wait until the committed start time before moving.
+The handshake rejects clock disagreement greater than two seconds. Rover A must accept the acknowledgement at least five seconds before the committed start or abort the schedule and issue a new commit. Both coordinators wait until the acknowledged start time before moving. The operator-facing screens expose whether each side has accepted the schedule; v1 does not claim Byzantine or packet-loss-resistant consensus over an optical channel.
 
 ### 4. Search
 
@@ -105,17 +101,23 @@ The loop ends when the target is confirmed, no eligible frontier remains, the de
 
 ### 5. Return and Rendezvous
 
-The mission offer defines two staging poses relative to the marker, one per role, so the rovers do not target the same physical point. Each rover navigates to its own pose and remains stopped. A finder waits until the peer arrives or until 60 seconds after the deadline.
+The fixed rendezvous staging positions are Rover A at `(-0.60 m, -0.80 m)` and Rover B at `(+0.60 m, -0.80 m)` in the shared frame, each with 0.20 m position tolerance. They sit south of a marker whose arrow points into the search space. For an optical scan of Rover B's screen, both rovers rotate their rear cameras east so B's screen faces A; for an optical scan of Rover A's screen, both rotate west. Rotation uses a 10-degree heading tolerance.
+
+Each rover navigates to its own staging position and remains stopped. If a staging pose or its path is unsafe, the mission fails; v1 does not search for an alternate rendezvous pose. A finder waits until the peer arrives or until 60 seconds after the deadline.
 
 ### 6. Status and Report Exchange
 
-The app guides sequential role-ordered status exchange. If one rover found the target, the finder displays a target report containing the canonical label, shared coordinate, sample count, confidence summary, and report hash. The peer scans it and displays an acknowledgement of that hash. The finder scans the acknowledgement and displays a convergence commit with a start time at least five seconds in the future. The peer scans the commit.
+The app exchanges status in role order. Rover A first displays its status; Rover B scans it. Rover B then displays its own status plus the hash of A's status; Rover A scans it. A found status contains the canonical label, shared coordinate, sample count, and confidence summary.
 
-If both rovers independently report a target, the reports must agree within 0.50 m; otherwise the mission fails as conflicting evidence. If neither reports a target, they exchange terminal not-found status and stop.
+Rover A deterministically selects the rendezvous result. If exactly one status contains a target, that report is selected. If both contain targets within 0.50 m, the selected coordinate is their component-wise median. If both contain targets farther apart, the mission fails as conflicting evidence. If neither contains a target, the result is terminal not-found.
+
+Rover A displays a rendezvous-decision message containing both status hashes and the selected result; Rover B scans it. For convergence, Rover A then displays a convergence commit at least 30 seconds in the future, Rover B scans and displays a hash acknowledgement, and Rover A scans that acknowledgement at least five seconds before release. The same acknowledged-decision mechanism carries terminal not-found without movement.
 
 ### 7. Convergence
 
-Each rover converts the shared target coordinate into its local AR frame and applies a different role-specific stand-off offset. Both wait for the committed convergence time, navigate through normal safety controls, and turn to face the target. A rover displays `FOUND` only after its own motion reaches the stand-off pose and final heading tolerance.
+The role-specific stand-off positions are fixed in the shared frame: Rover A targets `0.60 m` west of the selected coordinate and Rover B targets `0.60 m` east of it. Each faces the selected coordinate. Position tolerance is 0.20 m and heading tolerance is 10 degrees. If either pose or path is unsafe, that rover fails; v1 does not search for an alternate stand-off pose.
+
+Each rover converts its stand-off pose into its local AR frame, waits for the acknowledged convergence time, navigates through normal safety controls, and turns to face the target. A rover displays `FOUND` only after its own motion reaches both tolerances.
 
 ### 8. Completion
 
@@ -126,7 +128,7 @@ The coordinator records a terminal success, not-found result, operator abort, pa
 Decision precedence is:
 
 1. Operator Stop or emergency stop.
-2. Existing obstacle, communication, tracking, and progress safety.
+2. Existing obstacle, communication, and progress safety plus coordinator-enforced AR tracking safety.
 3. Calibration and shared-frame validity.
 4. Optical protocol validity.
 5. Mission deadline and rendezvous rules.
@@ -134,13 +136,13 @@ Decision precedence is:
 
 Additional behavior:
 
-- Limited AR tracking pauses new movement. Failure to recover within five seconds stops the mission and invalidates calibration.
+- Limited AR tracking immediately cancels active navigation and keeps the rover stopped. If normal tracking returns within five seconds, the coordinator may replan from the current pose before resuming the same phase; otherwise it terminates the mission and invalidates calibration.
 - An AR session reset always invalidates the shared frame.
 - Deadline expiry cancels active exploration and begins return.
 - A frontier planning failure rejects only that candidate; a transport, reactive-safety, or active-navigation failure terminates the mission.
 - Every optical step times out after 30 seconds and offers Retry or Abort. Retry never advances sequence state until a valid message is scanned.
 - A missing peer keeps the waiting rover stopped. The mission fails 60 seconds after the search deadline.
-- Neither rover begins convergence until report acknowledgement and convergence commit are complete.
+- Neither rover begins convergence until both statuses, the rendezvous decision, the convergence commit, and its acknowledgement are complete.
 - No fallback permits crossing the assigned sector, accepting a lower-confidence target, or moving with an invalid shared frame.
 
 ## Operator Experience
@@ -174,6 +176,19 @@ Structured runtime logs include:
 
 Logs do not store camera images or complete QR payloads.
 
+## Delivery Boundaries
+
+This is one cohesive product specification but is delivered as six independently testable implementation slices, in order:
+
+1. Shared-frame math and synthetic calibration validation.
+2. Canonical optical messages and the complete acknowledged exchange protocol.
+3. Sector path policy, deterministic frontier selection, and target tracking.
+4. Coordinator state machine with a two-rover in-memory simulation.
+5. Device calibration/scanning adapters and the operator UI.
+6. Two-device integration and hardware acceptance.
+
+Each slice must leave tests passing and expose no unfinished behavior through the app. Slice 6 is a hardware release gate: code completion can be reported separately, but the feature is not declared device-verified until the two-rover checklist passes.
+
 ## Testing Strategy
 
 Implementation is test-first wherever behavior does not require physical hardware.
@@ -186,7 +201,7 @@ Implementation is test-first wherever behavior does not require physical hardwar
 - Filter frontier destinations and full paths against west/east sectors and the center exclusion band.
 - Rank reachable, visited, rejected, and exhausted frontiers deterministically.
 - Confirm only clustered, depth-grounded, high-confidence detections and compute their median coordinate.
-- Derive collision-free role-specific rendezvous and target stand-off poses.
+- Verify the fixed role-specific rendezvous and target stand-off poses, tolerances, and unsafe-pose failure behavior.
 - Exercise every valid and invalid coordinator transition, deadline, timeout, retry, abort, and terminal state.
 
 ### Coordinator Tests
@@ -199,7 +214,7 @@ Run two coordinators with fake clocks, perception, motion, and an in-memory opti
 - neither rover finding the target;
 - sector exhaustion before deadline;
 - duplicate and out-of-order optical messages;
-- missing acknowledgement or convergence commit;
+- missing search-commit acknowledgement, rendezvous decision, convergence commit, or convergence-commit acknowledgement;
 - partner rendezvous timeout;
 - calibration invalidation and safety-stop propagation.
 
