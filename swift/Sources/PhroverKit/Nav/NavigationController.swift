@@ -14,7 +14,6 @@ import RoverNav
 @MainActor
 public final class NavigationController {
     public enum State: Equatable, Sendable { case idle, planning, driving, arrived, failed(String) }
-    enum VisualTargetApproachDecision: Equatable { case inactive, approach, arrived }
     public private(set) var state: State = .idle
     public private(set) var path: [Vec2] = []
 
@@ -28,6 +27,7 @@ public final class NavigationController {
     private let guardLayer: ObstacleGuard
     private let safetyFeedback: () -> RoverFeedback?
     private let depthSafetyObservation: (WheelCommand) -> DepthSafetyObservation
+    private let planningReadinessSnapshot: () -> PlanningReadinessSnapshot
 
     private struct OperationToken: Equatable, Sendable {
         let generation: UInt64
@@ -59,7 +59,8 @@ public final class NavigationController {
             scanDepthRecoveryTimeout: scanDepthRecoveryTimeout,
             guardLayer: ObstacleGuard(),
             safetyFeedback: { nil },
-            depthSafetyObservation: { ar.depthSafetyObservation(for: $0) }
+            depthSafetyObservation: { ar.depthSafetyObservation(for: $0) },
+            planningReadinessSnapshot: { ar.planningReadiness }
         )
     }
 
@@ -70,7 +71,14 @@ public final class NavigationController {
         scanDepthRecoveryTimeout: TimeInterval,
         guardLayer: ObstacleGuard,
         safetyFeedback: @escaping () -> RoverFeedback?,
-        depthSafetyObservation: @escaping (WheelCommand) -> DepthSafetyObservation
+        depthSafetyObservation: @escaping (WheelCommand) -> DepthSafetyObservation,
+        planningReadinessSnapshot: @escaping () -> PlanningReadinessSnapshot = {
+            PlanningReadinessSnapshot(
+                sessionGeneration: 0,
+                normalObservationStreak: 3,
+                trustedMeshRevision: 1
+            )
+        }
     ) {
         self.ar = ar
         self.control = control
@@ -79,6 +87,7 @@ public final class NavigationController {
         self.guardLayer = guardLayer
         self.safetyFeedback = safetyFeedback
         self.depthSafetyObservation = depthSafetyObservation
+        self.planningReadinessSnapshot = planningReadinessSnapshot
     }
 
     /// Begin autonomously driving to a nav-plane goal.
@@ -93,11 +102,34 @@ public final class NavigationController {
 
     public func assessGoal(_ goal: Vec2) -> NavigationGoalAssessment {
         guard let start = ar.pose?.position else {
-            return NavigationGoalAssessment(goal: goal, isReachable: false, pathDistance: .infinity)
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: false,
+                pathDistance: .infinity,
+                rejectionReason: .missingPose
+            )
+        }
+        guard planningReadinessSnapshot().isPoseReady,
+              Self.isNavigationObservationUsable(ar.latestObservation) else {
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: false,
+                pathDistance: .infinity,
+                rejectionReason: .trackingUnstable
+            )
         }
         let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
-        guard let candidatePath = planner.plan(from: start, to: goal, in: costmap) else {
-            return NavigationGoalAssessment(goal: goal, isReachable: false, pathDistance: .infinity)
+        let planningResult = planner.assess(from: start, to: goal, in: costmap)
+        guard case .path(let candidatePath) = planningResult else {
+            guard case .rejected(let reason) = planningResult else {
+                preconditionFailure("Unexpected planner result")
+            }
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: false,
+                pathDistance: .infinity,
+                rejectionReason: Self.navigationRejection(for: reason)
+            )
         }
         let distance = zip(candidatePath, candidatePath.dropFirst()).reduce(0) {
             $0 + $1.0.distance(to: $1.1)
@@ -107,25 +139,7 @@ public final class NavigationController {
 
     private func startNavigation(to goal: Vec2, stoppingAtForwardClearance: Double?) {
         let handoff = claimOperation()
-        guard let start = ar.pose?.position else {
-            state = .failed("No ARKit pose yet — move the device to establish tracking.")
-            installStopOnlyOperation(handoff)
-            return
-        }
-        guard planAndStore(from: start, to: goal) else {
-            state = .failed("No path to goal.")
-            installStopOnlyOperation(handoff)
-            return
-        }
-        RuntimeFileLog.append("nav_goal_start", fields: [
-            "goal_x": Self.formatMeters(goal.x),
-            "goal_y": Self.formatMeters(goal.y),
-            "pose_x": Self.formatMeters(start.x),
-            "pose_y": Self.formatMeters(start.y),
-            "distance_to_goal": Self.formatMeters(start.distance(to: goal)),
-            "target_stop_clearance": stoppingAtForwardClearance.map(Self.formatMeters) ?? "none"
-        ])
-        state = .driving
+        state = .planning
         let task = Task {
             await handoff.predecessor?.value
             guard self.isOperationActive(handoff.token) else {
@@ -140,6 +154,42 @@ public final class NavigationController {
                 self.clearLoopIfCurrent(handoff.token)
                 return
             }
+            let readinessOutcome = await self.waitForInitialPlanningContext(operation: handoff.token)
+            guard readinessOutcome == .ready,
+                  self.isOperationActive(handoff.token),
+                  let start = self.ar.pose?.position else {
+                if self.isOperationActive(handoff.token) {
+                    let message = readinessOutcome == .trackingTimeout
+                        ? "AR tracking did not recover in time."
+                        : "AR tracking or mesh did not become ready for planning."
+                    self.setStateIfCurrent(
+                        .failed(message),
+                        operation: handoff.token
+                    )
+                }
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+            switch self.planAndStore(from: start, to: goal) {
+            case .path:
+                break
+            case .rejected(let reason):
+                self.setStateIfCurrent(.failed("No path to goal."), operation: handoff.token)
+                RuntimeFileLog.append("nav_planning_failed", fields: [
+                    "rejection_reason": Self.navigationRejection(for: reason).rawValue
+                ])
+                self.clearLoopIfCurrent(handoff.token)
+                return
+            }
+            RuntimeFileLog.append("nav_goal_start", fields: [
+                "goal_x": Self.formatMeters(goal.x),
+                "goal_y": Self.formatMeters(goal.y),
+                "pose_x": Self.formatMeters(start.x),
+                "pose_y": Self.formatMeters(start.y),
+                "distance_to_goal": Self.formatMeters(start.distance(to: goal)),
+                "target_stop_clearance": stoppingAtForwardClearance.map(Self.formatMeters) ?? "none"
+            ])
+            self.setStateIfCurrent(.driving, operation: handoff.token)
             await self.drive(
                 to: goal,
                 stoppingAtForwardClearance: stoppingAtForwardClearance,
@@ -151,6 +201,65 @@ public final class NavigationController {
             self.clearLoopIfCurrent(handoff.token)
         }
         installLoop(task, operation: handoff.token)
+    }
+
+    public func preparePlanningContext(
+        requiring requirement: PlanningContextRequirement
+    ) async -> PlanningRecoveryOutcome {
+        await stopAndWait()
+        guard !Task.isCancelled else { return .cancelled }
+        let initial = planningReadinessSnapshot()
+        let generation = ar.sessionGeneration
+        let deadline = Date().addingTimeInterval(trackingRecoveryTimeout)
+        var reportedPoseReady = false
+        RuntimeFileLog.append("nav_planning_recovery_started", fields: [
+            "requirement": requirement.rawValue,
+            "session_generation": "\(generation)",
+            "pose_streak": "\(initial.normalObservationStreak)",
+            "mesh_revision": "\(initial.trustedMeshRevision)",
+            "timeout": Self.formatSeconds(trackingRecoveryTimeout)
+        ])
+
+        while Date() < deadline {
+            guard !Task.isCancelled else {
+                return planningRecoveryFailed(.cancelled, requirement: requirement)
+            }
+            guard ar.sessionGeneration == generation else {
+                return planningRecoveryFailed(.sessionGenerationChanged, requirement: requirement)
+            }
+            let snapshot = planningReadinessSnapshot()
+            if snapshot.isPoseReady,
+               Self.isNavigationObservationUsable(ar.latestObservation) {
+                if !reportedPoseReady {
+                    reportedPoseReady = true
+                    RuntimeFileLog.append("nav_planning_pose_ready", fields: [
+                        "requirement": requirement.rawValue,
+                        "pose_streak": "\(snapshot.normalObservationStreak)",
+                        "session_generation": "\(generation)"
+                    ])
+                }
+                if requirement == .stablePose {
+                    return .ready
+                }
+                if snapshot.trustedMeshRevision > initial.trustedMeshRevision {
+                    RuntimeFileLog.append("nav_planning_mesh_refreshed", fields: [
+                        "requirement": requirement.rawValue,
+                        "previous_revision": "\(initial.trustedMeshRevision)",
+                        "current_revision": "\(snapshot.trustedMeshRevision)"
+                    ])
+                    return .ready
+                }
+            }
+            try? await Task.sleep(for: .seconds(RoverConfig.navigationTrackingPollInterval))
+        }
+        let outcome: PlanningRecoveryOutcome = requirement == .stablePose
+            ? .trackingTimeout
+            : (reportedPoseReady ? .meshTimeout : .trackingTimeout)
+        return planningRecoveryFailed(outcome, requirement: requirement)
+    }
+
+    public func recoverPlanningContext() async -> PlanningRecoveryOutcome {
+        await preparePlanningContext(requiring: .refreshedTrustedMesh)
     }
 
     /// Rotate in place by `angle` radians (CCW positive, matching `Pose2D.yaw`) and wait
@@ -409,11 +518,12 @@ public final class NavigationController {
             // Replan every ~1s to fold in newly meshed obstacles.
             replanCounter += 1
             if replanCounter % 10 == 0,
-               !planAndStore(from: pose.position, to: goal) {
+               case .rejected(let rejection) = planAndStore(from: pose.position, to: goal) {
                 guard await stopTransportForActiveOperation(operation) else { return }
                 setStateIfCurrent(.failed("No path to goal after replanning."), operation: operation)
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "replan_failed",
+                    "rejection_reason": Self.navigationRejection(for: rejection).rawValue,
                     "distance_to_goal": Self.formatMeters(distanceToGoal)
                 ])
                 return
@@ -423,7 +533,7 @@ public final class NavigationController {
             let lastAck = await control.lastAckAt
             guard isOperationActive(operation) else { return }
             let now = Date()
-            let decision = guardLayer.evaluate(forwardClearance: ar.forwardClearance,
+            let decision = guardLayer.evaluate(forwardClearance: .infinity,
                                                lastAckAt: lastAck,
                                                now: now,
                                                feedback: nil,
@@ -464,13 +574,39 @@ public final class NavigationController {
                 // Probe the forward envelope without sending motion so stale or blind depth
                 // cannot turn an unsafe stop into a successful arrival.
                 let arrivalProbe = WheelCommand(left: 0.02, right: 0.02)
-                let arrivalSafety = ar.depthSafetyObservation(for: arrivalProbe)
+                let arrivalSafety = depthSafetyObservation(arrivalProbe)
                 switch guardLayer.evaluate(command: arrivalProbe, depthSafety: arrivalSafety) {
                 case .allow(_, _):
                     guard await stopTransportForActiveOperation(operation) else { return }
                     setStateIfCurrent(.arrived, operation: operation)
                 case .stopDepth(let observation):
-                    guard await stopTransportForActiveOperation(operation) else { return }
+                    if observation.state == .unavailable(.staleRawDepth) {
+                        let depthVersion = ar.depthSnapshotVersion
+                        guard await stopTransportForActiveOperation(operation) else { return }
+                        RuntimeFileLog.append("nav_arrival_depth_retry_started", fields: [
+                            "depth_age": Self.formatSeconds(observation.sampleAge),
+                            "depth_version": String(depthVersion),
+                            "timeout_seconds": Self.formatSeconds(scanDepthRecoveryTimeout)
+                        ])
+                        let depthRefreshed = await waitForNewDepthSnapshot(
+                            after: depthVersion,
+                            operation: operation
+                        )
+                        guard isOperationActive(operation) else { return }
+                        if depthRefreshed {
+                            RuntimeFileLog.append("nav_arrival_depth_fresh_snapshot", fields: [
+                                "previous_version": String(depthVersion),
+                                "depth_version": String(ar.depthSnapshotVersion),
+                                "depth_timestamp": ar.depthSnapshotTimestamp.map(Self.formatSeconds) ?? "none"
+                            ])
+                            continue
+                        }
+                        RuntimeFileLog.append("nav_arrival_depth_retry_timeout", fields: [
+                            "depth_version": String(depthVersion)
+                        ])
+                    } else {
+                        guard await stopTransportForActiveOperation(operation) else { return }
+                    }
                     let reason = observation.state.telemetryReason
                     setStateIfCurrent(
                         .failed("Depth safety stop at arrival: \(reason)."),
@@ -516,6 +652,44 @@ public final class NavigationController {
                 case .allow(let safeCommand, _):
                     command = safeCommand
                 case .stopDepth(let observation):
+                    if observation.state == .unavailable(.staleRawDepth) {
+                        let depthVersion = ar.depthSnapshotVersion
+                        guard await stopTransportForActiveOperation(operation) else { return }
+                        RuntimeFileLog.append("nav_depth_retry_started", fields: [
+                            "depth_age": Self.formatSeconds(observation.sampleAge),
+                            "depth_version": String(depthVersion),
+                            "timeout_seconds": Self.formatSeconds(scanDepthRecoveryTimeout)
+                        ])
+                        let depthRefreshed = await waitForNewDepthSnapshot(
+                            after: depthVersion,
+                            operation: operation
+                        )
+                        guard isOperationActive(operation) else { return }
+                        guard depthRefreshed else {
+                            setStateIfCurrent(
+                                .failed("Depth safety stop: stale_raw_depth."),
+                                operation: operation
+                            )
+                            RuntimeFileLog.append("nav_depth_retry_timeout", fields: [
+                                "depth_version": String(depthVersion)
+                            ])
+                            RuntimeFileLog.append("nav_safety_stop", fields: [
+                                "reason": "depth_safety",
+                                "depth_state": observation.state.telemetryReason,
+                                "clearance": Self.formatMeters(observation.clearance),
+                                "depth_age": Self.formatSeconds(observation.sampleAge),
+                                "support_count": "\(observation.supportCount)",
+                                "motion_class": observation.motionClass.rawValue
+                            ])
+                            return
+                        }
+                        RuntimeFileLog.append("nav_depth_fresh_snapshot", fields: [
+                            "previous_version": String(depthVersion),
+                            "depth_version": String(ar.depthSnapshotVersion),
+                            "depth_timestamp": ar.depthSnapshotTimestamp.map(Self.formatSeconds) ?? "none"
+                        ])
+                        continue
+                    }
                     guard await stopTransportForActiveOperation(operation) else { return }
                     let reason = observation.state.telemetryReason
                     setStateIfCurrent(.failed("Depth safety stop: \(reason)."), operation: operation)
@@ -547,7 +721,6 @@ public final class NavigationController {
                                                        goal: goal,
                                                        command: command,
                                                        consecutiveCommandFailures: consecutiveCommandFailures)
-            telemetry["forward_clearance"] = Self.formatMeters(ar.forwardClearance)
             telemetry["depth_safety_state"] = depthSafety.state.telemetryReason
             telemetry["depth_safety_clearance"] = Self.formatMeters(depthSafety.clearance)
             telemetry["depth_safety_age"] = Self.formatSeconds(depthSafety.sampleAge)
@@ -595,11 +768,11 @@ public final class NavigationController {
 
     private func waitForUsableTracking(operation: OperationToken) async -> Bool {
         guard isOperationActive(operation) else { return false }
-        if Self.isNavigationObservationUsable(ar.latestObservation) { return true }
+        if isPlanningPoseReady() { return true }
         guard await stopTransportForActiveOperation(operation) else { return false }
         let deadline = Date().addingTimeInterval(trackingRecoveryTimeout)
         while isOperationActive(operation), Date() < deadline {
-            if Self.isNavigationObservationUsable(ar.latestObservation) { return true }
+            if isPlanningPoseReady() { return true }
             do {
                 try await Task.sleep(for: .seconds(RoverConfig.navigationTrackingPollInterval))
             } catch {
@@ -607,6 +780,28 @@ public final class NavigationController {
             }
         }
         return false
+    }
+
+    private func isPlanningPoseReady() -> Bool {
+        planningReadinessSnapshot().isPoseReady
+            && Self.isNavigationObservationUsable(ar.latestObservation)
+    }
+
+    private func waitForInitialPlanningContext(
+        operation: OperationToken
+    ) async -> PlanningRecoveryOutcome {
+        let deadline = Date().addingTimeInterval(trackingRecoveryTimeout)
+        var sawReadyPose = false
+        while isOperationActive(operation), Date() < deadline {
+            let snapshot = planningReadinessSnapshot()
+            if isPlanningPoseReady() {
+                sawReadyPose = true
+                if snapshot.trustedMeshRevision > 0 { return .ready }
+            }
+            try? await Task.sleep(for: .seconds(RoverConfig.navigationTrackingPollInterval))
+        }
+        guard isOperationActive(operation), !Task.isCancelled else { return .cancelled }
+        return sawReadyPose ? .meshTimeout : .trackingTimeout
     }
 
     static func isNavigationObservationUsable(
@@ -618,14 +813,49 @@ public final class NavigationController {
     }
 
     @discardableResult
-    private func planAndStore(from: Vec2, to: Vec2) -> Bool {
+    private func planAndStore(from: Vec2, to: Vec2) -> PathPlanningResult {
         let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: from)
-        guard let p = planner.plan(from: from, to: to, in: costmap) else {
+        let result = planner.assess(from: from, to: to, in: costmap)
+        guard case .path(let p) = result else {
             path.removeAll()
-            return false
+            return result
         }
         path = p
-        return true
+        return result
+    }
+
+    private func planningRecoveryFailed(
+        _ outcome: PlanningRecoveryOutcome,
+        requirement: PlanningContextRequirement
+    ) -> PlanningRecoveryOutcome {
+        let snapshot = planningReadinessSnapshot()
+        RuntimeFileLog.append("nav_planning_recovery_failed", fields: [
+            "requirement": requirement.rawValue,
+            "outcome": outcome.rawValue,
+            "session_generation": "\(ar.sessionGeneration)",
+            "pose_streak": "\(snapshot.normalObservationStreak)",
+            "mesh_revision": "\(snapshot.trustedMeshRevision)",
+            "tracking_quality": Self.trackingQualityDescription(ar.latestObservation?.trackingQuality)
+        ])
+        return outcome
+    }
+
+    private static func navigationRejection(for failure: PathPlanningFailure) -> NavigationGoalRejection {
+        switch failure {
+        case .startOutsideMap: .startOutsideMap
+        case .goalOutsideMap: .goalOutsideMap
+        case .startBlocked: .startBlocked
+        case .goalBlocked: .goalBlocked
+        case .noConnectedPath: .noConnectedPath
+        }
+    }
+
+    private static func trackingQualityDescription(_ quality: PoseTrackingQuality?) -> String {
+        switch quality {
+        case .normal: "normal"
+        case .limited: "limited"
+        case .unavailable, nil: "unavailable"
+        }
     }
 
     private func performContinuousRotation(to targetYaw: Double,
@@ -923,61 +1153,74 @@ public final class NavigationController {
             return safeCommand
         case .stopDepth(let observation):
             var stoppingObservation = observation
-            if observation.state == .unavailable(.blindSweptVolume),
-               observation.motionClass == .rotating {
+            if Self.shouldWaitForFreshRotationDepth(observation) {
                 guard await stopTransportForActiveOperation(operation) else { return nil }
-                let depthVersion = ar.depthSnapshotVersion
+                var depthVersion = ar.depthSnapshotVersion
+                let deadline = Date().addingTimeInterval(scanDepthRecoveryTimeout)
                 RuntimeFileLog.append("nav_scan_depth_retry_started", fields: [
+                    "depth_state": observation.state.telemetryReason,
                     "depth_version": String(depthVersion),
                     "timeout_seconds": Self.formatSeconds(scanDepthRecoveryTimeout),
                 ])
-                let deadline = Date().addingTimeInterval(scanDepthRecoveryTimeout)
-                while ar.depthSnapshotVersion <= depthVersion,
-                      Date() < deadline,
-                      isOperationActive(operation) {
-                    do {
-                        try await Task.sleep(for: .seconds(RoverConfig.scanDepthRecoveryPollInterval))
-                    } catch {
-                        return nil
-                    }
-                }
-                guard isOperationActive(operation) else { return nil }
-                guard ar.depthSnapshotVersion > depthVersion else {
-                    guard await stopTransportForActiveOperation(operation) else { return nil }
-                    setStateIfCurrent(
-                        .failed("I can’t safely see the space needed to turn. Reposition the rover or camera and try again."),
+                while true {
+                    let depthRefreshed = await waitForNewDepthSnapshot(
+                        after: depthVersion,
+                        deadline: deadline,
                         operation: operation
                     )
-                    RuntimeFileLog.append("nav_scan_depth_retry_timeout", fields: [
+                    guard isOperationActive(operation) else { return nil }
+                    guard depthRefreshed else {
+                        guard await stopTransportForActiveOperation(operation) else { return nil }
+                        let failureMessage = stoppingObservation.state == .unavailable(.blindSweptVolume)
+                            ? "I can’t safely see the space needed to turn. Reposition the rover or camera and try again."
+                            : "Depth safety stop while rotating: \(stoppingObservation.state.telemetryReason)."
+                        setStateIfCurrent(.failed(failureMessage), operation: operation)
+                        RuntimeFileLog.append("nav_scan_depth_retry_timeout", fields: [
+                            "depth_state": stoppingObservation.state.telemetryReason,
+                            "depth_age": Self.formatSeconds(stoppingObservation.sampleAge),
+                            "depth_version": String(depthVersion),
+                        ])
+                        RuntimeFileLog.append("nav_safety_stop", fields: [
+                            "reason": "rotation_depth_timeout",
+                            "depth_state": stoppingObservation.state.telemetryReason,
+                        ])
+                        return nil
+                    }
+
+                    let previousDepthVersion = depthVersion
+                    depthVersion = ar.depthSnapshotVersion
+                    let retriedSafety = depthSafetyObservation(command)
+                    switch guardLayer.evaluate(command: command, depthSafety: retriedSafety) {
+                    case .allow(let safeCommand, let safeObservation):
+                        RuntimeFileLog.append("nav_scan_depth_fresh_snapshot", fields: [
+                            "previous_version": String(previousDepthVersion),
+                            "depth_version": String(depthVersion),
+                            "depth_timestamp": ar.depthSnapshotTimestamp.map(Self.formatSeconds) ?? "none",
+                        ])
+                        guard await rotationGeneralSafetyAllowsMotion(
+                            safeCommand,
+                            requireFreshAck: true,
+                            operation: operation
+                        ) else { return nil }
+                        guard isOperationActive(operation) else { return nil }
+                        RuntimeFileLog.append("nav_scan_depth_original_authorized", fields: [
+                            "depth_state": safeObservation.state.telemetryReason,
+                            "support_count": String(safeObservation.supportCount),
+                        ])
+                        return safeCommand
+                    case .stopDepth(let retriedObservation):
+                        stoppingObservation = retriedObservation
+                    }
+
+                    guard stoppingObservation.state == .unavailable(.staleRawDepth) else {
+                        break
+                    }
+                    RuntimeFileLog.append("nav_scan_depth_retry_candidate_rejected", fields: [
+                        "depth_state": stoppingObservation.state.telemetryReason,
+                        "depth_age": Self.formatSeconds(stoppingObservation.sampleAge),
+                        "previous_version": String(previousDepthVersion),
                         "depth_version": String(depthVersion),
                     ])
-                    RuntimeFileLog.append("nav_safety_stop", fields: [
-                        "reason": "blind_rotation_depth_timeout",
-                        "depth_state": observation.state.telemetryReason,
-                    ])
-                    return nil
-                }
-                RuntimeFileLog.append("nav_scan_depth_fresh_snapshot", fields: [
-                    "previous_version": String(depthVersion),
-                    "depth_version": String(ar.depthSnapshotVersion),
-                    "depth_timestamp": ar.depthSnapshotTimestamp.map(Self.formatSeconds) ?? "none",
-                ])
-                let retriedSafety = depthSafetyObservation(command)
-                switch guardLayer.evaluate(command: command, depthSafety: retriedSafety) {
-                case .allow(let safeCommand, let safeObservation):
-                    guard await rotationGeneralSafetyAllowsMotion(
-                        safeCommand,
-                        requireFreshAck: true,
-                        operation: operation
-                    ) else { return nil }
-                    guard isOperationActive(operation) else { return nil }
-                    RuntimeFileLog.append("nav_scan_depth_original_authorized", fields: [
-                        "depth_state": safeObservation.state.telemetryReason,
-                        "support_count": String(safeObservation.supportCount),
-                    ])
-                    return safeCommand
-                case .stopDepth(let retriedObservation):
-                    stoppingObservation = retriedObservation
                 }
                 if stoppingObservation.state == .unavailable(.blindSweptVolume) {
                     let arcCommand = RotationCommand.depthVisibleArc(matching: command)
@@ -1012,7 +1255,7 @@ public final class NavigationController {
                 }
             }
             guard await stopTransportForActiveOperation(operation) else { return nil }
-            if observation.state == .unavailable(.blindSweptVolume) {
+            if stoppingObservation.state == .unavailable(.blindSweptVolume) {
                 setStateIfCurrent(
                     .failed("I can’t safely see the space needed to turn. Reposition the rover or camera and try again."),
                     operation: operation
@@ -1034,6 +1277,36 @@ public final class NavigationController {
         }
     }
 
+    private static func shouldWaitForFreshRotationDepth(
+        _ observation: DepthSafetyObservation
+    ) -> Bool {
+        guard observation.motionClass == .rotating else { return false }
+        switch observation.state {
+        case .unavailable(.blindSweptVolume), .unavailable(.staleRawDepth):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func waitForNewDepthSnapshot(
+        after depthVersion: UInt64,
+        deadline: Date? = nil,
+        operation: OperationToken
+    ) async -> Bool {
+        let deadline = deadline ?? Date().addingTimeInterval(scanDepthRecoveryTimeout)
+        while ar.depthSnapshotVersion <= depthVersion,
+              Date() < deadline,
+              isOperationActive(operation) {
+            do {
+                try await Task.sleep(for: .seconds(RoverConfig.scanDepthRecoveryPollInterval))
+            } catch {
+                return false
+            }
+        }
+        return isOperationActive(operation) && ar.depthSnapshotVersion > depthVersion
+    }
+
     private func rotationGeneralSafetyAllowsMotion(
         _ command: WheelCommand,
         requireFreshAck: Bool,
@@ -1045,7 +1318,7 @@ public final class NavigationController {
         let now = Date()
         let motionClass = DepthSafetyMotionClass.classify(command)
         let decision = guardLayer.evaluate(
-            forwardClearance: ar.forwardClearance,
+            forwardClearance: .infinity,
             lastAckAt: lastAck,
             now: now,
             feedback: safetyFeedback(),
@@ -1168,35 +1441,6 @@ public final class NavigationController {
         .failed(obstacleMessage(clearance: clearance))
     }
 
-    static func visualTargetApproachDecision(distanceToGoal: Double,
-                                             forwardClearance: Double,
-                                             stopDistance: Double) -> VisualTargetApproachDecision {
-        guard distanceToGoal <= RoverConfig.visualTargetApproachDistance else { return .inactive }
-        let brakeTriggerDistance = stopDistance + RoverConfig.visualTargetBrakeLeadDistance
-        guard forwardClearance.isFinite,
-              forwardClearance <= brakeTriggerDistance else {
-            return .approach
-        }
-        return .arrived
-    }
-
-    static func visualTargetApproachCommand(_ command: WheelCommand,
-                                            forwardClearance: Double,
-                                            stopDistance: Double) -> WheelCommand {
-        guard forwardClearance.isFinite,
-              forwardClearance > stopDistance + RoverConfig.visualTargetBrakeLeadDistance,
-              forwardClearance <= RoverConfig.visualTargetSlowdownDistance,
-              command.left >= 0,
-              command.right >= 0 else {
-            return command
-        }
-
-        let peak = max(command.left, command.right)
-        guard peak > RoverConfig.visualTargetApproachMaxWheelSpeed else { return command }
-        let scale = RoverConfig.visualTargetApproachMaxWheelSpeed / peak
-        return WheelCommand(left: command.left * scale, right: command.right * scale)
-    }
-
     static func depthVisibleForwardCommand(_ command: WheelCommand) -> WheelCommand {
         guard DepthSafetyMotionClass.classify(command) == .curved else { return command }
         let outerSpeed = max(command.left, command.right)
@@ -1265,6 +1509,17 @@ public final class NavigationController {
 
     private static func formatDegrees(_ radians: Double) -> String {
         String(format: "%.0f", radians * 180 / .pi)
+    }
+}
+
+extension NavigationController.State {
+    var isMotionActive: Bool {
+        switch self {
+        case .planning, .driving:
+            true
+        case .idle, .arrived, .failed:
+            false
+        }
     }
 }
 

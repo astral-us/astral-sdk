@@ -94,6 +94,56 @@ final class HybridBrainTests: XCTestCase {
         XCTAssertEqual(order.names, ["on_device", "cloud"])
     }
 
+    func testLocalOnlyBrainWaitsPastPrimaryTimeoutForOnDeviceResult() async throws {
+        let order = CallOrder()
+        let onDevice = RecordingBrain(
+            name: "on_device",
+            order: order,
+            result: .success(.init(decision: .done)),
+            delay: .milliseconds(50)
+        )
+        let brain = HybridBrain(
+            cloud: nil,
+            onDevice: onDevice,
+            primaryTimeout: .milliseconds(10),
+            isOnline: { true }
+        )
+
+        let output = try await brain.nextAction(MissionContext())
+
+        XCTAssertEqual(output.decision, .done)
+        XCTAssertFalse(onDevice.wasCancelled)
+        XCTAssertEqual(order.names, ["on_device"])
+    }
+
+    func testOfflineBrainWaitsPastPrimaryTimeoutForOnDeviceResult() async throws {
+        let order = CallOrder()
+        let onDevice = RecordingBrain(
+            name: "on_device",
+            order: order,
+            result: .success(.init(decision: .done)),
+            delay: .milliseconds(50)
+        )
+        let cloud = RecordingBrain(
+            name: "cloud",
+            order: order,
+            result: .success(.init(decision: .say("cloud")))
+        )
+        let brain = HybridBrain(
+            cloud: cloud,
+            onDevice: onDevice,
+            primaryTimeout: .milliseconds(10),
+            isOnline: { false }
+        )
+
+        let output = try await brain.nextAction(MissionContext())
+
+        XCTAssertEqual(output.decision, .done)
+        XCTAssertFalse(onDevice.wasCancelled)
+        XCTAssertEqual(cloud.callCount, 0)
+        XCTAssertEqual(order.names, ["on_device"])
+    }
+
     func testPrimaryTimeoutDoesNotWaitForNonCooperativeOnDeviceBrain() async throws {
         let order = CallOrder()
         let cancellationProbe = CancellationProbe()

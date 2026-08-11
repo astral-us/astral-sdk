@@ -26,7 +26,6 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var pose: Pose2D?
     public private(set) var meshAnchors: [ARMeshAnchor] = []
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
-    public private(set) var forwardClearance: Double = .infinity
     private(set) var latestDepthSafetySnapshot: DepthSafetySnapshot?
     public private(set) var depthSnapshotVersion: UInt64 = 0
     public var depthSnapshotTimestamp: TimeInterval? { latestDepthSafetySnapshot?.timestamp }
@@ -39,6 +38,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var frameSequence: UInt64 = 0
     public private(set) var latestObservation: PoseObservation?
     public private(set) var sessionGeneration: UInt64 = 0
+    private var planningReadinessTracker = PlanningReadinessTracker()
+    var planningReadiness: PlanningReadinessSnapshot { planningReadinessTracker.snapshot }
     public var observationHandler: ((PoseObservation) -> Void)?
     public var onReset: ((UInt64) -> Void)?
     private var acceptsObservations = false
@@ -86,7 +87,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var latestCamera: ARCamera?
     /// Latest LiDAR depth map (meters, aligned to `latestCamera.imageResolution`'s aspect).
     public private(set) var latestDepthMap: CVPixelBuffer?
-    private var lastClearanceLogAt = Date.distantPast
+    private var lastRejectedMeshLogAt = Date.distantPast
 
     public override init() {
         relativeHeadingTelemetry = { event, fields in
@@ -141,6 +142,25 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         }
     }
 
+    nonisolated func makeRelativeHeadingMotionHandler() -> CMDeviceMotionHandler {
+        { [weak self] motion, _ in
+            guard let motion else { return }
+            self?.ingestRelativeHeadingMotionSample(RelativeHeadingSample(
+                timestamp: motion.timestamp,
+                rotationRate: SIMD3(
+                    motion.rotationRate.x,
+                    motion.rotationRate.y,
+                    motion.rotationRate.z
+                ),
+                gravity: SIMD3(
+                    motion.gravity.x,
+                    motion.gravity.y,
+                    motion.gravity.z
+                )
+            ))
+        }
+    }
+
     private func reportRelativeHeadingReliabilityTransition(
         to reliability: RelativeHeadingReliability
     ) {
@@ -187,9 +207,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     func resetTracking(generation: UInt64, runSession: Bool) {
         acceptsObservations = false
         sessionGeneration = generation
+        planningReadinessTracker.reset(sessionGeneration: generation)
         pose = nil
         meshAnchors.removeAll()
-        forwardClearance = .infinity
         latestDepthSafetySnapshot = nil
         trackingState = .notAvailable
         latestPixelBuffer = nil
@@ -205,23 +225,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             motionManager.deviceMotionUpdateInterval = RoverConfig.relativeHeadingUpdateInterval
             motionManager.startDeviceMotionUpdates(
                 using: .xArbitraryZVertical,
-                to: relativeHeadingOperationQueue
-            ) { [weak self] motion, _ in
-                guard let motion else { return }
-                self?.ingestRelativeHeadingMotionSample(RelativeHeadingSample(
-                    timestamp: motion.timestamp,
-                    rotationRate: SIMD3(
-                        motion.rotationRate.x,
-                        motion.rotationRate.y,
-                        motion.rotationRate.z
-                    ),
-                    gravity: SIMD3(
-                        motion.gravity.x,
-                        motion.gravity.y,
-                        motion.gravity.z
-                    )
-                ))
-            }
+                to: relativeHeadingOperationQueue,
+                withHandler: makeRelativeHeadingMotionHandler()
+            )
         }
         guard runSession else {
             acceptsObservations = true
@@ -309,10 +315,8 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             latestDepthSafetySnapshot = nil
         }
         if let depth = frame.smoothedSceneDepth ?? frame.sceneDepth {
-            forwardClearance = Self.forwardClearance(from: depth)
             latestDepthMap = depth.depthMap
         }
-        logForwardClearanceIfNeeded()
     }
 
     @discardableResult
@@ -327,14 +331,15 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         lastObservationTimestamp = observation.timestamp
         pose = observation.pose
         frameSequence = observation.frameSequence
+        planningReadinessTracker.ingest(observation)
         observationHandler?(observation)
         return true
     }
 
     private func suspendObservations() {
         acceptsObservations = false
+        planningReadinessTracker.suspend()
         pose = nil
-        forwardClearance = .infinity
         latestDepthSafetySnapshot = nil
         trackingState = .notAvailable
         latestPixelBuffer = nil
@@ -370,18 +375,22 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     private func collectMesh(_ anchors: [ARAnchor]) {
         let mesh = anchors.compactMap { $0 as? ARMeshAnchor }
         guard !mesh.isEmpty else { return }
+        guard planningReadiness.isPoseReady else {
+            let now = Date()
+            if now.timeIntervalSince(lastRejectedMeshLogAt) >= 1 {
+                lastRejectedMeshLogAt = now
+                RuntimeFileLog.append("nav_mesh_update_rejected", fields: [
+                    "reason": "tracking_unstable",
+                    "pose_streak": "\(planningReadiness.normalObservationStreak)",
+                    "session_generation": "\(sessionGeneration)"
+                ], now: now)
+            }
+            return
+        }
         var map = Dictionary(meshAnchors.map { ($0.identifier, $0) }, uniquingKeysWith: { a, _ in a })
         for m in mesh { map[m.identifier] = m }
         meshAnchors = Array(map.values)
-    }
-
-    private func logForwardClearanceIfNeeded(now: Date = Date()) {
-        guard now.timeIntervalSince(lastClearanceLogAt) >= 1 else { return }
-        lastClearanceLogAt = now
-        RuntimeFileLog.append("forward_clearance", fields: [
-            "meters": forwardClearance.isFinite ? String(format: "%.2f", forwardClearance) : "inf",
-            "tracking": trackingStateDescription(trackingState)
-        ], now: now)
+        planningReadinessTracker.recordTrustedMeshUpdate()
     }
 
     private func trackingStateDescription(_ state: ARCamera.TrackingState) -> String {
@@ -417,6 +426,39 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                                    intrinsics: camera.intrinsics, cameraTransform: camera.transform, depth: depth)
     }
 
+    /// Back-projects a detected object's bounds using several aligned depth samples.
+    /// A single center pixel is unreliable on reflective or partially occluded objects,
+    /// while the overall box median can be dominated by background around the object.
+    /// Prefer the nearest supported depth cluster and keep the center point as a fallback
+    /// when the detector did not provide usable bounds.
+    public func unproject(normalizedBoundingBox: CGRect, fallbackPoint: CGPoint) -> Vec2? {
+        guard let camera = latestCamera, let depthMap = latestDepthMap else { return nil }
+        let imageSize = camera.imageResolution
+        guard let sample = Self.sampleObjectDepth(
+            depthMap,
+            inVisionNormalizedBoundingBox: normalizedBoundingBox,
+            imageSize: imageSize
+        ) else {
+            return unproject(normalizedPoint: fallbackPoint)
+        }
+        RuntimeFileLog.append("object_depth_sampled", fields: [
+            "depth": String(format: "%.2f", sample.depth),
+            "support_count": "\(sample.supportCount)",
+            "valid_count": "\(sample.validSampleCount)",
+            "box_x": String(format: "%.2f", normalizedBoundingBox.minX),
+            "box_y": String(format: "%.2f", normalizedBoundingBox.minY),
+            "box_width": String(format: "%.2f", normalizedBoundingBox.width),
+            "box_height": String(format: "%.2f", normalizedBoundingBox.height),
+        ])
+        return Self.unprojectPoint(
+            sample.point,
+            imageSize: imageSize,
+            intrinsics: camera.intrinsics,
+            cameraTransform: camera.transform,
+            depth: sample.depth
+        )
+    }
+
     /// Undoes the `.right` (90° clockwise) rotation `Detector`'s Vision request handler
     /// applied, landing back in the raw sensor pixel space `intrinsics`/depth are
     /// calibrated against.
@@ -441,6 +483,75 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         let depth = base.assumingMemoryBound(to: Float32.self)[dy * stride + dx]
         guard depth > 0.05, depth.isFinite else { return nil }
         return depth
+    }
+
+    struct ObjectDepthSample: Equatable {
+        let point: CGPoint
+        let depth: Float
+        let supportCount: Int
+        let validSampleCount: Int
+    }
+
+    static func objectDepthSamplePoints(in boundingBox: CGRect) -> [CGPoint] {
+        let unitBox = boundingBox.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard !unitBox.isNull, unitBox.width > 0, unitBox.height > 0 else { return [] }
+        let fractions: [CGFloat] = [0.25, 0.5, 0.75]
+        return fractions.flatMap { yFraction in
+            fractions.map { xFraction in
+                CGPoint(
+                    x: unitBox.minX + unitBox.width * xFraction,
+                    y: unitBox.minY + unitBox.height * yFraction
+                )
+            }
+        }
+    }
+
+    static func sampleObjectDepth(_ depthMap: CVPixelBuffer,
+                                  inVisionNormalizedBoundingBox boundingBox: CGRect,
+                                  imageSize: CGSize) -> ObjectDepthSample? {
+        let samples = objectDepthSamplePoints(in: boundingBox).compactMap { point -> ObjectDepthSample? in
+            guard let depth = sampleDepth(
+                depthMap,
+                atVisionNormalizedPoint: point,
+                imageSize: imageSize
+            ) else { return nil }
+            return ObjectDepthSample(
+                point: point,
+                depth: depth,
+                supportCount: 1,
+                validSampleCount: 1
+            )
+        }
+        guard !samples.isEmpty else { return nil }
+        return nearestSupportedObjectDepthSample(from: samples)
+    }
+
+    static func nearestSupportedObjectDepthSample(
+        from samples: [ObjectDepthSample],
+        clusterTolerance: Float = 0.35
+    ) -> ObjectDepthSample? {
+        guard !samples.isEmpty else { return nil }
+        let sorted = samples.sorted { $0.depth < $1.depth }
+        let minimumSupport = min(2, sorted.count)
+        var clusters: [[ObjectDepthSample]] = []
+
+        for sample in sorted {
+            if let lastDepth = clusters.last?.last?.depth,
+               sample.depth - lastDepth <= clusterTolerance {
+                clusters[clusters.count - 1].append(sample)
+            } else {
+                clusters.append([sample])
+            }
+        }
+
+        let cluster = clusters.first(where: { $0.count >= minimumSupport }) ?? sorted
+        let selected = cluster[cluster.count / 2]
+        return ObjectDepthSample(
+            point: selected.point,
+            depth: selected.depth,
+            supportCount: cluster.count,
+            validSampleCount: sorted.count
+        )
     }
 
     /// Back-projects a raw-sensor-space point at a known depth through the camera
@@ -473,36 +584,6 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         return Pose2D(position: Vec2(Double(p.x), Double(p.z)), yaw: yaw)
     }
 
-    /// Robust near depth (m) sampled from the center region of the LiDAR depth map.
-    static func forwardClearance(from depth: ARDepthData) -> Double {
-        forwardClearance(fromDepthMap: depth.depthMap)
-    }
-
-    /// Robust near depth (m) sampled from the driving corridor of the LiDAR depth map.
-    static func forwardClearance(fromDepthMap map: CVPixelBuffer) -> Double {
-        CVPixelBufferLockBaseAddress(map, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
-        let w = CVPixelBufferGetWidth(map), h = CVPixelBufferGetHeight(map)
-        guard let base = CVPixelBufferGetBaseAddress(map), w > 0, h > 0 else { return .infinity }
-        let rowBytes = CVPixelBufferGetBytesPerRow(map)
-        let ptr = base.assumingMemoryBound(to: Float32.self)
-        let stride = rowBytes / MemoryLayout<Float32>.size
-
-        var depths: [Float] = []
-        depths.reserveCapacity((h / 3) * (w / 2))
-        // Sample a wider central driving corridor. A wall slightly off-center in the
-        // mounted phone's view still needs to stop the rover before contact.
-        for y in (h / 3)..<(h * 2 / 3) {
-            for x in (w / 4)..<(w * 3 / 4) {
-                let d = ptr[y * stride + x]
-                if d > 0.05 && d.isFinite { depths.append(d) }
-            }
-        }
-        guard !depths.isEmpty else { return .infinity }
-        depths.sort()
-        let index = min(depths.count - 1, max(0, Int(Double(depths.count - 1) * 0.10)))
-        return Double(depths[index])
-    }
 }
 
 extension ARSessionManager: RoomSessionARManaging {}

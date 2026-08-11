@@ -889,3 +889,49 @@ iPhone 15 Pro (`FC11C836-4978-5B20-9170-16EAD18568BE`) as unavailable. `devicect
 returned error `1011`: `CoreDeviceService was unable to locate a device matching the
 requested device identifier`. The connected iPhone 15 Pro Max was intentionally left
 untouched. Install, launch, log pull, and all four physical missions remain pending.
+
+## 2026-08-10 Visible Target Staging Recovery
+
+### Failure Evidence
+
+- The latest physical `Go to refrigerator` run detected and grounded the refrigerator,
+  while the rover link continued returning HTTP `200`.
+- The projected object point and every configured `0.30`-`1.20` m collinear stand-off
+  were planner-unreachable. The old fallback then submitted the known-unreachable object
+  point anyway, immediately failed with `No path to goal`, and returned the UI from
+  `Thinking...` to `Ready` without a rover action.
+- The same frame contained reachable exploration openings, but the offline object mission
+  did not use them to approach the locked target.
+
+### Repair
+
+- Visual goal selection now returns no goal when both the projected object point and all
+  safe stand-offs are unreachable; it never submits the known-bad object coordinate.
+- The offline object mission ranks unexplored openings by existing planner reachability
+  and reduction in distance to the locked target. It requires at least `0.10` m progress.
+- The rover may use at most three distinct staging openings. After each staging arrival,
+  it waits for a newer normally tracked frame, reacquires the same requested object, and
+  retries the normal `0.30` m target approach.
+- Cancellation, mapping-session generation, navigation failure, rover transport failure,
+  and the existing depth/obstacle safety states terminate staging through their existing
+  authoritative paths.
+- Added structured events: `mission_target_staging_started`,
+  `mission_target_staging_candidate`, `mission_target_staging_selected`,
+  `mission_target_staging_completed`, and `mission_target_staging_exhausted`.
+
+### Verification
+
+- Focused staging, candidate-ranking, de-duplication, attempt-limit, transport-failure,
+  and session-reset tests passed.
+- The complete `MissionAgentTests` suite passed.
+- The first full SDK run exposed one timing-sensitive cancellation-test failure; that test
+  passed in isolation, and the second full SDK run passed at
+  `/Users/hungmai/Library/Developer/Xcode/DerivedData/PhroverOperator-fddpasjqbvmpvydqermesnrnjsro/Logs/Test/Test-PhroverSDKTests-2026.08.10_11-53-06--0700.xcresult`.
+- `git diff --check` passed.
+- A signed iPhone 15 Pro build succeeded at
+  `/private/tmp/PhroverOperator-device-build/Build/Products/Debug-iphoneos/PhroverOperator.app`.
+- Installation on iPhone 15 Pro `FC11C836-4978-5B20-9170-16EAD18568BE` succeeded and
+  `devicectl` confirmed bundle `us.astral.phrover` version `1.0` is installed.
+- Launch is still blocked by iOS because the development profile has not been explicitly
+  trusted on this phone. Physical `Go to refrigerator` acceptance and the post-fix log
+  sequence remain pending; no physical motion success is claimed.

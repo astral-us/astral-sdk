@@ -3,8 +3,8 @@ import PhroverKit
 
 /// Wraps an on-device-primary/cloud-fallback pair behind a single `RoverBrain`, so
 /// `MissionAgent` doesn't need to know anything about connectivity or failure recovery.
-/// The local Apple Intelligence brain always gets a bounded first chance; cloud is an
-/// optional second stage for online missions when that primary stage cannot respond.
+/// The local Apple Intelligence brain runs to completion when cloud fallback is not
+/// usable. Online missions give it a bounded first chance before trying cloud.
 @MainActor
 public final class HybridBrain: RoverBrain {
     private let cloud: RoverBrain?
@@ -16,7 +16,7 @@ public final class HybridBrain: RoverBrain {
     public init(
         cloud: RoverBrain?,
         onDevice: RoverBrain,
-        primaryTimeout: Duration = .seconds(1.5),
+        primaryTimeout: Duration = .seconds(8),
         isOnline: @escaping () -> Bool = { NetworkMonitor.shared.isOnline },
         missionTelemetry: @escaping MissionTelemetrySink = { event, fields in
             RuntimeFileLog.append(event, fields: fields)
@@ -30,6 +30,10 @@ public final class HybridBrain: RoverBrain {
     }
 
     public func nextAction(_ context: MissionContext) async throws -> BrainOutput {
+        guard cloud != nil, isOnline() else {
+            return try await onDeviceAction(context)
+        }
+
         let primaryResult = await PrimaryStageRace.run(
             brain: onDevice,
             context: context,
@@ -54,6 +58,24 @@ public final class HybridBrain: RoverBrain {
             )
         case .cancelled:
             throw CancellationError()
+        }
+    }
+
+    private func onDeviceAction(_ context: MissionContext) async throws -> BrainOutput {
+        do {
+            let output = try await onDevice.nextAction(context)
+            logSelection("on_device", reason: "primary", missionID: context.missionID)
+            return output
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logSelection(
+                "on_device",
+                reason: "on_device_failed",
+                missionID: context.missionID,
+                error: error
+            )
+            throw error
         }
     }
 

@@ -96,6 +96,99 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(agent.phase, .idle)
     }
 
+    func testMissionWaitsThroughPlanningBeforeRequestingAnotherDecision() async {
+        let motion = FakeMotion()
+        motion.beginsNavigationInPlanning = true
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.34, y: 0.5))
+        ]
+        let brain = FakeBrain(script: [
+            .navigate(.visualQuery("the refrigerator")),
+            .navigate(.visualQuery("the refrigerator")),
+        ])
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: { brain }
+        )
+
+        await agent.handle("go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls.count, 1)
+        XCTAssertEqual(brain.seenContexts.count, 1)
+        XCTAssertEqual(motion.state, .arrived)
+    }
+
+    func testMissionCancellationDuringPlanningStopsMotion() async {
+        let motion = FakeMotion()
+        motion.beginsNavigationInPlanning = true
+        motion.planningDelay = 1
+        let navigationStarted = expectation(description: "navigation entered planning")
+        motion.onNavigate = { _ in navigationStarted.fulfill() }
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.34, y: 0.5))
+        ]
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: { FakeBrain(script: [.navigate(.visualQuery("the refrigerator"))]) }
+        )
+        let mission = Task { @MainActor in
+            await agent.handle("Go to the refrigerator")
+        }
+
+        await fulfillment(of: [navigationStarted], timeout: 1)
+        mission.cancel()
+        await mission.value
+
+        XCTAssertEqual(motion.cancelCallCount, 1)
+        XCTAssertEqual(motion.navigateCalls.count, 1)
+    }
+
+    func testSessionChangeDuringPlanningStopsMotion() async {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(
+            generation: 1,
+            initialPose: Pose2D(position: .zero, yaw: 0)
+        )
+        let motion = FakeMotion()
+        motion.beginsNavigationInPlanning = true
+        motion.planningDelay = 1
+        let navigationStarted = expectation(description: "navigation entered planning")
+        motion.onNavigate = { _ in navigationStarted.fulfill() }
+        let perception = FakePerception()
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.34, y: 0.5))
+        ]
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            roomTopology: topology,
+            currentBrain: { FakeBrain(script: [.navigate(.visualQuery("the refrigerator"))]) }
+        )
+        let mission = Task { @MainActor in
+            await agent.handle("Go to the refrigerator")
+        }
+
+        await fulfillment(of: [navigationStarted], timeout: 1)
+        topology.reset(forSessionGeneration: 2)
+        await mission.value
+
+        XCTAssertGreaterThanOrEqual(motion.stopAndWaitCallCount, 1)
+        XCTAssertEqual(motion.navigateCalls.count, 1)
+    }
+
     func testVisualTargetReturnMissionUsesCurrentCommandStartPose() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -542,6 +635,34 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(nextContext.explorationCandidates.first { $0.id == "opening_1" }?.status, .visited)
         XCTAssertEqual(nextContext.explorationCandidates.first { $0.id == "opening_2" }?.status, .unexplored)
         XCTAssertTrue(voice.spoken.isEmpty)
+    }
+
+    func testDepthSafetyStopMarksExplorationCandidateVisitedAndContinues() async {
+        let motion = FakeMotion()
+        motion.navigateOutcome = .failed("Depth safety stop: stop.")
+        let perception = FakePerception()
+        perception.frontiers = [
+            Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5),
+            Frontier(centroid: Vec2(3, -1), widthMeters: 1.0, cellCount: 5),
+        ]
+        let voice = FakeVoice()
+        let brain = FakeBrain(script: [.explore(candidateId: "opening_1"), .done])
+        let agent = MissionAgent(motion: motion,
+                                 perception: perception,
+                                 voice: voice,
+                                 blockedHeadingRecoveryTimeout: 0.03,
+                                 currentBrain: { brain })
+
+        await agent.handle("go to our room")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(2, 1)])
+        XCTAssertEqual(motion.rotateCalls, [.pi / 6])
+        XCTAssertEqual(brain.seenContexts.count, 2)
+        let nextContext = brain.seenContexts[1]
+        XCTAssertEqual(nextContext.explorationCandidates.first { $0.id == "opening_1" }?.status, .visited)
+        XCTAssertEqual(nextContext.explorationCandidates.first { $0.id == "opening_2" }?.status, .unexplored)
+        XCTAssertTrue(voice.spoken.isEmpty)
+        XCTAssertEqual(agent.phase, .idle)
     }
 
     func testScansWhenVisualTargetIsNotDetectedAndNoOpeningIsKnown() async {
@@ -1164,6 +1285,907 @@ final class MissionAgentTests: XCTestCase {
         }
     }
 
+    func testUnreachableVisualSurfaceUsesReachableStandOffGoal() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(1, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: goal.x <= 0.7,
+                pathDistance: goal.x
+            )
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(0.7, 0)])
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+    }
+
+    func testUnreachableVisualSurfaceBacksOffUntilApproachGoalIsReachable() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(2, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: goal.x <= 1.4,
+                pathDistance: goal.x
+            )
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls.count, 1)
+        XCTAssertEqual(motion.navigateCalls[0].x, 1.4, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateCalls[0].y, 0, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+    }
+
+    func testUnreachableVisualSurfaceDoesNotSubmitKnownUnreachableGoal() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(2, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: false,
+                pathDistance: .infinity
+            )
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+    }
+
+    func testVisualTargetWaitsForStablePoseAfterInferenceBeforeAssessing() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(4, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        var planningReady = false
+        var unprojectionCountAtPreparation = 0
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: planningReady,
+                pathDistance: planningReady ? goal.length : .infinity,
+                rejectionReason: planningReady ? nil : .trackingUnstable
+            )
+        }
+        motion.onPlanningRecovery = {
+            unprojectionCountAtPreparation = perception.unprojectFrameSequences.count
+            planningReady = true
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.planningContextRequirements, [.stablePose])
+        XCTAssertEqual(perception.unprojectFrameSequences.count, unprojectionCountAtPreparation)
+        XCTAssertEqual(motion.navigateCalls, [Vec2(4, 0)])
+    }
+
+    func testInitialVisualPlanningFailsClosedWhenStablePoseTimesOut() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(4, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: false,
+                pathDistance: .infinity,
+                rejectionReason: .trackingUnstable
+            )
+        }
+        motion.planningContextOutcomes[.stablePose] = .trackingTimeout
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.planningContextRequirements, [.stablePose])
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        guard case .failed(_, _, let message) = statuses.last else {
+            return XCTFail("Expected a terminal tracking failure")
+        }
+        XCTAssertEqual(message, "AR tracking did not recover in time.")
+    }
+
+    func testBrainDrivenUnreachableVisualTargetStagesAndCompletes() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.arrived, .arrived]
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.frameSequence = 1
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(3, 0), widthMeters: 1.0, cellCount: 5)
+        ]
+        motion.goalAssessment = { goal in
+            if goal == Vec2(3, 0), motion.navigateCalls.isEmpty {
+                return NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: 3)
+            }
+            let targetBecameReachable = !motion.navigateCalls.isEmpty
+                && goal.x >= 4.69 && goal.x <= 4.71
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: targetBecameReachable,
+                pathDistance: targetBecameReachable ? 1.7 : .infinity
+            )
+        }
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(3, 0), yaw: 0)
+            perception.frameSequence = 2
+        }
+        var statuses: [MissionCommandStatus] = []
+        let brain = FakeBrain(script: [
+            .navigate(.visualQuery("refrigerator"))
+        ])
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls.count, 2)
+        XCTAssertEqual(motion.navigateCalls[0], Vec2(3, 0))
+        XCTAssertEqual(motion.navigateCalls[1].x, 4.7, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected brain-driven staged navigation to succeed")
+        }
+    }
+
+    func testBrainDrivenUnreachableVisualTargetFailsWithoutAskingBrainAgain() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(goal: goal, isReachable: false, pathDistance: .infinity)
+        }
+        var statuses: [MissionCommandStatus] = []
+        let brain = FakeBrain(script: [
+            .navigate(.visualQuery("refrigerator"))
+        ])
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: { brain }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        XCTAssertEqual(brain.seenContexts.count, 1)
+        guard case .failed(_, _, let message) = statuses.last else {
+            return XCTFail("Expected a terminal no-route failure")
+        }
+        XCTAssertEqual(message, "No safe route toward target.")
+    }
+
+    func testAllUnreachableTargetReacquiresBeforeRefreshedMapPreparation() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(
+                label: "refrigerator",
+                confidence: 0.99,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+            )
+        ]
+        var refreshed = false
+        var events: [String] = []
+        perception.onDetectObjects = { events.append("detect") }
+        motion.goalAssessment = { goal in
+            events.append("assess")
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: refreshed,
+                pathDistance: refreshed ? goal.length : .infinity,
+                rejectionReason: refreshed ? nil : .noConnectedPath
+            )
+        }
+        motion.onPlanningRecovery = {
+            events.append("prepare")
+            refreshed = true
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.planningRecoveryCallCount, 1)
+        XCTAssertEqual(motion.planningContextRequirements, [.refreshedTrustedMesh])
+        XCTAssertEqual(Array(events.suffix(3)), ["detect", "prepare", "assess"])
+        XCTAssertEqual(motion.navigateCalls, [Vec2(5, 0)])
+        XCTAssertGreaterThanOrEqual(perception.unprojectFrameSequences.count, 2)
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected refreshed planning context to complete the mission")
+        }
+    }
+
+    func testRefreshedMapRetryDoesNotInferAfterReadiness() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(
+                label: "refrigerator",
+                confidence: 0.99,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+            )
+        ]
+        var didPrepare = false
+        perception.onDetectObjects = {
+            if didPrepare {
+                XCTFail("Detector ran after final planning readiness")
+            }
+        }
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: didPrepare,
+                pathDistance: didPrepare ? goal.length : .infinity,
+                rejectionReason: didPrepare ? nil : .noConnectedPath
+            )
+        }
+        motion.onPlanningRecovery = { didPrepare = true }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.planningContextRequirements, [.refreshedTrustedMesh])
+        XCTAssertEqual(motion.navigateCalls, [Vec2(5, 0)])
+    }
+
+    func testStillUnreachableRefreshedMapFailsWithoutSecondRecovery() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(
+                label: "refrigerator",
+                confidence: 0.99,
+                normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+            )
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: false,
+                pathDistance: .infinity,
+                rejectionReason: .noConnectedPath
+            )
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.planningRecoveryCallCount, 1)
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        guard case .failed(_, _, let message) = statuses.last else {
+            return XCTFail("Expected one terminal no-route failure")
+        }
+        XCTAssertEqual(message, "No safe route toward target.")
+    }
+
+    func testUnreachableFarVisualTargetUsesIncrementalRayStepBeforeRetryingGoal() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.arrived, .arrived]
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.frameSequence = 1
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        motion.goalAssessment = { goal in
+            let incrementalStep = abs(goal.x - 0.75) < 0.001 && abs(goal.y) < 0.001
+            let adjustedTargetBecameReachable = !motion.navigateCalls.isEmpty
+                && abs(goal.x - 4.70) < 0.001
+                && abs(goal.y) < 0.001
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: incrementalStep || adjustedTargetBecameReachable,
+                pathDistance: incrementalStep ? 0.75 : 3.95
+            )
+        }
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(0.75, 0), yaw: 0)
+            perception.frameSequence = 2
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls.count, 2)
+        XCTAssertEqual(motion.navigateCalls[0].x, 0.75, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateCalls[0].y, 0, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateCalls[1].x, 4.70, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateCalls[1].y, 0, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected incremental visual approach to complete")
+        }
+    }
+
+    func testVisibleTargetStagingPrefersCandidateWithMostTargetProgress() async {
+        let motion = FakeMotion()
+        motion.navigateOutcome = .failed("staging test stop")
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5),
+            Frontier(centroid: Vec2(3, 0), widthMeters: 1.0, cellCount: 5),
+            Frontier(centroid: Vec2(-1, 0), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            let isStagingPoint = goal == Vec2(2, 1) || goal == Vec2(3, 0) || goal == Vec2(-1, 0)
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: isStagingPoint,
+                pathDistance: goal.length
+            )
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls.first, Vec2(3, 0))
+    }
+
+    func testVisibleTargetStagingSkipsUnreachableCandidate() async {
+        let motion = FakeMotion()
+        motion.navigateOutcome = .failed("staging test stop")
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5),
+            Frontier(centroid: Vec2(3, 0), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: goal == Vec2(2, 1),
+                pathDistance: goal.length
+            )
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls.first, Vec2(2, 1))
+    }
+
+    func testVisibleTargetStagingRejectsCandidateWithoutTargetProgress() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(-1, 0), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: goal == Vec2(-1, 0),
+                pathDistance: goal.length
+            )
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        guard case .failed = statuses.last else {
+            return XCTFail("Expected a no-progress staging failure")
+        }
+    }
+
+    func testUnreachableVisibleTargetStagesThroughReachableOpeningAndResumes() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [.arrived, .arrived]
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(3, 0), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            if goal == Vec2(3, 0), motion.navigateCalls.isEmpty {
+                return NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: 3)
+            }
+            let targetStandOffBecameReachable = !motion.navigateCalls.isEmpty
+                && goal.x >= 4.69 && goal.x <= 4.71
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: targetStandOffBecameReachable,
+                pathDistance: targetStandOffBecameReachable ? 1.7 : .infinity
+            )
+        }
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(3, 0), yaw: 0)
+        }
+        var phases: [MissionAgent.Phase] = []
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            phaseDidChange: { phases.append($0) },
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls.count, 2)
+        XCTAssertEqual(motion.navigateCalls[0], Vec2(3, 0))
+        XCTAssertEqual(motion.navigateCalls[1].x, 4.7, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateCalls[1].y, 0, accuracy: 0.001)
+        XCTAssertEqual(motion.navigateStopClearances, [RoverConfig.visualTargetStopDistance])
+        XCTAssertTrue(phases.contains(.acting))
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected staged refrigerator mission to succeed")
+        }
+    }
+
+    func testDepthBlockedVisualTargetStagesThroughReachableOpeningAndRetries() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [
+            .failed("I can’t safely see the space needed to turn. Reposition the rover or camera and try again."),
+            .arrived,
+            .arrived,
+        ]
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: goal.length)
+        }
+        motion.onNavigate = { call in
+            guard call == 2 else { return }
+            perception.pose = Pose2D(position: Vec2(2, 1), yaw: 0)
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(5, 0), Vec2(2, 1), Vec2(5, 0)])
+        XCTAssertEqual(
+            motion.navigateStopClearances,
+            [RoverConfig.visualTargetStopDistance, RoverConfig.visualTargetStopDistance]
+        )
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected blocked target turn to recover through staging")
+        }
+    }
+
+    func testDepthBlockedStagingCandidateTriesNextDistinctOpening() async {
+        let motion = FakeMotion()
+        motion.navigateOutcomes = [
+            .failed("Depth safety stop: stop."),
+            .failed("Depth safety stop: stop."),
+            .arrived,
+            .arrived,
+        ]
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(4, 0), widthMeters: 1.0, cellCount: 5),
+            Frontier(centroid: Vec2(2, 1), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: goal.length)
+        }
+        motion.onNavigate = { call in
+            guard call == 3 else { return }
+            perception.pose = Pose2D(position: Vec2(2, 1), yaw: 0)
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(
+            motion.navigateCalls,
+            [Vec2(5, 0), Vec2(4, 0), Vec2(2, 1), Vec2(5, 0)]
+        )
+        XCTAssertEqual(
+            motion.navigateStopClearances,
+            [RoverConfig.visualTargetStopDistance, RoverConfig.visualTargetStopDistance]
+        )
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected the next safe staging opening to recover the mission")
+        }
+    }
+
+    func testVisibleTargetStagingDoesNotReuseCandidateAfterFrontierRefresh() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(2, 0), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: goal == Vec2(2, 0),
+                pathDistance: goal.length
+            )
+        }
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            perception.pose = Pose2D(position: Vec2(2, 0), yaw: 0)
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(2, 0)])
+    }
+
+    func testVisibleTargetStagingStopsAfterThreeDistinctCandidates() async {
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.frameSequence = 1
+        perception.unprojectResult = Vec2(10, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiersForFrameSequence = { sequence in
+            let x: Double
+            switch sequence ?? 1 {
+            case ...1: x = 2
+            case 2: x = 4
+            case 3: x = 6
+            default: x = 8
+            }
+            return [Frontier(centroid: Vec2(x, 0), widthMeters: 1.0, cellCount: 5)]
+        }
+        motion.goalAssessment = { goal in
+            let isStagingPoint = [2.0, 4.0, 6.0, 8.0].contains(goal.x) && goal.y == 0
+            return NavigationGoalAssessment(
+                goal: goal,
+                isReachable: isStagingPoint,
+                pathDistance: goal.length
+            )
+        }
+        motion.onNavigate = { call in
+            let goal = motion.navigateCalls[call - 1]
+            perception.pose = Pose2D(position: goal, yaw: 0)
+            perception.frameSequence = UInt64(call + 1)
+        }
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.navigateCalls, [Vec2(2, 0), Vec2(4, 0), Vec2(6, 0)])
+    }
+
+    func testVisibleTargetStagingPreservesTransportFailure() async {
+        let motion = FakeMotion()
+        motion.navigateOutcome = .failed("Rover command link lost.")
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(2, 0), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: goal == Vec2(2, 0),
+                pathDistance: goal.length
+            )
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        guard case .failed(_, _, let message) = statuses.last else {
+            return XCTFail("Expected transport failure status")
+        }
+        XCTAssertEqual(message, "Rover command link lost.")
+    }
+
+    func testVisibleTargetStagingStopsWhenSessionGenerationChanges() async {
+        let topology = SessionRoomTopology(telemetry: { _, _ in })
+        topology.startSession(
+            generation: 1,
+            initialPose: Pose2D(position: .zero, yaw: 0)
+        )
+        let motion = FakeMotion()
+        let perception = FakePerception()
+        perception.pose = Pose2D(position: .zero, yaw: 0)
+        perception.unprojectResult = Vec2(5, 0)
+        perception.objects = [
+            PerceivedObject(label: "refrigerator",
+                            confidence: 0.99,
+                            normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+        ]
+        perception.frontiers = [
+            Frontier(centroid: Vec2(2, 0), widthMeters: 1.0, cellCount: 5),
+        ]
+        motion.goalAssessment = { goal in
+            NavigationGoalAssessment(
+                goal: goal,
+                isReachable: goal == Vec2(2, 0),
+                pathDistance: goal.length
+            )
+        }
+        motion.onNavigate = { call in
+            guard call == 1 else { return }
+            topology.startSession(
+                generation: 2,
+                initialPose: Pose2D(position: .zero, yaw: 0)
+            )
+        }
+        var statuses: [MissionCommandStatus] = []
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            roomTopology: topology,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the refrigerator")
+
+        XCTAssertEqual(motion.stopAndWaitCallCount, 1)
+        guard case .failed = statuses.last else {
+            return XCTFail("Expected session change to fail the mission")
+        }
+    }
+
     func testBrainUnavailableFallsBackToVisibleRefrigeratorAndReturnsWhenRequested() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -1197,6 +2219,49 @@ final class MissionAgentTests: XCTestCase {
         guard case .succeeded = statuses.last else {
             return XCTFail("Expected a successful terminal status")
         }
+    }
+
+    func testOfflineTargetScanRetriesOppositeDirectionAfterRotationSafetyFailure() async {
+        let motion = FakeMotion()
+        motion.scanRotateOutcomes = [
+            .failed("Depth safety stop while rotating: blind_swept_volume."),
+            .arrived,
+        ]
+        let perception = FakePerception()
+        perception.frameSequence = 1
+        motion.onScanRotate = { _ in
+            perception.frameSequence = (perception.frameSequence ?? 0) + 1
+            guard motion.scanRotateCalls.count == 2 else { return }
+            perception.objects = [
+                PerceivedObject(label: "chair",
+                                confidence: 0.99,
+                                normalizedPoint: CGPoint(x: 0.5, y: 0.5))
+            ]
+        }
+        var statuses: [MissionCommandStatus] = []
+        let logBefore = runtimeLog()
+        let agent = MissionAgent(
+            motion: motion,
+            perception: perception,
+            voice: FakeVoice(),
+            visualTargetScanDelay: 0,
+            maxVisualTargetScanSteps: 3,
+            commandStatusDidChange: { statuses.append($0) },
+            currentBrain: {
+                ThrowingBrain(error: RoverBrainError.onDeviceUnavailable(.modelNotReady))
+            }
+        )
+
+        await agent.handle("Go to the chair")
+
+        XCTAssertEqual(motion.scanRotateCalls, [.pi / 6, -.pi / 6],
+                       "a failed turn should retry the same scan step in the opposite direction")
+        XCTAssertEqual(motion.navigateCalls, [Vec2(1, 2)])
+        guard case .succeeded = statuses.last else {
+            return XCTFail("Expected the opposite-direction scan to find the target")
+        }
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("mission_target_scan_rotation_retry"))
     }
 
     func testBrainUnavailableSearchesAnotherRoomWithFreshScansAndLockedTarget() async throws {
@@ -2967,29 +4032,50 @@ private final class FakeMotion: RoverMotion {
     private(set) var scanRotateCalls: [Double] = []
     private(set) var cancelCallCount = 0
     private(set) var stopAndWaitCallCount = 0
+    private(set) var planningRecoveryCallCount = 0
     private(set) var lifecycleEvents: [String] = []
     /// What `state` settles to shortly after `navigate(to:)` — simulates the real drive
     /// loop reaching `.arrived` asynchronously.
     var navigateOutcome: NavigationController.State = .arrived
     var navigateOutcomes: [NavigationController.State] = []
+    var beginsNavigationInPlanning = false
+    var planningDelay: TimeInterval = 0.03
     var rotateNeverCompletes = false
     var scanRotationUsesIndependentTask = false
+    var scanRotateOutcomes: [NavigationController.State] = []
     var rotateDelay: TimeInterval = 0
     var stopAndWaitDelay: TimeInterval = 0
     var onNavigate: ((Int) -> Void)?
     var onRotate: ((Double) -> Void)?
     var onScanRotate: ((Double) -> Void)?
     var onCancel: (() -> Void)?
+    var goalAssessment: ((Vec2) -> NavigationGoalAssessment)?
+    var planningContextOutcomes: [PlanningContextRequirement: PlanningRecoveryOutcome] = [
+        .stablePose: .ready,
+        .refreshedTrustedMesh: .ready,
+    ]
+    var planningRecoveryOutcome: PlanningRecoveryOutcome {
+        get { planningContextOutcomes[.refreshedTrustedMesh] ?? .ready }
+        set { planningContextOutcomes[.refreshedTrustedMesh] = newValue }
+    }
+    private(set) var planningContextRequirements: [PlanningContextRequirement] = []
+    var onPlanningRecovery: (() -> Void)?
     private var independentScanTask: Task<Void, Never>?
 
     func navigate(to goal: Vec2) {
         lifecycleEvents.append("navigate")
         navigateCalls.append(goal)
         onNavigate?(navigateCalls.count)
-        state = .driving
+        state = beginsNavigationInPlanning ? .planning : .driving
         let outcome = navigateOutcomes.isEmpty ? navigateOutcome : navigateOutcomes.removeFirst()
         Task { @MainActor in
+            if beginsNavigationInPlanning {
+                try? await Task.sleep(for: .seconds(planningDelay))
+                guard state == .planning else { return }
+                state = .driving
+            }
             try? await Task.sleep(for: .milliseconds(20))
+            guard state == .driving else { return }
             state = outcome
         }
     }
@@ -3018,6 +4104,10 @@ private final class FakeMotion: RoverMotion {
     func rotateForScan(by angle: Double) async {
         scanRotateCalls.append(angle)
         onScanRotate?(angle)
+        if !scanRotateOutcomes.isEmpty {
+            state = scanRotateOutcomes.removeFirst()
+            return
+        }
         if scanRotationUsesIndependentTask {
             state = .driving
             let task = Task { @MainActor in
@@ -3052,6 +4142,24 @@ private final class FakeMotion: RoverMotion {
         state = .idle
         lifecycleEvents.append("stopFinished")
     }
+
+    func assessGoal(_ goal: Vec2) -> NavigationGoalAssessment {
+        goalAssessment?(goal)
+            ?? NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: 0)
+    }
+
+    func preparePlanningContext(
+        requiring requirement: PlanningContextRequirement
+    ) async -> PlanningRecoveryOutcome {
+        planningRecoveryCallCount += 1
+        planningContextRequirements.append(requirement)
+        onPlanningRecovery?()
+        return planningContextOutcomes[requirement] ?? .ready
+    }
+
+    func recoverPlanningContext() async -> PlanningRecoveryOutcome {
+        await preparePlanningContext(requiring: .refreshedTrustedMesh)
+    }
 }
 
 @MainActor
@@ -3065,6 +4173,7 @@ private final class FakePerception: RoverPerception {
     var frontiersForFrameSequence: ((UInt64?) -> [Frontier])?
     private(set) var unprojectFrameSequences: [UInt64?] = []
     private(set) var frontierFrameSequences: [UInt64?] = []
+    var onDetectObjects: (() -> Void)?
 
     var latestObservation: PoseObservation? {
         guard !observations.isEmpty else { return nil }
@@ -3074,7 +4183,10 @@ private final class FakePerception: RoverPerception {
         return observation
     }
 
-    func detectObjects() -> [PerceivedObject] { objects }
+    func detectObjects() -> [PerceivedObject] {
+        onDetectObjects?()
+        return objects
+    }
     func unproject(normalizedPoint: CGPoint) -> Vec2? {
         unprojectFrameSequences.append(frameSequence)
         return unprojectResult

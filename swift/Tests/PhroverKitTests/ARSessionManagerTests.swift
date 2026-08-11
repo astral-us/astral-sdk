@@ -47,7 +47,6 @@ final class ARSessionManagerTests: XCTestCase {
         XCTAssertNil(ar.latestPixelBuffer)
         XCTAssertNil(ar.latestDepthMap)
         XCTAssertEqual(ar.frameSequence, 0)
-        XCTAssertEqual(ar.forwardClearance, .infinity)
         XCTAssertNil(ar.latestDepthSafetySnapshot)
         XCTAssertFalse(ar.ingest(PoseObservation(
             pose: Pose2D(position: Vec2(8, 8), yaw: 0),
@@ -226,6 +225,19 @@ final class ARSessionManagerTests: XCTestCase {
         XCTAssertEqual(measurement.reliability, .reliable)
     }
 
+    func testRelativeHeadingMotionHandlerCanRunOffMainActor() async {
+        let ar = ARSessionManager()
+        let handler = ar.makeRelativeHeadingMotionHandler()
+        let callbackCompleted = expectation(description: "motion callback completed off main actor")
+
+        DispatchQueue.global(qos: .userInteractive).async {
+            handler(nil, nil)
+            callbackCompleted.fulfill()
+        }
+
+        await fulfillment(of: [callbackCompleted], timeout: 1)
+    }
+
     func testTrackingResetInvalidatesRelativeHeadingMeasurement() {
         let ar = ARSessionManager()
         ar.beginRelativeHeadingMeasurement()
@@ -311,7 +323,6 @@ final class ARSessionManagerTests: XCTestCase {
         XCTAssertNil(ar.pose)
         XCTAssertNil(ar.latestObservation)
         XCTAssertFalse(ar.isTrackingNormal)
-        XCTAssertEqual(ar.forwardClearance, .infinity)
         XCTAssertFalse(ar.ingest(PoseObservation(
             pose: Pose2D(position: Vec2(9, 9), yaw: 0),
             frameSequence: 2,

@@ -24,7 +24,7 @@ public enum RoverConfig {
     public static let maxWheelSpeed = 0.5      // m/s per Waveshare closed-loop range on encoder bases; base rover is open-loop
     // Measured mount values must be confirmed before physical acceptance.
     static let cameraMountCalibration = CameraMountCalibration(
-        cameraHeight: 0.55,
+        cameraHeight: 0.30,
         forwardOffset: 0,
         lateralOffset: 0,
         headingAlignment: 0
@@ -65,7 +65,7 @@ public enum RoverConfig {
     public static let blockedHeadingRecoveryTimeout = maximumScanTurnDuration + 2.0
     public static let navigationTrackingFreshness: TimeInterval = 0.5
     public static let navigationTrackingPollInterval: TimeInterval = 0.05
-    public static let navigationTrackingRecoveryTimeout: TimeInterval = 1.5
+    public static let navigationTrackingRecoveryTimeout: TimeInterval = 3.0
     /// Stand-off distance for a confidently locked visual target.
     public static let visualTargetStopDistance = 0.30
     /// Brake before the desired stand-off to compensate for command latency and chassis coast.
@@ -76,6 +76,19 @@ public enum RoverConfig {
     public static let visualTargetApproachMaxWheelSpeed = 0.12
     /// Only relax the normal obstacle threshold when the projected target is nearby.
     public static let visualTargetApproachDistance = 1.20
+    /// Increase target stand-off gradually when scene-mesh inflation blocks the closest
+    /// approach point. This keeps the rover moving toward a visible target without asking
+    /// the planner to enter the object's occupied footprint.
+    public static let visualTargetStandOffIncrement = 0.15
+    /// When the complete route to a visible target is not connected in the local costmap,
+    /// advance only this far before collecting a fresh depth frame and planning again.
+    public static let visualTargetIncrementalStepDistance = 0.75
+    /// Shortest useful incremental move toward a visible target.
+    public static let visualTargetMinimumIncrementalStepDistance = 0.30
+    /// Reduce a rejected incremental step by this amount until a reachable step is found.
+    public static let visualTargetIncrementalStepDecrement = 0.15
+    /// Bound visual ray advances while still allowing a target near the edge of the 6 m map.
+    public static let visualTargetMaximumIncrementalSteps = 8
 
     // MARK: - Safety
     /// If no successful command round-trip within this window, ObstacleGuard forces a stop.

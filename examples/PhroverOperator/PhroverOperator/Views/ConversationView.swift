@@ -56,11 +56,6 @@ struct ConversationView: View {
                             .accessibilityIdentifier("brain-availability-message")
                     }
 
-                    Text(speechIn.partialTranscript)
-                        .foregroundStyle(.secondary)
-                        .frame(minHeight: 40)
-                        .multilineTextAlignment(.center)
-
                     if let record = lastCommand.record {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(record.command)
@@ -87,6 +82,16 @@ struct ConversationView: View {
             .scrollIndicators(.hidden)
 
             VStack(spacing: 12) {
+                if let commandText {
+                    Text(commandText)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .frame(maxWidth: 320)
+                        .accessibilityIdentifier("recognized-command-text")
+                }
+
                 if agent != nil {
                     Text(phaseStatusLabel)
                         .font(.subheadline)
@@ -222,6 +227,12 @@ struct ConversationView: View {
         return phaseLabel(missionPhase)
     }
 
+    private var commandText: String? {
+        let partial = speechIn.partialTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !partial.isEmpty { return partial }
+        return lastCommand.record?.command
+    }
+
     private func statusColor(_ status: LastCommandState.DisplayStatus) -> Color {
         switch status {
         case .listening, .recognized, .working: return .accentColor
@@ -293,7 +304,6 @@ private struct LiveCameraDebugPanel: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Tracking: \(trackingLabel)")
-                Text(String(format: "Clearance: %.2f m", ar.forwardClearance))
                 Text("Detector: \(effectiveDetectorLoaded ? "loaded" : "unavailable")")
                     .accessibilityIdentifier("detector-status-text")
                 Text("Visible: \(effectiveVisibleObjects)")

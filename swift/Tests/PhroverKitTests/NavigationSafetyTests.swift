@@ -11,13 +11,21 @@ final class NavigationSafetyTests: XCTestCase {
         TestURLProtocol.reset()
     }
 
+    func testOnlyPlanningAndDrivingAreActiveMotionStates() {
+        XCTAssertTrue(NavigationController.State.planning.isMotionActive)
+        XCTAssertTrue(NavigationController.State.driving.isMotionActive)
+        XCTAssertFalse(NavigationController.State.idle.isMotionActive)
+        XCTAssertFalse(NavigationController.State.arrived.isMotionActive)
+        XCTAssertFalse(NavigationController.State.failed("stop").isMotionActive)
+    }
+
     func testGoalAssessmentDoesNotDriveOrMutateNavigationState() throws {
         let (navigation, ar) = makeNavigation()
         ar.resetTracking(generation: 1, runSession: false)
         XCTAssertTrue(ar.ingest(PoseObservation(
             pose: Pose2D(position: .zero, yaw: 0),
             frameSequence: 1,
-            timestamp: 1,
+            timestamp: ProcessInfo.processInfo.systemUptime,
             trackingQuality: .normal,
             sessionGeneration: 1
         )))
@@ -37,7 +45,7 @@ final class NavigationSafetyTests: XCTestCase {
         _ = ar.ingest(PoseObservation(
             pose: Pose2D(position: .zero, yaw: 0),
             frameSequence: 1,
-            timestamp: 1,
+            timestamp: ProcessInfo.processInfo.systemUptime,
             trackingQuality: .normal,
             sessionGeneration: 1
         ))
@@ -46,7 +54,16 @@ final class NavigationSafetyTests: XCTestCase {
 
         XCTAssertFalse(assessment.isReachable)
         XCTAssertEqual(assessment.pathDistance, .infinity)
+        XCTAssertEqual(assessment.rejectionReason, .goalOutsideMap)
         XCTAssertEqual(navigation.state, .idle)
+    }
+
+    func testGoalAssessmentReportsMissingPose() {
+        let (navigation, _) = makeNavigation()
+
+        let assessment = navigation.assessGoal(Vec2(1, 0))
+
+        XCTAssertEqual(assessment.rejectionReason, .missingPose)
     }
 
     func testStopAndWaitReturnsOnlyAfterTransportStopCompletes() async {
@@ -77,7 +94,7 @@ final class NavigationSafetyTests: XCTestCase {
 
         let elapsed = await clock.measure {
             navigation.navigate(to: Vec2(1, 0))
-            while navigation.state == .driving {
+            while navigation.state == .planning || navigation.state == .driving {
                 try? await Task.sleep(for: .milliseconds(5))
             }
         }
@@ -105,6 +122,107 @@ final class NavigationSafetyTests: XCTestCase {
             trackingQuality: .normal,
             sessionGeneration: 1
         ), uptime: now))
+    }
+
+    func testStablePosePreparationDoesNotRequireNewMesh() async {
+        let readiness = PlanningReadinessSnapshot(
+            sessionGeneration: 1,
+            normalObservationStreak: 3,
+            trustedMeshRevision: 9
+        )
+        let (navigation, ar) = makeNavigation(
+            trackingRecoveryTimeout: 0.1,
+            planningReadinessSnapshot: { readiness }
+        )
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+
+        let outcome = await navigation.preparePlanningContext(requiring: .stablePose)
+
+        XCTAssertEqual(outcome, .ready)
+        XCTAssertEqual(readiness.trustedMeshRevision, 9)
+    }
+
+    func testPlanningPreparationIgnoresTrackingFlickerUntilStable() async {
+        var readiness = PlanningReadinessSnapshot(
+            sessionGeneration: 1,
+            normalObservationStreak: 1,
+            trustedMeshRevision: 9
+        )
+        let (navigation, ar) = makeNavigation(
+            trackingRecoveryTimeout: 0.2,
+            planningReadinessSnapshot: { readiness }
+        )
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(20))
+            readiness.normalObservationStreak = 0
+            try? await Task.sleep(for: .milliseconds(20))
+            readiness.normalObservationStreak = 3
+            ingestTrackedPose(into: ar, yaw: 0, sequence: 2)
+        }
+
+        let outcome = await navigation.preparePlanningContext(requiring: .stablePose)
+
+        XCTAssertEqual(outcome, .ready)
+        XCTAssertEqual(readiness.normalObservationStreak, 3)
+        XCTAssertEqual(readiness.trustedMeshRevision, 9)
+    }
+
+    func testPlanningRecoveryWaitsForStablePoseAndNewerMesh() async {
+        var readiness = PlanningReadinessSnapshot(
+            sessionGeneration: 1,
+            normalObservationStreak: 1,
+            trustedMeshRevision: 4
+        )
+        let (navigation, ar) = makeNavigation(
+            trackingRecoveryTimeout: 0.25,
+            planningReadinessSnapshot: { readiness }
+        )
+        ar.resetTracking(generation: 1, runSession: false)
+        _ = ar.ingest(PoseObservation(
+            pose: Pose2D(position: .zero, yaw: 0),
+            frameSequence: 1,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            trackingQuality: .normal,
+            sessionGeneration: 1
+        ))
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(30))
+            readiness.normalObservationStreak = 3
+            readiness.trustedMeshRevision = 5
+        }
+
+        let outcome = await navigation.preparePlanningContext(requiring: .refreshedTrustedMesh)
+
+        XCTAssertEqual(outcome, .ready)
+        XCTAssertEqual(navigation.state, .idle)
+    }
+
+    func testPlanningRecoveryDistinguishesTrackingAndMeshTimeouts() async {
+        var readiness = PlanningReadinessSnapshot(
+            sessionGeneration: 1,
+            normalObservationStreak: 0,
+            trustedMeshRevision: 2
+        )
+        let (navigation, ar) = makeNavigation(
+            trackingRecoveryTimeout: 0.03,
+            planningReadinessSnapshot: { readiness }
+        )
+        ar.resetTracking(generation: 1, runSession: false)
+        _ = ar.ingest(PoseObservation(
+            pose: Pose2D(position: .zero, yaw: 0),
+            frameSequence: 1,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            trackingQuality: .normal,
+            sessionGeneration: 1
+        ))
+
+        let trackingOutcome = await navigation.recoverPlanningContext()
+        XCTAssertEqual(trackingOutcome, .trackingTimeout)
+
+        readiness.normalObservationStreak = 3
+        let meshOutcome = await navigation.recoverPlanningContext()
+        XCTAssertEqual(meshOutcome, .meshTimeout)
     }
 
     func testUncorrelatedObstacleNearTargetDoesNotCountAsArrival() {
@@ -139,70 +257,6 @@ final class NavigationSafetyTests: XCTestCase {
         )
         XCTAssertEqual(leftTurn.left, 0.30, accuracy: 0.000_001)
         XCTAssertEqual(leftTurn.right, 0.225, accuracy: 0.000_001)
-    }
-
-    func testVisualTargetApproachStopsAtThirtyCentimeters() {
-        XCTAssertEqual(
-            NavigationController.visualTargetApproachDecision(
-                distanceToGoal: 0.99,
-                forwardClearance: 0.29,
-                stopDistance: 0.30
-            ),
-            .arrived
-        )
-    }
-
-    func testVisualTargetApproachBrakesBeforeStandOffToCompensateForOvershoot() {
-        XCTAssertEqual(
-            NavigationController.visualTargetApproachDecision(
-                distanceToGoal: 0.99,
-                forwardClearance: 0.39,
-                stopDistance: 0.30
-            ),
-            .arrived
-        )
-    }
-
-    func testVisualTargetApproachRelaxesObstacleGuardOnlyNearProjectedGoal() {
-        XCTAssertEqual(
-            NavigationController.visualTargetApproachDecision(
-                distanceToGoal: 0.99,
-                forwardClearance: 0.41,
-                stopDistance: 0.30
-            ),
-            .approach
-        )
-        XCTAssertEqual(
-            NavigationController.visualTargetApproachDecision(
-                distanceToGoal: 1.21,
-                forwardClearance: 0.29,
-                stopDistance: 0.30
-            ),
-            .inactive
-        )
-    }
-
-    func testVisualTargetApproachSlowsForwardCommandBeforeStopDistance() {
-        let command = NavigationController.visualTargetApproachCommand(
-            WheelCommand(left: 0.35, right: 0.31),
-            forwardClearance: 0.45,
-            stopDistance: 0.30
-        )
-
-        XCTAssertEqual(command.left, RoverConfig.visualTargetApproachMaxWheelSpeed, accuracy: 0.001)
-        XCTAssertEqual(command.right, 0.106, accuracy: 0.001)
-    }
-
-    func testVisualTargetApproachKeepsCommandOutsideSlowdownDistance() {
-        let original = WheelCommand(left: 0.35, right: 0.31)
-
-        let command = NavigationController.visualTargetApproachCommand(
-            original,
-            forwardClearance: 0.61,
-            stopDistance: 0.30
-        )
-
-        XCTAssertEqual(command, original)
     }
 
     func testCommandFailureStopsNavigationAsFailed() {
@@ -360,7 +414,7 @@ final class NavigationSafetyTests: XCTestCase {
         ))
 
         navigation.navigate(to: Vec2(0.10, 0))
-        while navigation.state == .driving {
+        while navigation.state == .planning || navigation.state == .driving {
             try? await Task.sleep(for: .milliseconds(5))
         }
 
@@ -368,6 +422,52 @@ final class NavigationSafetyTests: XCTestCase {
             navigation.state,
             .failed("Depth safety stop at arrival: missing_raw_depth.")
         )
+    }
+
+    func testReachedGoalWithStaleDepthWaitsForFreshSnapshotBeforeArrival() async {
+        let (navigation, ar) = makeNavigation(depthRecoveryTimeout: 0.5)
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        ingestBlindDepth(
+            into: ar,
+            timestamp: ProcessInfo.processInfo.systemUptime - 1
+        )
+        let initialDepthVersion = ar.depthSnapshotVersion
+
+        navigation.navigate(to: Vec2(0.10, 0))
+        await waitForRequestCount(2)
+        try? await Task.sleep(for: .milliseconds(20))
+        ingestBlindDepth(into: ar)
+        while navigation.state == .planning || navigation.state == .driving {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertGreaterThan(ar.depthSnapshotVersion, initialDepthVersion)
+        XCTAssertEqual(navigation.state, .arrived)
+        XCTAssertEqual(navigationCommandCount, 0)
+    }
+
+    func testReachedGoalWithPersistentlyStaleDepthTimesOutFailClosed() async {
+        let (navigation, ar) = makeNavigation(
+            depthRecoveryTimeout: 0.03,
+            depthSafetyState: { _ in .unavailable(.staleRawDepth) }
+        )
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        ingestBlindDepth(into: ar)
+        let logBefore = runtimeLog()
+
+        navigation.navigate(to: Vec2(0.10, 0))
+        while navigation.state == .planning || navigation.state == .driving {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertEqual(
+            navigation.state,
+            .failed("Depth safety stop at arrival: stale_raw_depth.")
+        )
+        XCTAssertEqual(navigationCommandCount, 0)
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("nav_arrival_depth_retry_timeout"))
+        XCTAssertTrue(logDelta.contains("depth_state=stale_raw_depth"))
     }
 
     func testRotationWithoutRawDepthStopsBeforeSendingMotorCommand() async {
@@ -436,6 +536,76 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertGreaterThan(ar.depthSnapshotVersion, initialVersion)
         XCTAssertEqual(navigation.state, .arrived)
         XCTAssertEqual(navigationCommandCount, 1)
+    }
+
+    func testStaleRotationWaitsForFreshSnapshotBeforeSendingMotion() async {
+        var depthState: DepthSafetyState = .unavailable(.staleRawDepth)
+        let (navigation, ar) = makeNavigation(
+            depthRecoveryTimeout: 0.5,
+            depthSafetyState: { _ in depthState }
+        )
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        ingestBlindDepth(into: ar)
+        let initialVersion = ar.depthSnapshotVersion
+
+        let rotation = Task { await navigation.rotate(by: .pi / 2) }
+        await waitForRequestCount(2)
+        try? await Task.sleep(for: .milliseconds(20))
+        depthState = .clear
+        ingestBlindDepth(into: ar)
+        await waitForNavigationCommandCount(1)
+        ingestTrackedPose(into: ar, yaw: .pi / 2, sequence: 2)
+        await rotation.value
+
+        XCTAssertGreaterThan(ar.depthSnapshotVersion, initialVersion)
+        XCTAssertEqual(navigation.state, .arrived)
+        XCTAssertEqual(navigationCommandCount, 1)
+    }
+
+    func testStaleRotationSkipsNewerStaleSnapshotUntilEligibleSnapshotArrives() async {
+        var depthState: DepthSafetyState = .unavailable(.staleRawDepth)
+        let (navigation, ar) = makeNavigation(
+            depthRecoveryTimeout: 0.5,
+            depthSafetyState: { _ in depthState }
+        )
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        ingestBlindDepth(into: ar)
+
+        let rotation = Task { await navigation.rotate(by: .pi / 2) }
+        await waitForRequestCount(2)
+        ingestBlindDepth(into: ar)
+        try? await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(navigationCommandCount, 0)
+
+        depthState = .clear
+        ingestBlindDepth(into: ar)
+        await waitForNavigationCommandCount(1)
+        ingestTrackedPose(into: ar, yaw: .pi / 2, sequence: 2)
+        await rotation.value
+
+        XCTAssertEqual(navigation.state, .arrived)
+        XCTAssertEqual(navigationCommandCount, 1)
+    }
+
+    func testStaleRotationWithoutFreshSnapshotTimesOutFailClosed() async {
+        let (navigation, ar) = makeNavigation(
+            depthRecoveryTimeout: 0.03,
+            depthSafetyState: { _ in .unavailable(.staleRawDepth) }
+        )
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        ingestBlindDepth(into: ar)
+        let logBefore = runtimeLog()
+
+        await navigation.rotate(by: .pi / 2)
+
+        XCTAssertEqual(
+            navigation.state,
+            .failed("Depth safety stop while rotating: stale_raw_depth.")
+        )
+        XCTAssertEqual(navigationCommandCount, 0)
+        let logDelta = String(runtimeLog().dropFirst(logBefore.count))
+        XCTAssertTrue(logDelta.contains("nav_scan_depth_retry_timeout"))
+        XCTAssertTrue(logDelta.contains("depth_state=stale_raw_depth"))
     }
 
     func testPostWaitCommsVetoPreventsRecoveredMotion() async {
@@ -508,6 +678,27 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertEqual(navigationCommandCount, 0)
     }
 
+    func testStaleForwardDepthWaitsForFreshSnapshotBeforeSendingMotion() async {
+        var depthState: DepthSafetyState = .unavailable(.staleRawDepth)
+        let (navigation, ar) = makeNavigation(
+            depthRecoveryTimeout: 0.5,
+            depthSafetyState: { _ in depthState }
+        )
+        ingestTrackedPose(into: ar, yaw: 0, sequence: 1)
+        ingestBlindDepth(into: ar)
+        let initialDepthVersion = ar.depthSnapshotVersion
+
+        navigation.navigate(to: Vec2(1, 0))
+        await waitForRequestCount(2)
+        depthState = .clear
+        ingestBlindDepth(into: ar)
+        await waitForNavigationCommandCount(1)
+        await navigation.stopAndWait()
+
+        XCTAssertGreaterThan(ar.depthSnapshotVersion, initialDepthVersion)
+        XCTAssertGreaterThanOrEqual(navigationCommandCount, 1)
+    }
+
     func testPathFollowingBlindInitialTurnUsesDepthVisibleArc() async {
         var observedMotionClasses: [DepthSafetyMotionClass] = []
         let (navigation, ar) = makeNavigation(
@@ -538,7 +729,14 @@ final class NavigationSafetyTests: XCTestCase {
         depthRecoveryTimeout: TimeInterval = RoverConfig.scanDepthRecoveryTimeout,
         obstacleGuard: ObstacleGuard = ObstacleGuard(),
         safetyFeedback: @escaping () -> RoverFeedback? = { nil },
-        depthSafetyState: ((WheelCommand) -> DepthSafetyState)? = nil
+        depthSafetyState: ((WheelCommand) -> DepthSafetyState)? = nil,
+        planningReadinessSnapshot: @escaping () -> PlanningReadinessSnapshot = {
+            PlanningReadinessSnapshot(
+                sessionGeneration: 0,
+                normalObservationStreak: 3,
+                trustedMeshRevision: 1
+            )
+        }
     ) -> (NavigationController, ARSessionManager) {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [TestURLProtocol.self]
@@ -562,14 +760,19 @@ final class NavigationSafetyTests: XCTestCase {
                         motionClass: DepthSafetyMotionClass.classify(command),
                         speedLimit: nil
                     )
-                }
+                },
+                planningReadinessSnapshot: planningReadinessSnapshot
             ), ar)
         }
         return (NavigationController(
             ar: ar,
             control: control,
             trackingRecoveryTimeout: trackingRecoveryTimeout,
-            scanDepthRecoveryTimeout: depthRecoveryTimeout
+            scanDepthRecoveryTimeout: depthRecoveryTimeout,
+            guardLayer: obstacleGuard,
+            safetyFeedback: safetyFeedback,
+            depthSafetyObservation: { ar.depthSafetyObservation(for: $0) },
+            planningReadinessSnapshot: planningReadinessSnapshot
         ), ar)
     }
 
@@ -586,7 +789,10 @@ final class NavigationSafetyTests: XCTestCase {
         ))
     }
 
-    private func ingestBlindDepth(into ar: ARSessionManager) {
+    private func ingestBlindDepth(
+        into ar: ARSessionManager,
+        timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
         var pixelBuffer: CVPixelBuffer?
         CVPixelBufferCreate(
             kCFAllocatorDefault,
@@ -615,7 +821,7 @@ final class NavigationSafetyTests: XCTestCase {
             rawDepthMap: map,
             intrinsics: intrinsics,
             cameraTransform: transform,
-            timestamp: ProcessInfo.processInfo.systemUptime
+            timestamp: timestamp
         )
     }
 
@@ -656,6 +862,11 @@ final class NavigationSafetyTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(2))
         }
         XCTAssertTrue(values().contains(expected))
+    }
+
+    private func runtimeLog() -> String {
+        guard let url = RuntimeFileLog.logFileURL else { return "" }
+        return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }
 
 }

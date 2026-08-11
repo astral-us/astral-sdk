@@ -105,6 +105,50 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         )
     }
 
+    func testThirtyCentimeterProductionMountKeepsVisibleFloorClear() {
+        let map = makeDepthBuffer(width: 80, height: 60, constantDepth: 3.0)
+        fillFloorPlane(cameraHeight: 0.30, in: map)
+
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: map,
+            intrinsics: wideIntrinsics,
+            cameraTransform: cameraTransform(height: 0.30),
+            timestamp: 10,
+            calibration: RoverConfig.cameraMountCalibration,
+            geometry: geometry
+        )
+        let observation = DepthSafetyEvaluator.evaluate(
+            snapshot,
+            command: WheelCommand(left: 0.20, right: 0.20),
+            now: 10.05
+        )
+
+        XCTAssertEqual(RoverConfig.cameraMountCalibration.cameraHeight, 0.30)
+        XCTAssertEqual(observation.state, .clear)
+    }
+
+    func testThirtyCentimeterProductionMountStillDetectsLowCrossbar() {
+        let map = makeDepthBuffer(width: 80, height: 60, constantDepth: 3.0)
+        fill(depth: 0.70, x: 35...44, y: 31...32, in: map)
+
+        let observation = DepthSafetyEvaluator.evaluate(
+            DepthSafetyEvaluator.ingest(
+                rawDepthMap: map,
+                intrinsics: wideIntrinsics,
+                cameraTransform: cameraTransform(height: 0.30),
+                timestamp: 10,
+                calibration: RoverConfig.cameraMountCalibration,
+                geometry: geometry
+            ),
+            command: WheelCommand(left: 0.35, right: 0.35),
+            now: 10.05
+        )
+
+        XCTAssertTrue(observation.state == .caution || observation.state == .stop)
+        XCTAssertLessThan(observation.clearance, 0.80)
+        XCTAssertGreaterThanOrEqual(observation.supportCount, 3)
+    }
+
     func testIntrinsicsAreScaledFromCameraImageToDepthResolution() {
         let map = makeDepthBuffer(width: 80, height: 60, constantDepth: 3.0)
         fill(depth: 0.70, x: 35...44, y: 33...37, in: map)

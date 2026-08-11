@@ -39,6 +39,10 @@ final class PhroverOperatorUITests: XCTestCase {
         let failedCard = app.otherElements["last-command-card"]
         XCTAssertTrue(failedCard.waitForExistence(timeout: 10))
 
+        let recognizedCommand = app.staticTexts["recognized-command-text"]
+        XCTAssertTrue(recognizedCommand.waitForExistence(timeout: 10))
+        XCTAssertEqual(recognizedCommand.label, "Go to our room")
+
         let mic = app.descendants(matching: .any)
             .matching(identifier: "push-to-talk-control").element
         XCTAssertTrue(mic.waitForExistence(timeout: 10))

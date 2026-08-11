@@ -55,7 +55,9 @@ public enum OfflineObjectMissionIntentParser {
         }
 
         var searchOtherRooms = false
-        for phrase in ["in the other room", "in another room", "other room"] {
+        for phrase in [
+            "in the other room", "in another room", "in our room", "in my room", "other room",
+        ] {
             if remainder == phrase {
                 searchOtherRooms = true
                 remainder = ""

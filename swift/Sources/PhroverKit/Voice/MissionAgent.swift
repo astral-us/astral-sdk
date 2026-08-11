@@ -3,15 +3,43 @@ import CoreGraphics
 import UIKit
 import RoverNav
 
+public enum NavigationGoalRejection: String, Equatable, Sendable, CaseIterable {
+    case missingPose = "missing_pose"
+    case trackingUnstable = "tracking_unstable"
+    case startOutsideMap = "start_outside_map"
+    case goalOutsideMap = "goal_outside_map"
+    case startBlocked = "start_blocked"
+    case goalBlocked = "goal_blocked"
+    case noConnectedPath = "no_connected_path"
+}
+
+public enum PlanningRecoveryOutcome: String, Equatable, Sendable {
+    case ready
+    case trackingTimeout = "tracking_timeout"
+    case meshTimeout = "mesh_timeout"
+    case cancelled
+    case sessionGenerationChanged = "session_generation_changed"
+}
+
+public enum PlanningContextRequirement: String, Equatable, Sendable {
+    case stablePose = "stable_pose"
+    case refreshedTrustedMesh = "refreshed_trusted_mesh"
+}
+
 public struct NavigationGoalAssessment: Equatable, Sendable {
     public let goal: Vec2
     public let isReachable: Bool
     public let pathDistance: Double
+    public let rejectionReason: NavigationGoalRejection?
 
-    public init(goal: Vec2, isReachable: Bool, pathDistance: Double) {
+    public init(goal: Vec2,
+                isReachable: Bool,
+                pathDistance: Double,
+                rejectionReason: NavigationGoalRejection? = nil) {
         self.goal = goal
         self.isReachable = isReachable
         self.pathDistance = pathDistance
+        self.rejectionReason = rejectionReason
     }
 }
 
@@ -26,6 +54,10 @@ public protocol RoverMotion: AnyObject {
     func rotate(by angle: Double) async
     func rotateForScan(by angle: Double) async
     func assessGoal(_ goal: Vec2) -> NavigationGoalAssessment
+    func preparePlanningContext(
+        requiring requirement: PlanningContextRequirement
+    ) async -> PlanningRecoveryOutcome
+    func recoverPlanningContext() async -> PlanningRecoveryOutcome
     func stopAndWait() async
     func cancel()
 }
@@ -41,6 +73,14 @@ extension RoverMotion {
 
     public func assessGoal(_ goal: Vec2) -> NavigationGoalAssessment {
         NavigationGoalAssessment(goal: goal, isReachable: true, pathDistance: 0)
+    }
+
+    public func preparePlanningContext(
+        requiring requirement: PlanningContextRequirement
+    ) async -> PlanningRecoveryOutcome { .ready }
+
+    public func recoverPlanningContext() async -> PlanningRecoveryOutcome {
+        await preparePlanningContext(requiring: .refreshedTrustedMesh)
     }
 
     public func stopAndWait() async {
@@ -62,6 +102,7 @@ public protocol RoverPerception: AnyObject {
     var frameSequence: UInt64? { get }
     func detectObjects() -> [PerceivedObject]
     func unproject(normalizedPoint: CGPoint) -> Vec2?
+    func unproject(object: PerceivedObject) -> Vec2?
     func capturedFrameJPEG() -> Data?
     /// Resolve a free-text description ("the green chair") to a normalized point in the
     /// current view, or `nil` if nothing matches. Has a default (substring-match)
@@ -75,6 +116,10 @@ public protocol RoverPerception: AnyObject {
 extension RoverPerception {
     public var latestObservation: PoseObservation? { nil }
     public var frameSequence: UInt64? { nil }
+
+    public func unproject(object: PerceivedObject) -> Vec2? {
+        unproject(normalizedPoint: object.normalizedPoint)
+    }
 
     /// Default grounding: case-insensitive substring match against `detectObjects()`
     /// labels, picking the highest-confidence match. No attribute/color understanding —
@@ -127,6 +172,16 @@ public final class ARPerceptionSource: RoverPerception {
 
     public func unproject(normalizedPoint: CGPoint) -> Vec2? {
         ar.unproject(normalizedPoint: normalizedPoint)
+    }
+
+    public func unproject(object: PerceivedObject) -> Vec2? {
+        guard let boundingBox = object.normalizedBoundingBox else {
+            return unproject(normalizedPoint: object.normalizedPoint)
+        }
+        return ar.unproject(
+            normalizedBoundingBox: boundingBox,
+            fallbackPoint: object.normalizedPoint
+        )
     }
 
     public func capturedFrameJPEG() -> Data? {
@@ -222,6 +277,7 @@ public final class MissionAgent {
     private enum VisualTargetScanResult {
         case found(Vec2)
         case notFound
+        case failed(String)
         case cancelled
         case sessionGenerationChanged
     }
@@ -243,6 +299,33 @@ public final class MissionAgent {
         case crossed(DoorwayRouteStep)
         case exhausted(String)
         case cancelled
+    }
+
+    private enum VisualTargetApproachOutcome {
+        case arrived
+        case failed(String)
+        case cancelled
+        case sessionGenerationChanged
+    }
+
+    private enum VisualNavigationGoalResult {
+        case reachable(Vec2)
+        case rejected(NavigationGoalRejection)
+    }
+
+    private struct VisualTargetStagingCandidate {
+        enum Kind: String {
+            case mapOpening = "map_opening"
+            case incrementalVisualRay = "incremental_visual_ray"
+        }
+
+        let candidate: ExplorationCandidate
+        let assessment: NavigationGoalAssessment
+        let targetDistanceBefore: Double
+        let targetDistanceAfter: Double
+        let kind: Kind
+
+        var targetProgress: Double { targetDistanceBefore - targetDistanceAfter }
     }
 
     public private(set) var phase: Phase = .idle {
@@ -679,6 +762,9 @@ public final class MissionAgent {
                 ) {
                 case .completed:
                     break
+                case .failed(let reason):
+                    roomTraversalExhaustionFields = ["scan_step": String(scanStep)]
+                    return .exhausted(reason)
                 case .cancelled:
                     return .cancelled
                 case .sessionGenerationChanged:
@@ -1184,8 +1270,36 @@ public final class MissionAgent {
                                                                scanSteps: &visualTargetScanSteps) {
                     case .found(let scannedGoal):
                         visualTargetScanSteps = 0
-                        navigate(to: scannedGoal, for: effectiveTarget)
-                        await waitForMotionToSettle()
+                        if navigate(to: scannedGoal, for: effectiveTarget) {
+                            await waitForMotionToSettle()
+                        } else {
+                            switch await approachVisualTarget(
+                                effectiveTarget,
+                                initialGoal: scannedGoal,
+                                missionID: missionID,
+                                expectedSessionGeneration: roomTopology?.snapshot.sessionGeneration
+                            ) {
+                            case .arrived:
+                                break
+                            case .failed(let reason):
+                                failTargetNavigationMission(missionID: missionID, reason: reason)
+                                return
+                            case .cancelled:
+                                phase = .idle
+                                RuntimeFileLog.append("mission_cancelled", fields: [
+                                    "mission": "\(missionID)",
+                                    "reason": "cancelled_during_target_approach"
+                                ])
+                                return
+                            case .sessionGenerationChanged:
+                                phase = .idle
+                                RuntimeFileLog.append("mission_cancelled", fields: [
+                                    "mission": "\(missionID)",
+                                    "reason": "session_generation_changed"
+                                ])
+                                return
+                            }
+                        }
                         guard isCurrentMission(missionID) else {
                             phase = .idle
                             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
@@ -1219,6 +1333,9 @@ public final class MissionAgent {
                             return
                         }
                         continue
+                    case .failed(let reason):
+                        failScanRotationMission(missionID: missionID, reason: reason)
+                        return
                     case .cancelled:
                         phase = .idle
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
@@ -1287,8 +1404,42 @@ public final class MissionAgent {
                     continue
                 }
                 visualTargetScanSteps = 0
-                navigate(to: goal, for: effectiveTarget)
-                await waitForMotionToSettle()
+                if navigate(to: goal, for: effectiveTarget) {
+                    guard await waitForMotionToSettle(
+                        missionID: missionID,
+                        expectedSessionGeneration: roomTopology?.snapshot.sessionGeneration
+                    ) else {
+                        phase = .idle
+                        return
+                    }
+                } else {
+                    switch await approachVisualTarget(
+                        effectiveTarget,
+                        initialGoal: goal,
+                        missionID: missionID,
+                        expectedSessionGeneration: roomTopology?.snapshot.sessionGeneration
+                    ) {
+                    case .arrived:
+                        break
+                    case .failed(let reason):
+                        failTargetNavigationMission(missionID: missionID, reason: reason)
+                        return
+                    case .cancelled:
+                        phase = .idle
+                        RuntimeFileLog.append("mission_cancelled", fields: [
+                            "mission": "\(missionID)",
+                            "reason": "cancelled_during_target_approach"
+                        ])
+                        return
+                    case .sessionGenerationChanged:
+                        phase = .idle
+                        RuntimeFileLog.append("mission_cancelled", fields: [
+                            "mission": "\(missionID)",
+                            "reason": "session_generation_changed"
+                        ])
+                        return
+                    }
+                }
                 if await recoverVisualNavigation(effectiveTarget,
                                                   missionID: missionID,
                                                   scanSteps: &visualTargetScanSteps,
@@ -1514,6 +1665,13 @@ public final class MissionAgent {
                     resolvedGoal = scannedGoal
                 case .notFound:
                     break
+                case .failed(let reason):
+                    failOfflineObjectMission(
+                        missionID: missionID,
+                        message: reason,
+                        reason: "scan_rotation_failed"
+                    )
+                    return
                 case .cancelled:
                     cancelActiveMotion(missionID: missionID, reason: "cancelled_while_scanning")
                     RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
@@ -1653,39 +1811,32 @@ public final class MissionAgent {
         }
 
         phase = .acting
-        navigate(to: goal, for: target)
-        guard await waitForMotionToSettle(
+        switch await approachVisualTarget(
+            target,
+            initialGoal: goal,
             missionID: missionID,
             expectedSessionGeneration: sessionGeneration
-        ) else {
-            if sessionGenerationChanged(from: sessionGeneration) {
-                failOfflineObjectMission(
-                    missionID: missionID,
-                    message: failureMessage,
-                    reason: "session_generation_changed"
-                )
-                return
-            }
-            RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
-                "mission": "\(missionID)",
-                "reason": "cancelled_during_navigation"
-            ])
-            return
-        }
-
-        if case .failed(let reason) = motion.state {
+        ) {
+        case .arrived:
+            break
+        case .failed(let reason):
             failOfflineObjectMission(
                 missionID: missionID,
                 message: reason,
                 reason: "target_navigation_failed"
             )
             return
-        }
-        guard case .arrived = motion.state else {
+        case .cancelled:
+            RuntimeFileLog.append("mission_offline_fallback_cancelled", fields: [
+                "mission": "\(missionID)",
+                "reason": "cancelled_during_navigation"
+            ])
+            return
+        case .sessionGenerationChanged:
             failOfflineObjectMission(
                 missionID: missionID,
                 message: failureMessage,
-                reason: "target_navigation_incomplete"
+                reason: "session_generation_changed"
             )
             return
         }
@@ -1927,6 +2078,278 @@ public final class MissionAgent {
         ])
     }
 
+    private func approachVisualTarget(
+        _ target: NavigationTarget,
+        initialGoal: Vec2,
+        missionID: Int,
+        expectedSessionGeneration: UInt64?
+    ) async -> VisualTargetApproachOutcome {
+        let maximumMapOpeningAttempts = 3
+        var targetGoal = initialGoal
+        var usedCandidateIDs = Set<String>()
+        var stagingAttempts = 0
+        var mapOpeningAttempts = 0
+        var incrementalVisualRayAttempts = 0
+        var stagingReason = "target_goal_unreachable"
+        var shouldAttemptTargetGoal = true
+        var hasRecoveredPlanningContext = false
+        var hasPreparedInitialVisualPose = false
+
+        while true {
+            guard !missionCancellationDetected(missionID) else {
+                cancelActiveMotion(missionID: missionID, reason: "cancelled_before_target_approach")
+                return .cancelled
+            }
+            guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                await motion.stopAndWait()
+                return .sessionGenerationChanged
+            }
+
+            if shouldAttemptTargetGoal {
+                stagingReason = "target_goal_unreachable"
+            }
+            var startedTargetNavigation = false
+            if shouldAttemptTargetGoal {
+                switch reachableVisualNavigationGoal(for: targetGoal) {
+                case .reachable(let navigationGoal):
+                    motion.navigate(
+                        to: navigationGoal,
+                        stoppingAtForwardClearance: RoverConfig.visualTargetStopDistance
+                    )
+                    startedTargetNavigation = true
+                case .rejected(.trackingUnstable) where !hasPreparedInitialVisualPose:
+                    hasPreparedInitialVisualPose = true
+                    switch await motion.preparePlanningContext(requiring: .stablePose) {
+                    case .ready:
+                        continue
+                    case .trackingTimeout:
+                        return .failed("AR tracking did not recover in time.")
+                    case .meshTimeout:
+                        preconditionFailure("stablePose cannot produce meshTimeout")
+                    case .cancelled:
+                        return .cancelled
+                    case .sessionGenerationChanged:
+                        return .sessionGenerationChanged
+                    }
+                case .rejected:
+                    break
+                }
+            }
+            if startedTargetNavigation {
+                guard await waitForMotionToSettle(
+                    missionID: missionID,
+                    expectedSessionGeneration: expectedSessionGeneration
+                ) else {
+                    return sessionGenerationChanged(from: expectedSessionGeneration)
+                        ? .sessionGenerationChanged
+                        : .cancelled
+                }
+                if case .failed(let reason) = motion.state {
+                    guard Self.isRecoverableTargetApproachFailure(reason) else {
+                        return .failed(reason)
+                    }
+                    stagingReason = reason
+                    RuntimeFileLog.append("mission_target_navigation_recovery", fields: [
+                        "mission": "\(missionID)",
+                        "reason": reason,
+                        "recovery": "target_staging"
+                    ])
+                } else {
+                    guard case .arrived = motion.state else {
+                        return .failed("Target navigation did not complete.")
+                    }
+                    return .arrived
+                }
+            }
+            shouldAttemptTargetGoal = true
+
+            guard mapOpeningAttempts < maximumMapOpeningAttempts
+                    || incrementalVisualRayAttempts < RoverConfig.visualTargetMaximumIncrementalSteps else {
+                RuntimeFileLog.append("mission_target_staging_exhausted", fields: [
+                    "mission": "\(missionID)",
+                    "attempts": "\(stagingAttempts)",
+                    "reason": "attempt_limit"
+                ])
+                return .failed("No safe route toward target.")
+            }
+
+            RuntimeFileLog.append("mission_target_staging_started", fields: [
+                "mission": "\(missionID)",
+                "attempt": "\(stagingAttempts + 1)",
+                "target_goal_x": String(format: "%.2f", targetGoal.x),
+                "target_goal_y": String(format: "%.2f", targetGoal.y),
+                "reason": stagingReason
+            ])
+            var rejectionCounts: [NavigationGoalRejection: Int] = [:]
+            guard let selected = rankedVisualTargetStagingCandidates(
+                toward: targetGoal,
+                excluding: usedCandidateIDs,
+                allowMapOpenings: mapOpeningAttempts < maximumMapOpeningAttempts,
+                allowIncrementalVisualRay: incrementalVisualRayAttempts
+                    < RoverConfig.visualTargetMaximumIncrementalSteps,
+                missionID: missionID,
+                rejectionCounts: &rejectionCounts
+            ).first else {
+                let dominantRejection = Self.dominantRejection(in: rejectionCounts)
+                if !hasRecoveredPlanningContext, dominantRejection != nil {
+                    hasRecoveredPlanningContext = true
+                    guard !missionCancellationDetected(missionID) else {
+                        cancelActiveMotion(missionID: missionID, reason: "cancelled_before_target_reacquisition")
+                        return .cancelled
+                    }
+                    guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                        await motion.stopAndWait()
+                        return .sessionGenerationChanged
+                    }
+                    guard let refreshedGoal = resolve(target, missionID: missionID) else {
+                        return .failed("I couldn't reacquire the target before refreshing the map.")
+                    }
+                    guard !missionCancellationDetected(missionID) else {
+                        cancelActiveMotion(missionID: missionID, reason: "cancelled_after_target_reacquisition")
+                        return .cancelled
+                    }
+                    guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                        await motion.stopAndWait()
+                        return .sessionGenerationChanged
+                    }
+                    targetGoal = refreshedGoal
+                    switch await motion.preparePlanningContext(requiring: .refreshedTrustedMesh) {
+                    case .ready:
+                        guard !missionCancellationDetected(missionID) else {
+                            cancelActiveMotion(missionID: missionID, reason: "cancelled_after_planning_readiness")
+                            return .cancelled
+                        }
+                        guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
+                            await motion.stopAndWait()
+                            return .sessionGenerationChanged
+                        }
+                        usedCandidateIDs.removeAll()
+                        RuntimeFileLog.append("mission_target_planning_retry", fields: [
+                            "mission": "\(missionID)",
+                            "target": targetDescription(target),
+                            "original_rejection_reason": dominantRejection?.rawValue ?? "unknown",
+                            "inference_completed_before_readiness": "true"
+                        ])
+                        continue
+                    case .trackingTimeout:
+                        return .failed("AR tracking did not recover in time.")
+                    case .meshTimeout:
+                        return .failed("The navigation map did not refresh in time.")
+                    case .cancelled:
+                        return .cancelled
+                    case .sessionGenerationChanged:
+                        return .sessionGenerationChanged
+                    }
+                }
+                RuntimeFileLog.append("mission_target_staging_exhausted", fields: [
+                    "mission": "\(missionID)",
+                    "attempts": "\(stagingAttempts)",
+                    "reason": "no_progress_candidate",
+                    "rejection_reason": dominantRejection?.rawValue ?? "none"
+                ])
+                return .failed("No safe route toward target.")
+            }
+
+            stagingAttempts += 1
+            switch selected.kind {
+            case .mapOpening:
+                mapOpeningAttempts += 1
+            case .incrementalVisualRay:
+                incrementalVisualRayAttempts += 1
+            }
+            usedCandidateIDs.insert(selected.candidate.id)
+            RuntimeFileLog.append("mission_target_staging_selected", fields: [
+                "mission": "\(missionID)",
+                "attempt": "\(stagingAttempts)",
+                "candidate": selected.candidate.id,
+                "source": selected.kind.rawValue,
+                "goal_x": String(format: "%.2f", selected.candidate.worldPoint.x),
+                "goal_y": String(format: "%.2f", selected.candidate.worldPoint.y),
+                "target_progress": String(format: "%.2f", selected.targetProgress),
+                "path_distance": String(format: "%.2f", selected.assessment.pathDistance)
+            ])
+
+            phase = .acting
+            let frameBeforeStaging = perception.frameSequence
+            motion.navigate(to: selected.candidate.worldPoint)
+            guard await waitForMotionToSettle(
+                missionID: missionID,
+                expectedSessionGeneration: expectedSessionGeneration
+            ) else {
+                return sessionGenerationChanged(from: expectedSessionGeneration)
+                    ? .sessionGenerationChanged
+                    : .cancelled
+            }
+            if case .failed(let reason) = motion.state {
+                if Self.isRecoverableTargetApproachFailure(reason) {
+                    stagingReason = reason
+                    shouldAttemptTargetGoal = false
+                    RuntimeFileLog.append("mission_target_staging_rejected", fields: [
+                        "mission": "\(missionID)",
+                        "attempt": "\(stagingAttempts)",
+                        "candidate": selected.candidate.id,
+                        "reason": reason,
+                        "recovery": "next_candidate"
+                    ])
+                    continue
+                }
+                return .failed(reason)
+            }
+            guard case .arrived = motion.state else {
+                return .failed("Target staging navigation did not complete.")
+            }
+
+            switch await waitForFreshTrackedPerceptionFrame(
+                newerThan: frameBeforeStaging,
+                expectedSessionGeneration: expectedSessionGeneration,
+                missionID: missionID
+            ) {
+            case .ready:
+                break
+            case .timedOut:
+                return .failed("The camera view did not refresh after moving.")
+            case .cancelled:
+                return .cancelled
+            case .sessionGenerationChanged:
+                return .sessionGenerationChanged
+            }
+
+            var reacquiredGoal = resolve(target, missionID: missionID)
+            if reacquiredGoal == nil {
+                var scanSteps = 0
+                switch await scanForUnresolvedVisualTarget(
+                    target,
+                    missionID: missionID,
+                    scanSteps: &scanSteps,
+                    expectedSessionGeneration: expectedSessionGeneration,
+                    requireTrackedFrame: expectedSessionGeneration != nil
+                ) {
+                case .found(let goal):
+                    reacquiredGoal = goal
+                case .notFound:
+                    break
+                case .failed(let reason):
+                    return .failed(reason)
+                case .cancelled:
+                    return .cancelled
+                case .sessionGenerationChanged:
+                    return .sessionGenerationChanged
+                }
+            }
+            if let reacquiredGoal {
+                targetGoal = reacquiredGoal
+            }
+            RuntimeFileLog.append("mission_target_staging_completed", fields: [
+                "mission": "\(missionID)",
+                "attempt": "\(stagingAttempts)",
+                "candidate": selected.candidate.id,
+                "target_reacquired": reacquiredGoal == nil ? "false" : "true",
+                "target_goal_x": String(format: "%.2f", targetGoal.x),
+                "target_goal_y": String(format: "%.2f", targetGoal.y)
+            ])
+        }
+    }
+
     private func failOfflineObjectMission(
         missionID: Int,
         message: String,
@@ -2066,7 +2489,7 @@ public final class MissionAgent {
     private func updateWorldModel() {
         // Object permanence: pin every current detection to the nav plane.
         for object in perception.detectObjects() {
-            if let world = perception.unproject(normalizedPoint: object.normalizedPoint) {
+            if let world = perception.unproject(object: object) {
                 memory.rememberObject(label: object.label, at: world)
             }
         }
@@ -2114,8 +2537,8 @@ public final class MissionAgent {
         case .worldPoint(let p): return p
         case .imagePoint(let p): return perception.unproject(normalizedPoint: p)
         case .visualQuery(let q):
-            guard let point = lockedVisualTargetPoint(query: q, missionID: missionID) else { return nil }
-            return perception.unproject(normalizedPoint: point)
+            guard let object = lockedVisualTarget(query: q, missionID: missionID) else { return nil }
+            return perception.unproject(object: object)
         }
     }
 
@@ -2144,8 +2567,14 @@ public final class MissionAgent {
         return target
     }
 
-    private func lockedVisualTargetPoint(query: String, missionID: Int) -> CGPoint? {
+    private func lockedVisualTarget(query: String, missionID: Int) -> PerceivedObject? {
         let objects = perception.detectObjects()
+        return lockedVisualTarget(query: query, objects: objects, missionID: missionID)
+    }
+
+    private func lockedVisualTarget(query: String,
+                                    objects: [PerceivedObject],
+                                    missionID: Int) -> PerceivedObject? {
         guard let match = Self.bestVisualTargetMatch(
             query: query,
             objects: objects,
@@ -2169,7 +2598,7 @@ public final class MissionAgent {
             "direction": Self.visualTargetDirection(for: match.normalizedPoint),
             "x": String(format: "%.2f", match.normalizedPoint.x)
         ])
-        return match.normalizedPoint
+        return match
     }
 
     static func bestVisualTargetMatch(query: String,
@@ -2313,6 +2742,7 @@ public final class MissionAgent {
         -> VisualTargetScanResult {
         guard case .visualQuery(let query) = target else { return .notFound }
         var shouldEvaluateBeforeTurn = !requireNewFrameAfterInitialTurn
+        var scanDirection = 1.0
         while scanSteps < maxVisualTargetScanSteps {
             guard !sessionGenerationChanged(from: expectedSessionGeneration) else {
                 return .sessionGenerationChanged
@@ -2342,22 +2772,54 @@ public final class MissionAgent {
                 return .cancelled
             }
 
-            scanSteps += 1
-            let angle = visualTargetScanAngle(forScanStep: scanSteps)
+            let attemptedStep = scanSteps + 1
+            let angle = visualTargetScanAngle(forScanStep: attemptedStep) * scanDirection
             RuntimeFileLog.append("mission_target_scan_step", fields: [
                 "mission": "\(missionID)",
                 "target": query,
-                "step": "\(scanSteps)",
+                "step": "\(attemptedStep)",
                 "max": "\(maxVisualTargetScanSteps)",
                 "angle": String(format: "%.0fdeg", angle * 180 / .pi)
             ])
             let frameBeforeTurn = perception.frameSequence
-            switch await rotateForScanRespectingCancellation(
+            let firstRotation = await rotateForScanRespectingCancellation(
                 by: angle,
                 expectedSessionGeneration: expectedSessionGeneration
-            ) {
+            )
+            switch firstRotation {
             case .completed:
-                break
+                scanSteps = attemptedStep
+            case .failed(let firstReason):
+                let retryAngle = -angle
+                RuntimeFileLog.append("mission_target_scan_rotation_retry", fields: [
+                    "mission": "\(missionID)",
+                    "target": query,
+                    "step": "\(attemptedStep)",
+                    "failed_angle": String(format: "%.0fdeg", angle * 180 / .pi),
+                    "retry_angle": String(format: "%.0fdeg", retryAngle * 180 / .pi),
+                    "reason": firstReason,
+                ])
+                switch await rotateForScanRespectingCancellation(
+                    by: retryAngle,
+                    expectedSessionGeneration: expectedSessionGeneration
+                ) {
+                case .completed:
+                    scanDirection *= -1
+                    scanSteps = attemptedStep
+                case .failed(let retryReason):
+                    RuntimeFileLog.append("mission_target_scan_rotation_failed", fields: [
+                        "mission": "\(missionID)",
+                        "target": query,
+                        "step": "\(attemptedStep)",
+                        "first_reason": firstReason,
+                        "retry_reason": retryReason,
+                    ])
+                    return .failed(retryReason)
+                case .cancelled:
+                    return .cancelled
+                case .sessionGenerationChanged:
+                    return .sessionGenerationChanged
+                }
             case .cancelled:
                 return .cancelled
             case .sessionGenerationChanged:
@@ -2472,8 +2934,8 @@ public final class MissionAgent {
             ) else { return .timedOut }
             let objects = perception.detectObjects()
             guard !objects.isEmpty else { return .timedOut }
-            if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
-               let goal = perception.unproject(normalizedPoint: point) {
+            if let object = lockedVisualTarget(query: query, objects: objects, missionID: missionID),
+               let goal = perception.unproject(object: object) {
                 return .found(goal)
             }
             return .timedOut
@@ -2522,8 +2984,8 @@ public final class MissionAgent {
                 continue
             }
             sawVisibleObjects = true
-            if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
-               let goal = perception.unproject(normalizedPoint: point) {
+            if let object = lockedVisualTarget(query: query, objects: objects, missionID: missionID),
+               let goal = perception.unproject(object: object) {
                 RuntimeFileLog.append("mission_target_scan_wait_match", fields: [
                     "mission": "\(missionID)",
                     "target": query
@@ -2581,35 +3043,6 @@ public final class MissionAgent {
         min(0.2, max(0.01, visualTargetScanDelay / 5))
     }
 
-    private func lockedVisualTargetPoint(query: String,
-                                         objects: [PerceivedObject],
-                                         missionID: Int) -> CGPoint? {
-        guard let match = Self.bestVisualTargetMatch(
-            query: query,
-            objects: objects,
-            minimumConfidence: visualTargetConfidenceThreshold,
-            missionID: missionID,
-            telemetry: missionTelemetry
-        ) else {
-            RuntimeFileLog.append("mission_target_not_locked", fields: [
-                "mission": "\(missionID)",
-                "target": query,
-                "visible": visibleObjectsLogSummary(objects),
-                "threshold": String(format: "%.2f", visualTargetConfidenceThreshold)
-            ])
-            return nil
-        }
-        RuntimeFileLog.append("mission_target_match", fields: [
-            "mission": "\(missionID)",
-            "target": query,
-            "label": match.label,
-            "confidence": String(format: "%.2f", match.confidence),
-            "direction": Self.visualTargetDirection(for: match.normalizedPoint),
-            "x": String(format: "%.2f", match.normalizedPoint.x)
-        ])
-        return match.normalizedPoint
-    }
-
     private func visualTargetScanAngle(forScanStep step: Int) -> Double {
         guard step > 0 else { return 0 }
         return visualTargetScanAngle
@@ -2621,13 +3054,226 @@ public final class MissionAgent {
             .max { $0.widthMeters < $1.widthMeters }
     }
 
-    private func navigate(to goal: Vec2, for target: NavigationTarget) {
+    private func rankedVisualTargetStagingCandidates(
+        toward targetGoal: Vec2,
+        excluding usedCandidateIDs: Set<String>,
+        allowMapOpenings: Bool,
+        allowIncrementalVisualRay: Bool,
+        missionID: Int,
+        rejectionCounts: inout [NavigationGoalRejection: Int]
+    ) -> [VisualTargetStagingCandidate] {
+        updateWorldModel()
+        guard let currentPosition = perception.pose?.position else { return [] }
+        let targetDistanceBefore = currentPosition.distance(to: targetGoal)
+
+        let mapOpeningCandidates = explorationCandidates
+            .filter {
+                allowMapOpenings
+                    && $0.status == .unexplored
+                    && !usedCandidateIDs.contains($0.id)
+            }
+            .compactMap { candidate in
+                let assessment = motion.assessGoal(candidate.worldPoint)
+                let targetDistanceAfter = candidate.worldPoint.distance(to: targetGoal)
+                let ranked = VisualTargetStagingCandidate(
+                    candidate: candidate,
+                    assessment: assessment,
+                    targetDistanceBefore: targetDistanceBefore,
+                    targetDistanceAfter: targetDistanceAfter,
+                    kind: .mapOpening
+                )
+                let accepted = assessment.isReachable && ranked.targetProgress >= 0.10
+                if !assessment.isReachable {
+                    rejectionCounts[assessment.rejectionReason ?? .noConnectedPath, default: 0] += 1
+                }
+                RuntimeFileLog.append("mission_target_staging_candidate", fields: [
+                    "mission": "\(missionID)",
+                    "candidate": candidate.id,
+                    "source": VisualTargetStagingCandidate.Kind.mapOpening.rawValue,
+                    "goal_x": String(format: "%.2f", candidate.worldPoint.x),
+                    "goal_y": String(format: "%.2f", candidate.worldPoint.y),
+                    "reachable": assessment.isReachable ? "true" : "false",
+                    "target_progress": String(format: "%.2f", ranked.targetProgress),
+                    "path_distance": String(format: "%.2f", assessment.pathDistance),
+                    "accepted": accepted ? "true" : "false",
+                    "rejection_reason": assessment.rejectionReason?.rawValue ?? "none"
+                ])
+                return accepted ? ranked : nil
+            }
+            .sorted { lhs, rhs in
+                if abs(lhs.targetProgress - rhs.targetProgress) > 0.001 {
+                    return lhs.targetProgress > rhs.targetProgress
+                }
+                return lhs.assessment.pathDistance < rhs.assessment.pathDistance
+            }
+
+        guard mapOpeningCandidates.isEmpty, allowIncrementalVisualRay else {
+            return mapOpeningCandidates
+        }
+        return incrementalVisualTargetStagingCandidates(
+            from: currentPosition,
+            toward: targetGoal,
+            excluding: usedCandidateIDs,
+            missionID: missionID,
+            rejectionCounts: &rejectionCounts
+        )
+    }
+
+    private func incrementalVisualTargetStagingCandidates(
+        from currentPosition: Vec2,
+        toward targetGoal: Vec2,
+        excluding usedCandidateIDs: Set<String>,
+        missionID: Int,
+        rejectionCounts: inout [NavigationGoalRejection: Int]
+    ) -> [VisualTargetStagingCandidate] {
+        let offset = targetGoal - currentPosition
+        let targetDistanceBefore = offset.length
+        let maximumStep = min(
+            RoverConfig.visualTargetIncrementalStepDistance,
+            targetDistanceBefore - RoverConfig.visualTargetStopDistance
+        )
+        guard maximumStep >= RoverConfig.visualTargetMinimumIncrementalStepDistance,
+              targetDistanceBefore > 0 else {
+            return []
+        }
+
+        let direction = offset * (1 / targetDistanceBefore)
+        var candidates: [VisualTargetStagingCandidate] = []
+        var stepDistance = maximumStep
+        while stepDistance >= RoverConfig.visualTargetMinimumIncrementalStepDistance - 0.001 {
+            let worldPoint = currentPosition + direction * stepDistance
+            let candidateID = String(
+                format: "visual_step_%.2f_%.2f",
+                worldPoint.x,
+                worldPoint.y
+            )
+            guard !usedCandidateIDs.contains(candidateID) else {
+                stepDistance -= RoverConfig.visualTargetIncrementalStepDecrement
+                continue
+            }
+
+            let candidate = ExplorationCandidate(
+                id: candidateID,
+                worldPoint: worldPoint,
+                widthMeters: 0
+            )
+            let assessment = motion.assessGoal(worldPoint)
+            let ranked = VisualTargetStagingCandidate(
+                candidate: candidate,
+                assessment: assessment,
+                targetDistanceBefore: targetDistanceBefore,
+                targetDistanceAfter: worldPoint.distance(to: targetGoal),
+                kind: .incrementalVisualRay
+            )
+            let accepted = assessment.isReachable && ranked.targetProgress >= 0.10
+            if !assessment.isReachable {
+                rejectionCounts[assessment.rejectionReason ?? .noConnectedPath, default: 0] += 1
+            }
+            RuntimeFileLog.append("mission_target_staging_candidate", fields: [
+                "mission": "\(missionID)",
+                "candidate": candidateID,
+                "source": VisualTargetStagingCandidate.Kind.incrementalVisualRay.rawValue,
+                "goal_x": String(format: "%.2f", worldPoint.x),
+                "goal_y": String(format: "%.2f", worldPoint.y),
+                "reachable": assessment.isReachable ? "true" : "false",
+                "target_progress": String(format: "%.2f", ranked.targetProgress),
+                "path_distance": String(format: "%.2f", assessment.pathDistance),
+                "accepted": accepted ? "true" : "false",
+                "rejection_reason": assessment.rejectionReason?.rawValue ?? "none"
+            ])
+            if accepted {
+                candidates.append(ranked)
+            }
+            stepDistance -= RoverConfig.visualTargetIncrementalStepDecrement
+        }
+        return candidates.sorted {
+            if abs($0.targetProgress - $1.targetProgress) > 0.001 {
+                return $0.targetProgress > $1.targetProgress
+            }
+            return $0.assessment.pathDistance < $1.assessment.pathDistance
+        }
+    }
+
+    @discardableResult
+    private func navigate(to goal: Vec2, for target: NavigationTarget) -> Bool {
         if case .visualQuery = target {
-            motion.navigate(to: goal,
+            guard case .reachable(let navigationGoal) = reachableVisualNavigationGoal(for: goal) else {
+                return false
+            }
+            motion.navigate(to: navigationGoal,
                             stoppingAtForwardClearance: RoverConfig.visualTargetStopDistance)
+            return true
         } else {
             motion.navigate(to: goal)
+            return true
         }
+    }
+
+    private func reachableVisualNavigationGoal(for objectGoal: Vec2) -> VisualNavigationGoalResult {
+        let objectAssessment = motion.assessGoal(objectGoal)
+        guard !objectAssessment.isReachable else { return .reachable(objectGoal) }
+        var rejectionCounts: [NavigationGoalRejection: Int] = [
+            objectAssessment.rejectionReason ?? .noConnectedPath: 1
+        ]
+        guard let pose = perception.pose?.position else {
+            RuntimeFileLog.append("mission_target_approach_goal_unreachable", fields: [
+                "object_goal_x": String(format: "%.2f", objectGoal.x),
+                "object_goal_y": String(format: "%.2f", objectGoal.y),
+                "reason": "pose_unavailable"
+            ])
+            return .rejected(.missingPose)
+        }
+        let offset = objectGoal - pose
+        let distance = offset.length
+        guard distance > RoverConfig.visualTargetStopDistance else { return .reachable(pose) }
+
+        let maximumStandOff = min(RoverConfig.visualTargetApproachDistance, distance)
+        var standOff = RoverConfig.visualTargetStopDistance
+        while standOff <= maximumStandOff + 0.001 {
+            let approachGoal = objectGoal - offset * (standOff / distance)
+            let assessment = motion.assessGoal(approachGoal)
+            if assessment.isReachable {
+                RuntimeFileLog.append("mission_target_approach_goal_adjusted", fields: [
+                    "object_goal_x": String(format: "%.2f", objectGoal.x),
+                    "object_goal_y": String(format: "%.2f", objectGoal.y),
+                    "approach_goal_x": String(format: "%.2f", approachGoal.x),
+                    "approach_goal_y": String(format: "%.2f", approachGoal.y),
+                    "stand_off": String(format: "%.2f", standOff),
+                    "path_distance": String(format: "%.2f", assessment.pathDistance)
+                ])
+                return .reachable(approachGoal)
+            }
+            rejectionCounts[assessment.rejectionReason ?? .noConnectedPath, default: 0] += 1
+            RuntimeFileLog.append("mission_target_approach_goal_rejected", fields: [
+                "approach_goal_x": String(format: "%.2f", approachGoal.x),
+                "approach_goal_y": String(format: "%.2f", approachGoal.y),
+                "stand_off": String(format: "%.2f", standOff),
+                "rejection_reason": assessment.rejectionReason?.rawValue ?? "unknown"
+            ])
+            standOff += RoverConfig.visualTargetStandOffIncrement
+        }
+
+        RuntimeFileLog.append("mission_target_approach_goal_unreachable", fields: [
+            "object_goal_x": String(format: "%.2f", objectGoal.x),
+            "object_goal_y": String(format: "%.2f", objectGoal.y),
+            "maximum_stand_off": String(format: "%.2f", maximumStandOff),
+            "rejection_reason": objectAssessment.rejectionReason?.rawValue ?? "unknown"
+        ])
+        return .rejected(Self.dominantRejection(in: rejectionCounts) ?? .noConnectedPath)
+    }
+
+    private static func dominantRejection(
+        in counts: [NavigationGoalRejection: Int]
+    ) -> NavigationGoalRejection? {
+        NavigationGoalRejection.allCases.max { lhs, rhs in
+            let left = counts[lhs, default: 0]
+            let right = counts[rhs, default: 0]
+            if left == right {
+                return NavigationGoalRejection.allCases.firstIndex(of: lhs)!
+                    > NavigationGoalRejection.allCases.firstIndex(of: rhs)!
+            }
+            return left < right
+        }.flatMap { counts[$0, default: 0] > 0 ? $0 : nil }
     }
 
     private func finishMissionIfVisualTargetArrived(_ target: NavigationTarget,
@@ -2742,6 +3388,9 @@ public final class MissionAgent {
             ) {
             case .completed:
                 break
+            case .failed(let reason):
+                failReturnMission(missionID: missionID, reason: reason)
+                return .failed
             case .cancelled:
                 return .cancelled
             case .sessionGenerationChanged:
@@ -2783,7 +3432,9 @@ public final class MissionAgent {
                     self?.motion.cancel()
                 }
             }
-            return Task.isCancelled ? .cancelled : .completed
+            if Task.isCancelled { return .cancelled }
+            if case .failed(let reason) = motion.state { return .failed(reason) }
+            return .completed
         }
 
         let race = ScanRotationRace()
@@ -2899,6 +3550,34 @@ public final class MissionAgent {
         ])
     }
 
+    private func failScanRotationMission(missionID: Int, reason: String) {
+        motion.cancel()
+        voice.speak(reason)
+        publishMissionTerminal(
+            { .failed(id: $0, command: $1, message: reason) },
+            missionID: missionID
+        )
+        phase = .idle
+        RuntimeFileLog.append("mission_target_scan_rotation_failed", fields: [
+            "mission": "\(missionID)",
+            "reason": reason,
+        ])
+    }
+
+    private func failTargetNavigationMission(missionID: Int, reason: String) {
+        motion.cancel()
+        voice.speak(reason)
+        publishMissionTerminal(
+            { .failed(id: $0, command: $1, message: reason) },
+            missionID: missionID
+        )
+        phase = .idle
+        RuntimeFileLog.append("mission_target_navigation_failed", fields: [
+            "mission": "\(missionID)",
+            "reason": reason,
+        ])
+    }
+
     private func recoverVisualNavigation(_ target: NavigationTarget,
                                          missionID: Int,
                                          scanSteps: inout Int,
@@ -2952,6 +3631,10 @@ public final class MissionAgent {
             ])
             return true
 
+        case .failed(let reason):
+            failScanRotationMission(missionID: missionID, reason: reason)
+            return true
+
         case .cancelled:
             phase = .idle
             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
@@ -2996,7 +3679,10 @@ public final class MissionAgent {
         missionID: Int? = nil,
         expectedSessionGeneration: UInt64? = nil
     ) async -> Bool {
-        while motion.state == .driving {
+        RuntimeFileLog.append("mission_motion_wait_started", fields: [
+            "state": motion.state.description
+        ])
+        while motion.state.isMotionActive {
             if sessionGenerationChanged(from: expectedSessionGeneration) {
                 await motion.stopAndWait()
                 return false
@@ -3163,6 +3849,13 @@ public final class MissionAgent {
 
     private static func isBlockedHeading(_ reason: String) -> Bool {
         reason.localizedCaseInsensitiveContains("Obstacle ahead")
+            || reason.localizedCaseInsensitiveContains("Depth safety stop: stop")
+    }
+
+    private static func isRecoverableTargetApproachFailure(_ reason: String) -> Bool {
+        isBlockedHeading(reason)
+            || reason.localizedCaseInsensitiveContains("safely see the space needed to turn")
+            || reason.localizedCaseInsensitiveContains("Depth safety stop while rotating")
     }
 
     private static func isNavigationStalled(_ reason: String) -> Bool {
@@ -3227,6 +3920,7 @@ private struct BrainDecisionTimeoutError: LocalizedError {
 
 private enum ScanRotationOutcome: Equatable {
     case completed
+    case failed(String)
     case cancelled
     case sessionGenerationChanged
 }
@@ -3325,7 +4019,13 @@ private final class ScanRotationRace {
         tasks = [
             Task { @MainActor in
                 await motion.rotateForScan(by: angle)
-                self.finish(Task.isCancelled ? .cancelled : .completed)
+                if Task.isCancelled {
+                    self.finish(.cancelled)
+                } else if case .failed(let reason) = motion.state {
+                    self.finish(.failed(reason))
+                } else {
+                    self.finish(.completed)
+                }
             },
             Task { @MainActor in
                 while !Task.isCancelled {

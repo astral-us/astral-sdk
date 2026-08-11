@@ -147,7 +147,9 @@ public final class OnDeviceBrain: RoverBrain {
         }
 
         let fallback: RoverDecision
-        if let opening = context.explorationCandidates.first(where: { $0.status == .unexplored }) {
+        if let operatorTarget = visibleOperatorTarget(in: context) {
+            fallback = .navigate(.visualQuery(operatorTarget))
+        } else if let opening = context.explorationCandidates.first(where: { $0.status == .unexplored }) {
             fallback = .explore(candidateId: opening.id)
         } else {
             fallback = .lookAround(angle: .pi / 6)
@@ -158,6 +160,19 @@ public final class OnDeviceBrain: RoverBrain {
             "reason": "not_grounded_in_current_mission",
         ])
         return BrainOutput(decision: fallback)
+    }
+
+    private static func visibleOperatorTarget(in context: MissionContext) -> String? {
+        let utterances = context.memory.currentMissionTurns.map(\.utterance)
+            + [context.utterance].compactMap { $0 }
+        guard let intent = utterances.lazy.compactMap(OfflineObjectMissionIntentParser.parse).first else {
+            return nil
+        }
+        let targetLabel = intent.targetLabel.lowercased()
+        guard context.visibleObjects.contains(where: { $0.label.lowercased() == targetLabel }) else {
+            return nil
+        }
+        return intent.objectQuery
     }
 
     private static func visualQueryIsGrounded(_ query: String, context: MissionContext) -> Bool {

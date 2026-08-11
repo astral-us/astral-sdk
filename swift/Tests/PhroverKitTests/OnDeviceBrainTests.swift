@@ -92,6 +92,33 @@ final class OnDeviceBrainTests: XCTestCase {
         XCTAssertNil(output.updatedPlan)
     }
 
+    func testRestoresVisibleOperatorTargetWhenModelInventsAttribute() async throws {
+        let responder = ScriptedOnDeviceBrainResponder(output: BrainOutput(
+            decision: .navigate(.visualQuery("the gray refrigerator")),
+            updatedPlan: "1. go to the gray refrigerator"
+        ))
+        let brain = OnDeviceBrain(isAvailable: { true }, makeResponder: { responder })
+        var memory = MissionMemory()
+        memory.beginMission(utterance: "Go to refrigerator", at: Pose2D(position: .zero, yaw: 0))
+
+        let output = try await brain.nextAction(MissionContext(
+            visibleObjects: [
+                PerceivedObject(
+                    label: "refrigerator",
+                    confidence: 0.99,
+                    normalizedPoint: CGPoint(x: 0.5, y: 0.5)
+                ),
+            ],
+            memory: memory,
+            explorationCandidates: [
+                ExplorationCandidate(id: "opening_1", worldPoint: Vec2(2, 0), widthMeters: 1),
+            ]
+        ))
+
+        XCTAssertEqual(output.decision, .navigate(.visualQuery("refrigerator")))
+        XCTAssertNil(output.updatedPlan)
+    }
+
     func testPromptIncludesObjectAndColorConfidence() async throws {
         let responder = PromptRecordingResponder()
         let brain = OnDeviceBrain(availability: { .available }, makeResponder: { responder })
