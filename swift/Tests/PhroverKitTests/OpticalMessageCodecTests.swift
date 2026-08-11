@@ -122,6 +122,9 @@ final class OpticalMessageCodecTests: XCTestCase {
         XCTAssertThrowsError(try codec.decode(Data([0xff]), nowMilliseconds: offerTime)) {
             XCTAssertEqual($0 as? OpticalMessageCodecError, .malformedUTF8)
         }
+        XCTAssertThrowsError(try codec.decode(Data("{".utf8), nowMilliseconds: offerTime)) {
+            XCTAssertEqual($0 as? OpticalMessageCodecError, .malformedJSON)
+        }
         XCTAssertThrowsError(try codec.decode(Data("[]".utf8), nowMilliseconds: offerTime)) {
             XCTAssertEqual($0 as? OpticalMessageCodecError, .invalidEnvelope)
         }

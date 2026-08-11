@@ -117,6 +117,45 @@ final class OpticalProtocolSessionTests: XCTestCase {
         }
     }
 
+    func testLateSearchAcknowledgementCanBeReplacedWithoutCorruptingSequenceOrPhase() throws {
+        var sessions = try sessionsThroughAcceptance()
+        let acceptHash = OpticalMessageCodec().messageLinkHash(for: try sessions.b.retryOutgoing())
+        let initialCommit = try sessions.a.prepareOutgoing(body: .searchCommit(SearchCommitBody(
+            deadlineMilliseconds: now + 210_000, acceptanceHash: acceptHash,
+            startMilliseconds: now + 30_000)), at: now)
+        try sessions.b.receive(initialCommit, at: now)
+        let lateAcknowledgement = try sessions.b.prepareOutgoing(body: .searchAck(HashAcknowledgementBody(
+            hash: OpticalMessageCodec().messageLinkHash(for: initialCommit))), at: now)
+
+        XCTAssertThrowsError(try sessions.a.receive(lateAcknowledgement, at: now + 25_001)) {
+            XCTAssertEqual($0 as? OpticalProtocolRejection, .invalidSchedule)
+        }
+        XCTAssertEqual(sessions.a.phase, .awaitingSearchAck)
+        XCTAssertEqual(sessions.a.incomingSequence.lastAccepted, 1)
+        XCTAssertEqual(sessions.a.outgoingSequence.nextSequence, 3)
+
+        let replacementStart = now + 55_001
+        let replacementCommit = try sessions.a.prepareOutgoing(body: .searchCommit(SearchCommitBody(
+            deadlineMilliseconds: replacementStart + 180_000, acceptanceHash: acceptHash,
+            startMilliseconds: replacementStart)), at: now + 25_001)
+        XCTAssertEqual(try OpticalMessageCodec().decode(replacementCommit).sequence, 3)
+        XCTAssertEqual(sessions.a.phase, .awaitingSearchAck)
+        XCTAssertEqual(sessions.a.outgoingSequence.nextSequence, 4)
+        XCTAssertEqual(try sessions.a.retryOutgoing(), replacementCommit)
+
+        try sessions.b.receive(replacementCommit, at: now + 25_001)
+        let replacementAcknowledgement = try sessions.b.prepareOutgoing(body: .searchAck(HashAcknowledgementBody(
+            hash: OpticalMessageCodec().messageLinkHash(for: replacementCommit))), at: now + 25_001)
+        try sessions.a.receive(replacementAcknowledgement, at: replacementStart - 5_000)
+
+        let expected = OpticalProtocolPhase.searchScheduled(
+            startMilliseconds: replacementStart, deadlineMilliseconds: replacementStart + 180_000)
+        XCTAssertEqual(sessions.a.phase, expected)
+        XCTAssertEqual(sessions.b.phase, expected)
+        XCTAssertEqual(sessions.a.incomingSequence.lastAccepted, 3)
+        XCTAssertEqual(sessions.b.incomingSequence.lastAccepted, 3)
+    }
+
     func testRendezvousDeterministicallyHandlesEveryOutcome() throws {
         let foundA = StatusBody(found: true, label: "chair", x: -100, y: 200,
                                 confidenceBasisPoints: 9500, sampleCount: 3)
@@ -149,6 +188,24 @@ final class OpticalProtocolSessionTests: XCTestCase {
             previousStatusHash: String(repeating: "0", count: 64)))
         XCTAssertEqual(neither.a.phase, .terminalNotFound)
         XCTAssertEqual(neither.b.phase, .terminalNotFound)
+    }
+
+    func testConvergenceIsRejectedAfterConflictWithoutChangingStateOrSequence() throws {
+        let foundA = StatusBody(found: true, label: "chair", x: -100, y: 200,
+                                confidenceBasisPoints: 9500, sampleCount: 3)
+        let foundBFar = StatusBody(found: true, previousStatusHash: String(repeating: "0", count: 64),
+                                   label: "chair", x: 401, y: 600,
+                                   confidenceBasisPoints: 9700, sampleCount: 5)
+        var sessions = try completeRendezvous(aStatus: foundA, bStatusTemplate: foundBFar)
+        let nextSequence = sessions.a.outgoingSequence.nextSequence
+
+        XCTAssertThrowsError(try sessions.a.prepareOutgoing(body: .converge(ConvergeBody(
+            decisionHash: String(repeating: "a", count: 64),
+            releaseMilliseconds: now + 130_000, x: 0, y: 0)), at: now + 100_000)) {
+            XCTAssertEqual($0 as? OpticalProtocolRejection, .convergenceAfterConflict)
+        }
+        XCTAssertEqual(sessions.a.phase, .terminalConflict)
+        XCTAssertEqual(sessions.a.outgoingSequence.nextSequence, nextSequence)
     }
 
     func testSequenceTrackerAllowsGapsAndRejectsReplay() throws {

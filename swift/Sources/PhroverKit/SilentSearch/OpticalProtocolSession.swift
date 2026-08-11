@@ -120,7 +120,7 @@ public struct OpticalProtocolSession: Sendable {
         do { data = try codec.encode(message) }
         catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }
         outgoingSequence.allocate()
-        applyOutgoing(kind: kind, body: body, data: data)
+        applyOutgoing(body: body, data: data)
         lastOutgoing = data
         return data
     }
@@ -140,7 +140,7 @@ public struct OpticalProtocolSession: Sendable {
         do { try codec.validateTimestamp(of: message, nowMilliseconds: nowMilliseconds) }
         catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }
         try incomingSequence.validate(message.sequence)
-        try validateIncoming(message, data: data, at: nowMilliseconds)
+        try validateIncoming(message, at: nowMilliseconds)
         incomingSequence.accept(message.sequence)
         applyIncoming(message, data: data)
     }
@@ -178,6 +178,7 @@ public struct OpticalProtocolSession: Sendable {
         case .awaitingAccept: .accept
         case .awaitingSearchCommit: .searchCommit
         case .awaitingSearchAck: .searchAck
+        case .searchScheduled where context.localRole == .b: .searchCommit
         case .awaitingAStatus, .awaitingBStatus: .status
         case .awaitingDecision: .decision
         case .awaitingConverge: .converge
@@ -194,7 +195,8 @@ public struct OpticalProtocolSession: Sendable {
         let validPhase: Bool
         switch (phase, kind) {
         case (.readyToSendOffer, .offer), (.readyToSendAccept, .accept),
-             (.readyToSendSearchCommit, .searchCommit), (.readyToSendSearchAck, .searchAck),
+             (.readyToSendSearchCommit, .searchCommit), (.awaitingSearchAck, .searchCommit),
+             (.readyToSendSearchAck, .searchAck),
              (.readyToSendStatus, .status), (.readyToSendBStatus, .status),
              (.readyToSendDecision, .decision), (.readyToSendConverge, .converge),
              (.readyToSendConvergeAck, .convergeAck): validPhase = true
@@ -239,7 +241,7 @@ public struct OpticalProtocolSession: Sendable {
         }
     }
 
-    private func validateIncoming(_ message: OpticalMessage, data: Data, at now: Int64) throws {
+    private func validateIncoming(_ message: OpticalMessage, at now: Int64) throws {
         switch message.body {
         case let .offer(value):
             guard absDifference(now, message.timestampMilliseconds) <= 2_000 else {
@@ -256,6 +258,9 @@ public struct OpticalProtocolSession: Sendable {
             }
         case let .searchCommit(value):
             guard message.role == .a else { throw OpticalProtocolRejection.wrongRole }
+            if case let .searchScheduled(previousStart, _) = phase {
+                guard now < previousStart else { throw OpticalProtocolRejection.invalidSchedule }
+            }
             guard value.acceptanceHash == acceptanceHash else { throw OpticalProtocolRejection.invalidLinkedHash }
             try validateSchedule(start: value.startMilliseconds, deadline: value.deadlineMilliseconds, at: now)
         case let .searchAck(value):
@@ -302,10 +307,9 @@ public struct OpticalProtocolSession: Sendable {
                 throw OpticalProtocolRejection.invalidSchedule
             }
         }
-        _ = data
     }
 
-    private mutating func applyOutgoing(kind: OpticalMessageKind, body: OpticalMessageBody, data: Data) {
+    private mutating func applyOutgoing(body: OpticalMessageBody, data: Data) {
         switch body {
         case let .offer(value):
             offer = value; offerHash = codec.messageLinkHash(for: data); phase = .awaitingAccept
@@ -331,7 +335,6 @@ public struct OpticalProtocolSession: Sendable {
         case .convergeAck:
             phase = terminalPhaseForAcknowledgedConvergence()
         }
-        _ = kind
     }
 
     private mutating func applyIncoming(_ message: OpticalMessage, data: Data) {
