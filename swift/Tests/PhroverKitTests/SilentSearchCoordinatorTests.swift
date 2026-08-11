@@ -149,6 +149,132 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.motion.stopCount, 1)
         XCTAssertNil(coordinator.sharedFrame)
     }
+
+    func testSearchPerformsInitialSettledScanThenVisitsCandidatesInExplorerOrder() async throws {
+        let harness = SilentSearchTestHarness()
+        let first = candidate("frontier_2", x: -2, y: 0)
+        let second = candidate("frontier_1", x: -1, y: 0)
+        harness.explorer.selections = [.candidate(first), .candidate(second), .exhausted]
+        harness.targetObserver.results = [.pending, .pending, .pending]
+        let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
+
+        await eventually { harness.motion.stopCount == 1 }
+        XCTAssertTrue(harness.targetObserver.deadlines.isEmpty)
+        harness.clock.advance(nanoseconds: 749_000_000)
+        await taskTurn()
+        XCTAssertTrue(harness.targetObserver.deadlines.isEmpty)
+
+        harness.clock.advance(nanoseconds: 1_000_000)
+        await eventually { harness.motion.navigationRequests.count == 1 }
+        XCTAssertEqual(harness.motion.navigationRequests[0].0, first.missionCentroid)
+        XCTAssertEqual(harness.motion.navigationRequests[0].1, .sectorConstrained(.west))
+        XCTAssertTrue(harness.explorer.visitedIDs.isEmpty)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { harness.motion.navigationRequests.count == 2 }
+        XCTAssertEqual(harness.explorer.visitedIDs, ["frontier_2"])
+        XCTAssertEqual(harness.motion.navigationRequests[1].0, second.missionCentroid)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+        XCTAssertEqual(harness.explorer.visitedIDs, ["frontier_2", "frontier_1"])
+        XCTAssertEqual(harness.motion.navigationRequests.last?.0, SilentSearchGeometry.rendezvousPoint(for: .a))
+        XCTAssertEqual(harness.motion.navigationRequests.last?.1, .sectorConstrained(.west))
+    }
+
+    func testCrossSectorTargetReturnsToFixedRoleStagingWithoutReleasingSectorPolicy() async throws {
+        let harness = SilentSearchTestHarness()
+        let target = TargetConfirmation(
+            label: "chair", coordinate: MissionPoint(x: 3, y: 2)!, sampleCount: 3, meanConfidence: 0.95
+        )
+        harness.targetObserver.result = .confirmed(target)
+        let coordinator = try await searchingCoordinator(harness, role: .b, deadline: 100_000_000_000)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+
+        XCTAssertEqual(coordinator.targetConfirmation, target)
+        XCTAssertEqual(harness.motion.navigationRequests.map(\.0), [SilentSearchGeometry.rendezvousPoint(for: .b)])
+        XCTAssertEqual(harness.motion.navigationRequests.map(\.1), [.sectorConstrained(.east)])
+        XCTAssertFalse(harness.motion.navigationRequests.contains { $0.1 == .unrestrictedConvergence })
+        XCTAssertGreaterThan(target.coordinate.x, SilentSearchGeometry.centerBandHalfWidth)
+    }
+
+    func testTargetConfirmedAfterArrivalMarksCandidateVisitedBeforeReturn() async throws {
+        let harness = SilentSearchTestHarness()
+        let visited = candidate("frontier_1", x: -2, y: 0)
+        let target = TargetConfirmation(
+            label: "chair", coordinate: MissionPoint(x: -2, y: 0)!, sampleCount: 3, meanConfidence: 0.97
+        )
+        harness.explorer.selection = .candidate(visited)
+        harness.targetObserver.results = [.pending, .confirmed(target)]
+        let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { harness.motion.navigationRequests.count == 1 }
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+
+        XCTAssertEqual(harness.explorer.visitedIDs, ["frontier_1"])
+        XCTAssertEqual(coordinator.targetConfirmation, target)
+    }
+
+    func testCandidateNoPathIsRejectedButActiveSafetyFailureIsTerminal() async throws {
+        let noPathHarness = SilentSearchTestHarness()
+        let blocked = candidate("frontier_1", x: -2, y: 0)
+        let unsafe = candidate("frontier_2", x: -3, y: 0)
+        noPathHarness.explorer.selections = [.candidate(blocked), .candidate(unsafe)]
+        noPathHarness.motion.results = [.failed(.noPath), .failed(.obstacle)]
+        let coordinator = try await searchingCoordinator(noPathHarness, deadline: 100_000_000_000)
+
+        noPathHarness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { coordinator.phase == .terminal(.motionFailure(.obstacle)) }
+
+        XCTAssertEqual(noPathHarness.explorer.rejections.count, 1)
+        XCTAssertEqual(noPathHarness.explorer.rejections.first?.0, "frontier_1")
+        XCTAssertEqual(noPathHarness.explorer.rejections.first?.1, .unreachable)
+        XCTAssertEqual(noPathHarness.motion.navigationRequests.count, 2)
+    }
+
+    func testExhaustionReturnsAndUnsafeFixedStagingFailsWithoutAlternate() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.explorer.selection = .exhausted
+        harness.motion.result = .failed(.pathRejected(.outsideSector(pointIndex: 2)))
+        let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually {
+            coordinator.phase == .terminal(.motionFailure(.pathRejected(.outsideSector(pointIndex: 2))))
+        }
+
+        XCTAssertEqual(harness.motion.navigationRequests.count, 1)
+        XCTAssertEqual(harness.motion.navigationRequests[0].0, SilentSearchGeometry.rendezvousPoint(for: .a))
+        XCTAssertEqual(harness.motion.navigationRequests[0].1, .sectorConstrained(.west))
+    }
+
+    func testDeadlineAwaitsStopBeforeReturningToFixedStaging() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.explorer.selection = .candidate(candidate("frontier_1", x: -2, y: 0))
+        harness.motion.suspendNavigation = true
+        let coordinator = try await searchingCoordinator(harness, deadline: 1_000_000_000)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { harness.motion.navigationRequests.count == 1 }
+        harness.motion.suspendStop = true
+        harness.clock.advance(nanoseconds: 250_000_000)
+        await eventually { harness.motion.stopCount == 2 }
+
+        XCTAssertEqual(coordinator.phase, .searching)
+        XCTAssertEqual(harness.motion.navigationRequests.count, 1)
+        harness.motion.suspendNavigation = false
+        harness.motion.resumeStops()
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+
+        XCTAssertEqual(harness.motion.navigationRequests.count, 2)
+        XCTAssertEqual(harness.motion.navigationRequests[1].0, SilentSearchGeometry.rendezvousPoint(for: .a))
+        XCTAssertEqual(harness.motion.navigationRequests[1].1, .sectorConstrained(.west))
+    }
+
     func testCalibrationRequiresCompleteReadiness() async throws {
         let harness = SilentSearchTestHarness()
         let coordinator = harness.coordinator()
@@ -348,6 +474,33 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         harness.calibration.send(.accepted(try frame(generation: generation)))
         await eventually { coordinator.phase == .handshake(.ready) }
         return coordinator
+    }
+
+    private func searchingCoordinator(
+        _ harness: SilentSearchTestHarness,
+        role: RoverRole = .a,
+        deadline: SilentSearchInstant
+    ) async throws -> SilentSearchCoordinator {
+        let coordinator = try await calibratedCoordinator(harness, role: role)
+        try coordinator.transition(to: .waitingForSearch)
+        try coordinator.transition(to: .searching)
+        coordinator.startSearch(until: deadline)
+        await eventually { harness.motion.stopCount == 1 }
+        return coordinator
+    }
+
+    private func candidate(_ id: String, x: Double, y: Double) -> SectorFrontierCandidate {
+        let point = MissionPoint(x: x, y: y)!
+        return SectorFrontierCandidate(
+            stableID: id,
+            localCentroid: Vec2(x, y),
+            missionCentroid: point,
+            width: 1,
+            status: .available,
+            rejectionReason: nil,
+            safePath: [Vec2(x, y)],
+            pathLength: hypot(x, y)
+        )
     }
 
     private func frame(generation: UInt64) throws -> SharedMissionFrame {

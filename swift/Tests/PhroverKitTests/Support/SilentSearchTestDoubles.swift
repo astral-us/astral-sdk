@@ -132,16 +132,32 @@ final class FakeSilentSearchOpticalExchange: SilentSearchOpticalExchanging {
 @MainActor
 final class FakeSilentSearchExplorer: SilentSearchExploring {
     var selection: SectorExplorerSelection = .exhausted
-    func nextCandidate() async -> SectorExplorerSelection { selection }
-    func markVisited(_ stableID: String) {}
-    func markRejected(_ stableID: String, reason: SectorFrontierRejectionReason) {}
+    var selections: [SectorExplorerSelection] = []
+    private(set) var selectionCount = 0
+    private(set) var visitedIDs: [String] = []
+    private(set) var rejections: [(String, SectorFrontierRejectionReason)] = []
+
+    func nextCandidate() async -> SectorExplorerSelection {
+        selectionCount += 1
+        return selections.isEmpty ? selection : selections.removeFirst()
+    }
+
+    func markVisited(_ stableID: String) { visitedIDs.append(stableID) }
+
+    func markRejected(_ stableID: String, reason: SectorFrontierRejectionReason) {
+        rejections.append((stableID, reason))
+    }
 }
 
 @MainActor
 final class FakeSilentSearchTargetObserver: SilentSearchTargetObserving {
     var result: SilentSearchTargetObservationResult = .pending
+    var results: [SilentSearchTargetObservationResult] = []
+    private(set) var deadlines: [SilentSearchInstant] = []
+
     func observeNextFrame(until deadline: SilentSearchInstant) async -> SilentSearchTargetObservationResult {
-        result
+        deadlines.append(deadline)
+        return results.isEmpty ? result : results.removeFirst()
     }
 }
 
@@ -150,13 +166,20 @@ final class FakeSilentSearchMotion: SilentSearchMotion {
     var currentMissionPose: MissionPose?
     var currentMissionPath: [MissionPoint] = []
     var result: SilentSearchMotionResult = .arrived
+    var results: [SilentSearchMotionResult] = []
+    var suspendNavigation = false
+    var suspendStop = false
     private(set) var stopCount = 0
     private(set) var navigationRequests: [(MissionPoint, SilentSearchMotionPolicy)] = []
     var onStop: (() -> Void)?
+    private var navigationContinuations: [CheckedContinuation<SilentSearchMotionResult, Never>] = []
+    private var stopContinuations: [CheckedContinuation<Void, Never>] = []
 
     func navigate(to target: MissionPoint, policy: SilentSearchMotionPolicy) async -> SilentSearchMotionResult {
         navigationRequests.append((target, policy))
-        return result
+        if !results.isEmpty { return results.removeFirst() }
+        guard suspendNavigation else { return result }
+        return await withCheckedContinuation { navigationContinuations.append($0) }
     }
 
     func rotate(to heading: Double, tolerance: Double) async -> SilentSearchMotionResult {
@@ -166,6 +189,18 @@ final class FakeSilentSearchMotion: SilentSearchMotion {
     func stop() async {
         stopCount += 1
         onStop?()
+        if suspendStop {
+            await withCheckedContinuation { stopContinuations.append($0) }
+        }
+        let pendingNavigation = navigationContinuations
+        navigationContinuations.removeAll()
+        pendingNavigation.forEach { $0.resume(returning: .cancelled) }
+    }
+
+    func resumeStops() {
+        let pending = stopContinuations
+        stopContinuations.removeAll()
+        pending.forEach { $0.resume() }
     }
 }
 

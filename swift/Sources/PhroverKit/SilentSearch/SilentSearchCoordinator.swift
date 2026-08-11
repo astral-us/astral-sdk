@@ -10,10 +10,12 @@ public final class SilentSearchCoordinator {
     public private(set) var sharedFrame: SharedMissionFrame?
     public private(set) var calibrationProgress = 0
     public private(set) var diagnostic: SilentSearchCoordinatorDiagnostic?
+    public private(set) var targetConfirmation: TargetConfirmation?
 
     @ObservationIgnored private let dependencies: SilentSearchDependencies
     @ObservationIgnored private var missionTask: Task<Void, Never>?
     @ObservationIgnored private var safetyListenerTask: Task<Void, Never>?
+    @ObservationIgnored private var searchDeadlineTask: Task<Void, Never>?
     @ObservationIgnored private var protocolSession: OpticalProtocolSession?
     @ObservationIgnored private var lastIncomingPayload: Data?
     @ObservationIgnored private var retryAction: OpticalAction?
@@ -41,6 +43,7 @@ public final class SilentSearchCoordinator {
     deinit {
         missionTask?.cancel()
         safetyListenerTask?.cancel()
+        searchDeadlineTask?.cancel()
     }
 
     public func configure(_ mission: SilentSearchMission) {
@@ -131,6 +134,9 @@ public final class SilentSearchCoordinator {
         protocolSession = nil
         retryAction = nil
         trackingRecovery = nil
+        targetConfirmation = nil
+        searchDeadlineTask?.cancel()
+        searchDeadlineTask = nil
         calibrationProgress = 0
         diagnostic = nil
         readiness = dependencies.readiness.snapshot
@@ -245,20 +251,15 @@ public final class SilentSearchCoordinator {
                     )), at: dependencies.clock.wallNowMilliseconds)
                     protocolSession = session
                     try await perform(.present(payload))
-                case let .searchScheduled(start, _):
+                case let .searchScheduled(start, deadline):
                     protocolSession = session
                     try transition(to: .waitingForSearch)
-                    let remaining = start.subtractingReportingOverflow(dependencies.clock.wallNowMilliseconds)
-                    guard !remaining.overflow else { throw OpticalProtocolRejection.invalidSchedule }
-                    let nanoseconds = remaining.partialValue.multipliedReportingOverflow(by: 1_000_000)
-                    guard !nanoseconds.overflow else { throw OpticalProtocolRejection.invalidSchedule }
-                    let startInstant = dependencies.clock.monotonicNow.addingReportingOverflow(
-                        max(0, nanoseconds.partialValue)
-                    )
-                    guard !startInstant.overflow else { throw OpticalProtocolRejection.invalidSchedule }
-                    try await dependencies.clock.sleep(until: startInstant.partialValue)
+                    let startInstant = try monotonicInstant(forWallMilliseconds: start)
+                    let deadlineInstant = try monotonicInstant(forWallMilliseconds: deadline)
+                    try await dependencies.clock.sleep(until: startInstant)
                     guard !Task.isCancelled, phase == .waitingForSearch else { return }
                     try transition(to: .searching)
+                    startSearch(until: deadlineInstant)
                     return
                 default:
                     throw OpticalProtocolRejection.unexpectedPhase
@@ -349,10 +350,132 @@ public final class SilentSearchCoordinator {
         return result.overflow ? Int64.max : result.partialValue
     }
 
+    func startSearch(until deadline: SilentSearchInstant) {
+        guard phase == .searching else { return }
+        searchDeadlineTask?.cancel()
+        searchDeadlineTask = Task { [weak self] in
+            guard let self else { return }
+            do { try await self.dependencies.clock.sleep(until: deadline) }
+            catch { return }
+            await self.searchDeadlineReached()
+        }
+        missionTask = Task { [weak self] in
+            await self?.runSearch(until: deadline)
+        }
+    }
+
+    private func runSearch(until deadline: SilentSearchInstant) async {
+        guard await settledTargetObservation(until: deadline) else { return }
+
+        while !Task.isCancelled, phase == .searching {
+            if dependencies.clock.monotonicNow >= deadline { return }
+            switch await dependencies.explorer.nextCandidate() {
+            case .exhausted:
+                await returnToRendezvous()
+                return
+            case let .candidate(candidate):
+                let result = await dependencies.motion.navigate(
+                    to: candidate.missionCentroid,
+                    policy: .sectorConstrained(sector)
+                )
+                guard !Task.isCancelled, phase == .searching else { return }
+                switch result {
+                case .arrived:
+                    let shouldContinue = await settledTargetObservation(
+                        until: deadline,
+                        visitedCandidateID: candidate.stableID
+                    )
+                    if !shouldContinue { return }
+                case .failed(.noPath):
+                    dependencies.explorer.markRejected(candidate.stableID, reason: .unreachable)
+                case let .failed(failure):
+                    await finish(with: .motionFailure(failure))
+                    return
+                case .cancelled:
+                    return
+                }
+            }
+        }
+    }
+
+    private func settledTargetObservation(
+        until deadline: SilentSearchInstant,
+        visitedCandidateID: String? = nil
+    ) async -> Bool {
+        await dependencies.motion.stop()
+        guard !Task.isCancelled, phase == .searching else { return false }
+        let settle = dependencies.clock.monotonicNow.addingReportingOverflow(750_000_000)
+        let settleDeadline = settle.overflow ? deadline : min(deadline, settle.partialValue)
+        do { try await dependencies.clock.sleep(until: settleDeadline) }
+        catch { return false }
+        guard !Task.isCancelled, phase == .searching,
+              dependencies.clock.monotonicNow < deadline else { return false }
+        switch await dependencies.targetObserver.observeNextFrame(until: deadline) {
+        case .pending:
+            if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
+            return true
+        case let .confirmed(confirmation):
+            if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
+            targetConfirmation = confirmation
+            await returnToRendezvous()
+            return false
+        }
+    }
+
+    private func searchDeadlineReached() async {
+        guard phase == .searching else { return }
+        missionTask?.cancel()
+        missionTask = nil
+        await dependencies.motion.stop()
+        guard phase == .searching else { return }
+        await returnToRendezvous(alreadyStopped: true)
+    }
+
+    private func returnToRendezvous(alreadyStopped: Bool = false) async {
+        guard phase == .searching, let mission else { return }
+        if !alreadyStopped { searchDeadlineTask?.cancel() }
+        searchDeadlineTask = nil
+        if !alreadyStopped { await dependencies.motion.stop() }
+        guard phase == .searching else { return }
+        do { try transition(to: .returning) }
+        catch { return }
+        let result = await dependencies.motion.navigate(
+            to: SilentSearchGeometry.rendezvousPoint(for: mission.role),
+            policy: .sectorConstrained(mission.role.searchSector)
+        )
+        guard phase == .returning else { return }
+        switch result {
+        case .arrived:
+            await dependencies.motion.stop()
+            guard phase == .returning else { return }
+            try? transition(to: .rendezvous(.waiting))
+        case let .failed(failure):
+            await finish(with: .motionFailure(failure))
+        case .cancelled:
+            return
+        }
+    }
+
+    private var sector: SearchSector {
+        mission?.role.searchSector ?? .west
+    }
+
+    private func monotonicInstant(forWallMilliseconds wall: Int64) throws -> SilentSearchInstant {
+        let remaining = wall.subtractingReportingOverflow(dependencies.clock.wallNowMilliseconds)
+        guard !remaining.overflow else { throw OpticalProtocolRejection.invalidSchedule }
+        let nanoseconds = remaining.partialValue.multipliedReportingOverflow(by: 1_000_000)
+        guard !nanoseconds.overflow else { throw OpticalProtocolRejection.invalidSchedule }
+        let instant = dependencies.clock.monotonicNow.addingReportingOverflow(max(0, nanoseconds.partialValue))
+        guard !instant.overflow else { throw OpticalProtocolRejection.invalidSchedule }
+        return instant.partialValue
+    }
+
     private func finish(with result: SilentSearchTerminalResult) async {
         guard case .terminal = phase else {
             missionTask?.cancel()
             missionTask = nil
+            searchDeadlineTask?.cancel()
+            searchDeadlineTask = nil
             dependencies.calibration.cancel()
             dependencies.opticalExchange.cancel()
             await dependencies.motion.stop()

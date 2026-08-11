@@ -36,6 +36,7 @@ public enum SilentSearchHandshakeStep: String, Equatable, Sendable {
 
 public enum SilentSearchRendezvousStep: String, Equatable, Sendable {
     case ready
+    case waiting
     case presenting
     case scanning
 }
