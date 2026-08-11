@@ -16,6 +16,7 @@ public enum OpticalExchangeError: Error, Equatable, Sendable {
 
 public struct OpticalFrame: @unchecked Sendable {
     public let frameID: UInt64
+    public let arFrameID: ARFrameID?
     public let monotonicTimestamp: TimeInterval
     fileprivate let image: Image
 
@@ -27,12 +28,29 @@ public struct OpticalFrame: @unchecked Sendable {
     public init(image: CGImage, frameID: UInt64, monotonicTimestamp: TimeInterval) {
         self.image = .cgImage(image)
         self.frameID = frameID
+        arFrameID = nil
         self.monotonicTimestamp = monotonicTimestamp
     }
 
     public init(pixelBuffer: CVPixelBuffer, frameID: UInt64, monotonicTimestamp: TimeInterval) {
         image = .pixelBuffer(pixelBuffer)
         self.frameID = frameID
+        arFrameID = nil
+        self.monotonicTimestamp = monotonicTimestamp
+    }
+
+    public init(image: CGImage, arFrameID: ARFrameID, monotonicTimestamp: TimeInterval) {
+        self.image = .cgImage(image)
+        self.arFrameID = arFrameID
+        frameID = arFrameID.sequence
+        self.monotonicTimestamp = monotonicTimestamp
+    }
+
+    public init(pixelBuffer: CVPixelBuffer, arFrameID: ARFrameID,
+                monotonicTimestamp: TimeInterval) {
+        image = .pixelBuffer(pixelBuffer)
+        self.arFrameID = arFrameID
+        frameID = arFrameID.sequence
         self.monotonicTimestamp = monotonicTimestamp
     }
 }
@@ -82,7 +100,12 @@ public struct OpticalQRCodeRenderer: Sendable {
 }
 
 public final class OpticalQRCodeScanner: @unchecked Sendable {
-    private var processedFrameIDs = Set<UInt64>()
+    private enum FrameIdentity: Hashable {
+        case sequence(UInt64)
+        case ar(ARFrameID)
+    }
+
+    private var processedFrameIDs = Set<FrameIdentity>()
     private let lock = NSLock()
 
     public init() {}
@@ -90,7 +113,8 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
     public func scan(_ frame: OpticalFrame) throws -> [OpticalObservation] {
         guard frame.monotonicTimestamp.isFinite else { throw OpticalExchangeError.invalidTimestamp }
         lock.lock()
-        let isNewFrame = processedFrameIDs.insert(frame.frameID).inserted
+        let identity = frame.arFrameID.map(FrameIdentity.ar) ?? .sequence(frame.frameID)
+        let isNewFrame = processedFrameIDs.insert(identity).inserted
         lock.unlock()
         guard isNewFrame else { return [] }
 

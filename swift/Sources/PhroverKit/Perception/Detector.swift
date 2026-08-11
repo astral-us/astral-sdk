@@ -18,12 +18,27 @@ public final class Detector {
         public let boundingBox: CGRect // normalized, Vision coords
     }
 
+    public struct FrameDetections: Sendable {
+        public let frameID: ARFrameID
+        public let monotonicTimestamp: TimeInterval
+        public let detections: [Detection]
+
+        public init(frameID: ARFrameID, monotonicTimestamp: TimeInterval, detections: [Detection]) {
+            self.frameID = frameID
+            self.monotonicTimestamp = monotonicTimestamp
+            self.detections = detections
+        }
+    }
+
     private var request: VNCoreMLRequest?
+    private let detectionHandler: ((CVPixelBuffer) -> [Detection])?
     public var isLoaded: Bool { request != nil }
+    public private(set) var supportedCanonicalLabels: Set<String> = []
 
     /// Loads Xcode's compiled `.mlmodelc` when available, with source model fallback for
     /// package contexts that still ship `.mlpackage`/`.mlmodel` resources.
     public init(modelName: String = "RoverYOLO") async {
+        detectionHandler = nil
         guard let modelURL = Self.modelResourceURL(modelName: modelName) else {
             request = nil
             RuntimeFileLog.append("detector_unavailable", fields: [
@@ -40,8 +55,9 @@ public final class Detector {
             } else {
                 loadURL = try await MLModel.compileModel(at: modelURL)
             }
-            let model = try VNCoreMLModel(for: MLModel(contentsOf: loadURL,
-                                                       configuration: Self.modelConfiguration()))
+            let coreMLModel = try MLModel(contentsOf: loadURL, configuration: Self.modelConfiguration())
+            supportedCanonicalLabels = Self.canonicalLabels(from: coreMLModel.modelDescription.classLabels ?? [])
+            let model = try VNCoreMLModel(for: coreMLModel)
             let req = VNCoreMLRequest(model: model)
             req.imageCropAndScaleOption = .scaleFill
             request = req
@@ -56,6 +72,12 @@ public final class Detector {
                 "error": error.localizedDescription
             ])
         }
+    }
+
+    init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) -> [Detection]) {
+        request = nil
+        self.detectionHandler = detectionHandler
+        supportedCanonicalLabels = supportedLabels
     }
 
     static func modelResourceURL(modelName: String, bundle: Bundle = .module) -> URL? {
@@ -73,13 +95,23 @@ public final class Detector {
         return configuration
     }
 
+    static func canonicalLabels(from classLabels: [Any]) -> Set<String> {
+        Set(classLabels.compactMap { $0 as? String })
+    }
+
     public func detect(_ pixelBuffer: CVPixelBuffer) -> [Detection] {
+        if let detectionHandler { return detectionHandler(pixelBuffer) }
         guard let request else { return [] }
         for orientation in Self.detectionOrientations(preferred: .right) {
             let detections = detect(pixelBuffer, request: request, orientation: orientation)
             if !detections.isEmpty { return detections }
         }
         return []
+    }
+
+    public func detect(_ snapshot: ARFrameSnapshot) -> FrameDetections {
+        FrameDetections(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
+                        detections: detect(snapshot.image))
     }
 
     static func detectionOrientations(preferred: CGImagePropertyOrientation) -> [CGImagePropertyOrientation] {

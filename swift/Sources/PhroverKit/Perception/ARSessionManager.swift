@@ -2,6 +2,56 @@ import Foundation
 import ARKit
 import RoverNav
 
+public struct ARFrameID: Hashable, Sendable {
+    public let generation: UInt64
+    public let sequence: UInt64
+
+    public init(generation: UInt64, sequence: UInt64) {
+        self.generation = generation
+        self.sequence = sequence
+    }
+}
+
+public enum ARTrackingQuality: Equatable, Sendable {
+    case unavailable
+    case limited
+    case normal
+}
+
+public struct ARFrameSnapshot: @unchecked Sendable {
+    public let id: ARFrameID
+    public let timestamp: TimeInterval
+    public let image: CVPixelBuffer
+    public let cameraTransform: simd_float4x4
+    public let cameraIntrinsics: simd_float3x3
+    public let imageResolution: CGSize
+    public let depthMap: CVPixelBuffer?
+    public let pose: Pose2D
+    public let trackingQuality: ARTrackingQuality
+
+    public init(id: ARFrameID, timestamp: TimeInterval, image: CVPixelBuffer,
+                cameraTransform: simd_float4x4, cameraIntrinsics: simd_float3x3,
+                imageResolution: CGSize, depthMap: CVPixelBuffer?, pose: Pose2D,
+                trackingQuality: ARTrackingQuality) {
+        self.id = id
+        self.timestamp = timestamp
+        self.image = image
+        self.cameraTransform = cameraTransform
+        self.cameraIntrinsics = cameraIntrinsics
+        self.imageResolution = imageResolution
+        self.depthMap = depthMap
+        self.pose = pose
+        self.trackingQuality = trackingQuality
+    }
+}
+
+public enum ARSessionLifecycleEvent: Equatable, Sendable {
+    case reset(generation: UInt64)
+    case interrupted(generation: UInt64)
+    case interruptionEnded(generation: UInt64)
+    case failed(generation: UInt64, description: String)
+}
+
 /// Owns the ARKit session and is the rover's **primary odometry + mapping** source
 /// (the WAVE ROVER base has no wheel encoders). Provides:
 ///   • 6DoF pose flattened to the nav ground plane (`Pose2D`)
@@ -19,6 +69,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     /// Nearest obstacle distance (m) in a forward cone from the latest depth frame.
     public private(set) var forwardClearance: Double = .infinity
     public private(set) var trackingState: ARCamera.TrackingState = .notAvailable
+    public private(set) var trackingQuality: ARTrackingQuality = .unavailable
+    public private(set) var sessionGeneration: UInt64 = 0
+    public private(set) var latestSnapshot: ARFrameSnapshot?
 
     /// Latest RGB frame, for `Detector` to run inference on.
     public private(set) var latestPixelBuffer: CVPixelBuffer?
@@ -28,6 +81,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     /// Latest LiDAR depth map (meters, aligned to `latestCamera.imageResolution`'s aspect).
     public private(set) var latestDepthMap: CVPixelBuffer?
     private var lastClearanceLogAt = Date.distantPast
+    private var frameSequence: UInt64 = 0
+    private var snapshotContinuations: [UUID: AsyncStream<ARFrameSnapshot>.Continuation] = [:]
+    private var lifecycleContinuations: [UUID: AsyncStream<ARSessionLifecycleEvent>.Continuation] = [:]
 
     public override init() {
         super.init()
@@ -46,23 +102,51 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             config.frameSemantics.insert(.smoothedSceneDepth)
         }
+        prepareForReset()
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
     }
 
     public func pause() { session.pause() }
 
+    public func snapshots() -> AsyncStream<ARFrameSnapshot> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            snapshotContinuations[id] = continuation
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { @MainActor in self?.snapshotContinuations.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    public func lifecycleEvents() -> AsyncStream<ARSessionLifecycleEvent> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .unbounded) { continuation in
+            lifecycleContinuations[id] = continuation
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { @MainActor in self?.lifecycleContinuations.removeValue(forKey: id) }
+            }
+        }
+    }
+
     // MARK: - ARSessionDelegate
 
     public func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        trackingState = frame.camera.trackingState
-        pose = Self.groundPose(from: frame.camera.transform)
-        latestPixelBuffer = frame.capturedImage
-        latestCamera = frame.camera
-        if let depth = frame.smoothedSceneDepth ?? frame.sceneDepth {
-            forwardClearance = Self.forwardClearance(from: depth)
-            latestDepthMap = depth.depthMap
-            logForwardClearanceIfNeeded()
-        }
+        let depthMap = (frame.smoothedSceneDepth ?? frame.sceneDepth)?.depthMap
+        ingest(image: frame.capturedImage, timestamp: frame.timestamp,
+               cameraTransform: frame.camera.transform, intrinsics: frame.camera.intrinsics,
+               imageResolution: frame.camera.imageResolution, depthMap: depthMap,
+               trackingQuality: Self.trackingQuality(from: frame.camera.trackingState),
+               compatibilityCamera: frame.camera, compatibilityTrackingState: frame.camera.trackingState)
+    }
+
+    public func sessionWasInterrupted(_ session: ARSession) { interruptionBegan() }
+
+    public func sessionInterruptionEnded(_ session: ARSession) {
+        publishLifecycle(.interruptionEnded(generation: sessionGeneration))
+    }
+
+    public func session(_ session: ARSession, didFailWithError error: any Error) {
+        failure(description: error.localizedDescription)
     }
 
     public func session(_ session: ARSession, didAdd anchors: [ARAnchor]) { collectMesh(anchors) }
@@ -75,6 +159,96 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
         for m in mesh { map[m.identifier] = m }
         meshAnchors = Array(map.values)
     }
+
+    private func prepareForReset() {
+        sessionGeneration &+= 1
+        frameSequence = 0
+        meshAnchors = []
+        clearCurrentFrame()
+        publishLifecycle(.reset(generation: sessionGeneration))
+    }
+
+    private func ingest(image: CVPixelBuffer, timestamp: TimeInterval,
+                        cameraTransform: simd_float4x4, intrinsics: simd_float3x3,
+                        imageResolution: CGSize, depthMap: CVPixelBuffer?,
+                        trackingQuality: ARTrackingQuality, compatibilityCamera: ARCamera? = nil,
+                        compatibilityTrackingState: ARCamera.TrackingState? = nil) {
+        frameSequence &+= 1
+        let currentPose = Self.groundPose(from: cameraTransform)
+        let snapshot = ARFrameSnapshot(
+            id: ARFrameID(generation: sessionGeneration, sequence: frameSequence), timestamp: timestamp,
+            image: image, cameraTransform: cameraTransform, cameraIntrinsics: intrinsics,
+            imageResolution: imageResolution, depthMap: depthMap, pose: currentPose,
+            trackingQuality: trackingQuality
+        )
+        latestSnapshot = snapshot
+        latestPixelBuffer = snapshot.image
+        latestCamera = compatibilityCamera
+        latestDepthMap = snapshot.depthMap
+        pose = snapshot.pose
+        self.trackingQuality = snapshot.trackingQuality
+        trackingState = compatibilityTrackingState ?? Self.compatibilityTrackingState(from: trackingQuality)
+        forwardClearance = depthMap.map(Self.forwardClearance(fromDepthMap:)) ?? .infinity
+        if depthMap != nil { logForwardClearanceIfNeeded() }
+        for continuation in snapshotContinuations.values { continuation.yield(snapshot) }
+    }
+
+    private func interruptionBegan() {
+        clearCurrentFrame()
+        publishLifecycle(.interrupted(generation: sessionGeneration))
+    }
+
+    private func failure(description: String) {
+        clearCurrentFrame()
+        publishLifecycle(.failed(generation: sessionGeneration, description: description))
+    }
+
+    private func clearCurrentFrame() {
+        latestSnapshot = nil
+        latestPixelBuffer = nil
+        latestCamera = nil
+        latestDepthMap = nil
+        pose = nil
+        forwardClearance = .infinity
+        trackingState = .notAvailable
+        trackingQuality = .unavailable
+    }
+
+    private func publishLifecycle(_ event: ARSessionLifecycleEvent) {
+        for continuation in lifecycleContinuations.values { continuation.yield(event) }
+    }
+
+    private static func trackingQuality(from state: ARCamera.TrackingState) -> ARTrackingQuality {
+        switch state {
+        case .normal: .normal
+        case .limited: .limited
+        case .notAvailable: .unavailable
+        @unknown default: .unavailable
+        }
+    }
+
+    private static func compatibilityTrackingState(from quality: ARTrackingQuality) -> ARCamera.TrackingState {
+        switch quality {
+        case .normal: .normal
+        case .limited: .limited(.initializing)
+        case .unavailable: .notAvailable
+        }
+    }
+
+    func resetForTesting() { prepareForReset() }
+
+    func ingestForTesting(image: CVPixelBuffer, timestamp: TimeInterval,
+                          cameraTransform: simd_float4x4, intrinsics: simd_float3x3,
+                          imageResolution: CGSize, depthMap: CVPixelBuffer?,
+                          trackingQuality: ARTrackingQuality) {
+        ingest(image: image, timestamp: timestamp, cameraTransform: cameraTransform,
+               intrinsics: intrinsics, imageResolution: imageResolution, depthMap: depthMap,
+               trackingQuality: trackingQuality)
+    }
+
+    func interruptionBeganForTesting() { interruptionBegan() }
+    func interruptionEndedForTesting() { publishLifecycle(.interruptionEnded(generation: sessionGeneration)) }
+    func failureForTesting(description: String) { failure(description: description) }
 
     private func logForwardClearanceIfNeeded(now: Date = Date()) {
         guard now.timeIntervalSince(lastClearanceLogAt) >= 1 else { return }
@@ -109,26 +283,32 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     /// helpers `sensorPixel`/`sampleDepth`/`unprojectPoint` specifically so it can still be
     /// exercised in tests against synthetic intrinsics/transforms/depth.
     public func unproject(normalizedPoint: CGPoint) -> Vec2? {
-        guard let camera = latestCamera, let depthMap = latestDepthMap else { return nil }
-        let imageSize = camera.imageResolution // raw (landscape) sensor pixel space, matches `intrinsics`
-        guard let depth = Self.sampleDepth(depthMap, atVisionNormalizedPoint: normalizedPoint, imageSize: imageSize) else {
+        guard let snapshot = latestSnapshot else { return nil }
+        return Self.unproject(normalizedPoint: normalizedPoint, in: snapshot)
+    }
+
+    nonisolated public static func unproject(normalizedPoint: CGPoint, in snapshot: ARFrameSnapshot) -> Vec2? {
+        guard let depthMap = snapshot.depthMap,
+              let depth = sampleDepth(depthMap, atVisionNormalizedPoint: normalizedPoint,
+                                      imageSize: snapshot.imageResolution) else {
             return nil
         }
-        return Self.unprojectPoint(normalizedPoint, imageSize: imageSize,
-                                   intrinsics: camera.intrinsics, cameraTransform: camera.transform, depth: depth)
+        return unprojectPoint(normalizedPoint, imageSize: snapshot.imageResolution,
+                              intrinsics: snapshot.cameraIntrinsics,
+                              cameraTransform: snapshot.cameraTransform, depth: depth)
     }
 
     /// Undoes the `.right` (90° clockwise) rotation `Detector`'s Vision request handler
     /// applied, landing back in the raw sensor pixel space `intrinsics`/depth are
     /// calibrated against.
-    static func sensorPixel(forVisionNormalizedPoint p: CGPoint, imageSize: CGSize) -> CGPoint {
+    nonisolated static func sensorPixel(forVisionNormalizedPoint p: CGPoint, imageSize: CGSize) -> CGPoint {
         CGPoint(x: (1 - p.y) * imageSize.width, y: (1 - p.x) * imageSize.height)
     }
 
     /// Samples the LiDAR depth map (meters) at the raw-sensor-space point corresponding to
     /// a Vision-normalized point. The depth map is lower-res than the color camera but
     /// aligned to the same field of view, so the fractional position carries over directly.
-    static func sampleDepth(_ depthMap: CVPixelBuffer, atVisionNormalizedPoint p: CGPoint, imageSize: CGSize) -> Float? {
+    nonisolated static func sampleDepth(_ depthMap: CVPixelBuffer, atVisionNormalizedPoint p: CGPoint, imageSize: CGSize) -> Float? {
         guard imageSize.width > 0, imageSize.height > 0 else { return nil }
         let sensor = sensorPixel(forVisionNormalizedPoint: p, imageSize: imageSize)
 
@@ -147,8 +327,9 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     /// Back-projects a raw-sensor-space point at a known depth through the camera
     /// intrinsics and pose into a world-plane point (matches `groundPose`'s x/world-x,
     /// y/world-z convention). Pure math — testable with synthetic intrinsics/transform.
-    static func unprojectPoint(_ visionNormalizedPoint: CGPoint, imageSize: CGSize,
-                               intrinsics: simd_float3x3, cameraTransform: simd_float4x4, depth: Float) -> Vec2 {
+    nonisolated static func unprojectPoint(_ visionNormalizedPoint: CGPoint, imageSize: CGSize,
+                                           intrinsics: simd_float3x3, cameraTransform: simd_float4x4,
+                                           depth: Float) -> Vec2 {
         let sensor = sensorPixel(forVisionNormalizedPoint: visionNormalizedPoint, imageSize: imageSize)
         let fx = Double(intrinsics[0][0]), fy = Double(intrinsics[1][1])
         let cx = Double(intrinsics[2][0]), cy = Double(intrinsics[2][1])
