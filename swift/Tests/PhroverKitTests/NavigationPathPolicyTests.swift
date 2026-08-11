@@ -57,6 +57,26 @@ final class NavigationPathPolicyTests: XCTestCase {
         )
     }
 
+    func testAwaitedNavigationStopsCurrentOperationBeforePlanningReplacement() async {
+        var events: [String] = []
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: Vec2(0, 0), yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in
+                events.append("plan")
+                return [goal]
+            },
+            lastAckAt: { Date() },
+            sendCommand: { _ in events.append("send") },
+            stopRover: { events.append("stop") },
+            sleep: { _ in }
+        )
+
+        _ = await controller.navigateAndWait(to: Vec2(0, 0))
+
+        XCTAssertEqual(Array(events.prefix(2)), ["stop", "plan"])
+    }
+
     private func westPolicy() -> SectorPathPolicy {
         SectorPathPolicy(
             sector: .west,

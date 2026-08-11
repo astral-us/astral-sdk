@@ -17,16 +17,25 @@ public enum SilentSearchTrackingReadiness: Equatable, Sendable {
 
 public struct SilentSearchReadiness: Equatable, Sendable {
     public let tracking: SilentSearchTrackingReadiness
+    public let lidarAvailable: Bool
+    public let generationValid: Bool
     public let detectorLoaded: Bool
+    public let detectorLabelAvailable: Bool
     public let commandLinkAvailable: Bool
 
     public init(
         tracking: SilentSearchTrackingReadiness,
+        lidarAvailable: Bool = true,
+        generationValid: Bool = true,
         detectorLoaded: Bool,
+        detectorLabelAvailable: Bool = true,
         commandLinkAvailable: Bool
     ) {
         self.tracking = tracking
+        self.lidarAvailable = lidarAvailable
+        self.generationValid = generationValid
         self.detectorLoaded = detectorLoaded
+        self.detectorLabelAvailable = detectorLabelAvailable
         self.commandLinkAvailable = commandLinkAvailable
     }
 
@@ -47,7 +56,10 @@ public struct SilentSearchReadiness: Equatable, Sendable {
     public var missingRequirements: [SilentSearchReadinessRequirement] {
         var missing: [SilentSearchReadinessRequirement] = []
         if case .normal = tracking {} else { missing.append(.tracking) }
+        if !lidarAvailable { missing.append(.lidar) }
+        if !generationValid { missing.append(.generation) }
         if !detectorLoaded { missing.append(.detector) }
+        if !detectorLabelAvailable { missing.append(.detectorLabel) }
         if !commandLinkAvailable { missing.append(.commandLink) }
         return missing
     }
@@ -113,6 +125,8 @@ public enum SilentSearchMotionFailure: Equatable, Sendable {
     case tipping
     case stalled
     case tracking
+    case positionToleranceExceeded
+    case headingToleranceExceeded
 }
 
 public enum SilentSearchMotionResult: Equatable, Sendable {

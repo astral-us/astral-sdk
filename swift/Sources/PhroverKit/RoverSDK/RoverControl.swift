@@ -47,6 +47,11 @@ public actor RoverControl {
         try await sendJSON(["T": RoverConfig.Opcode.feedbackFlowOn, "cmd": 1])
     }
 
+    /// Verify the command link without issuing a wheel-motion opcode.
+    public func probeLink() async throws {
+        try await sendJSON(["T": RoverConfig.Opcode.feedbackFlowOn, "cmd": 1])
+    }
+
     // MARK: - Transport
 
     private func sendJSON(_ payload: [String: Any]) async throws {

@@ -83,7 +83,10 @@ public enum SilentSearchPhase: Equatable, Sendable {
 
 public enum SilentSearchReadinessRequirement: String, Equatable, Sendable {
     case tracking
+    case lidar
+    case generation
     case detector
+    case detectorLabel
     case commandLink
 }
 
