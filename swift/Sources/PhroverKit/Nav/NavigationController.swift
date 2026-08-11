@@ -498,11 +498,12 @@ public final class NavigationController {
             } else {
                 plannedCommand = out.command
             }
+            let depthVisibleCommand = Self.depthVisibleForwardCommand(plannedCommand)
             let command: WheelCommand
             let depthSafety: DepthSafetyObservation
-            if DepthSafetyMotionClass.classify(plannedCommand) == .rotating {
+            if DepthSafetyMotionClass.classify(depthVisibleCommand) == .rotating {
                 guard let recoveredCommand = await rotationSafetyCommand(
-                    plannedCommand,
+                    depthVisibleCommand,
                     hasSentCommand: hasSentCommand,
                     operation: operation
                 ) else { return }
@@ -510,8 +511,8 @@ public final class NavigationController {
                 command = recoveredCommand
                 depthSafety = depthSafetyObservation(recoveredCommand)
             } else {
-                depthSafety = depthSafetyObservation(plannedCommand)
-                switch guardLayer.evaluate(command: plannedCommand, depthSafety: depthSafety) {
+                depthSafety = depthSafetyObservation(depthVisibleCommand)
+                switch guardLayer.evaluate(command: depthVisibleCommand, depthSafety: depthSafety) {
                 case .allow(let safeCommand, _):
                     command = safeCommand
                 case .stopDepth(let observation):
@@ -552,7 +553,10 @@ public final class NavigationController {
             telemetry["depth_safety_age"] = Self.formatSeconds(depthSafety.sampleAge)
             telemetry["depth_safety_support"] = "\(depthSafety.supportCount)"
             telemetry["path_points"] = "\(path.count)"
-            telemetry["target_approach_slowed"] = command == out.command ? "false" : "true"
+            telemetry["target_approach_slowed"] = plannedCommand == out.command ? "false" : "true"
+            telemetry["depth_visible_curvature_limited"] = depthVisibleCommand == plannedCommand
+                ? "false"
+                : "true"
             RuntimeFileLog.append("nav_drive_tick", fields: telemetry)
             do {
                 guard isOperationActive(operation) else { return }
@@ -1191,6 +1195,17 @@ public final class NavigationController {
         guard peak > RoverConfig.visualTargetApproachMaxWheelSpeed else { return command }
         let scale = RoverConfig.visualTargetApproachMaxWheelSpeed / peak
         return WheelCommand(left: command.left * scale, right: command.right * scale)
+    }
+
+    static func depthVisibleForwardCommand(_ command: WheelCommand) -> WheelCommand {
+        guard DepthSafetyMotionClass.classify(command) == .curved else { return command }
+        let outerSpeed = max(command.left, command.right)
+        guard outerSpeed > 0 else { return command }
+        let minimumInnerSpeed = outerSpeed * 0.75
+        if command.left < command.right {
+            return WheelCommand(left: max(command.left, minimumInnerSpeed), right: command.right)
+        }
+        return WheelCommand(left: command.left, right: max(command.right, minimumInnerSpeed))
     }
 
     static func stateAfterCommandFailure(_ error: Error) -> State {

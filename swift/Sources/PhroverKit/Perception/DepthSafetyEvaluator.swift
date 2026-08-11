@@ -13,6 +13,17 @@ enum DepthSafetyEvaluator {
     private static let cautionSpeedLimit = 0.12
     private static let minimumConnectedCells = 3
     private static let minimumSweptVolumeCoverage = 0.90
+    private static let maximumGroundOffset = 0.20
+    private static let minimumGroundPlaneSamples = 40
+    private static let minimumGroundPlaneSampleRatio = 0.05
+    private static let minimumGroundPlaneForwardSpan = 0.50
+    private static let minimumGroundPlaneLateralSpan = 0.30
+
+    private struct ProjectedSample {
+        let lateral: Double
+        let vertical: Double
+        let forward: Double
+    }
 
     static func ingest(rawDepthMap: CVPixelBuffer,
                        intrinsics: simd_float3x3,
@@ -65,7 +76,7 @@ enum DepthSafetyEvaluator {
         let s = sin(calibration.headingAlignment)
         let roverForward = projectedForward * c + cameraRight * s
         let roverRight = SIMD3<Double>(-roverForward.z, 0, roverForward.x)
-        let roverOrigin = cameraPosition
+        var roverOrigin = cameraPosition
             - SIMD3<Double>(0, calibration.cameraHeight, 0)
             - roverForward * calibration.forwardOffset
             - roverRight * calibration.lateralOffset
@@ -79,6 +90,8 @@ enum DepthSafetyEvaluator {
         let values = base.assumingMemoryBound(to: Float32.self)
         var depthValues = [Float](repeating: .nan, count: width * height)
         var validSamples = 0
+        var projectedSamples: [ProjectedSample] = []
+        projectedSamples.reserveCapacity(width * height / 2)
         var cells = Set<DepthSafetyCell>()
         cells.reserveCapacity(width * height / 8)
 
@@ -101,12 +114,14 @@ enum DepthSafetyEvaluator {
                 let lateral = simd_dot(relative, roverRight)
                 let vertical = relative.y
                 let forward = simd_dot(relative, roverForward)
-                guard vertical >= geometry.minimumCollisionHeight,
-                      vertical <= geometry.maximumCollisionHeight,
-                      forward >= -geometry.length / 2,
+                guard forward >= -geometry.length / 2,
                       forward <= 4.0,
                       abs(lateral) <= 3.0 else { continue }
-                cells.insert(cell(lateral: lateral, height: vertical, forward: forward))
+                projectedSamples.append(ProjectedSample(
+                    lateral: lateral,
+                    vertical: vertical,
+                    forward: forward
+                ))
             }
         }
 
@@ -121,6 +136,22 @@ enum DepthSafetyEvaluator {
                 projection: nil,
                 failureReason: .malformedDepth
             )
+        }
+        let groundOffset = inferredGroundOffset(
+            samples: projectedSamples,
+            validSampleCount: validSamples,
+            geometry: geometry
+        )
+        roverOrigin.y += groundOffset
+        for sample in projectedSamples {
+            let correctedVertical = sample.vertical - groundOffset
+            guard correctedVertical >= geometry.minimumCollisionHeight,
+                  correctedVertical <= geometry.maximumCollisionHeight else { continue }
+            cells.insert(cell(
+                lateral: sample.lateral,
+                height: correctedVertical,
+                forward: sample.forward
+            ))
         }
         let projection = DepthSafetyProjection(
             width: width,
@@ -144,6 +175,47 @@ enum DepthSafetyEvaluator {
             projection: projection,
             failureReason: nil
         )
+    }
+
+    private static func inferredGroundOffset(samples: [ProjectedSample],
+                                             validSampleCount: Int,
+                                             geometry: RoverCollisionGeometry) -> Double {
+        let candidates = samples.filter {
+            $0.vertical >= geometry.minimumCollisionHeight
+                && $0.vertical <= maximumGroundOffset
+                && $0.forward >= 0.25
+                && abs($0.lateral) <= 1.50
+        }
+        guard !candidates.isEmpty else { return 0 }
+
+        var bins: [Int: [ProjectedSample]] = [:]
+        for sample in candidates {
+            bins[Int(floor(sample.vertical / cellResolution)), default: []].append(sample)
+        }
+
+        let minimumSupport = max(
+            minimumGroundPlaneSamples,
+            Int(ceil(Double(validSampleCount) * minimumGroundPlaneSampleRatio))
+        )
+        var bestCluster: [ProjectedSample] = []
+        for index in bins.keys {
+            let cluster = (index - 1...index + 1).flatMap { bins[$0] ?? [] }
+            guard cluster.count >= minimumSupport else { continue }
+            let forwardValues = cluster.map(\.forward)
+            let lateralValues = cluster.map(\.lateral)
+            guard let minimumForward = forwardValues.min(),
+                  let maximumForward = forwardValues.max(),
+                  let minimumLateral = lateralValues.min(),
+                  let maximumLateral = lateralValues.max(),
+                  maximumForward - minimumForward >= minimumGroundPlaneForwardSpan,
+                  maximumLateral - minimumLateral >= minimumGroundPlaneLateralSpan else { continue }
+            if cluster.count > bestCluster.count {
+                bestCluster = cluster
+            }
+        }
+        guard !bestCluster.isEmpty else { return 0 }
+        let heights = bestCluster.map(\.vertical).sorted()
+        return heights[heights.count / 2]
     }
 
     static func evaluate(_ snapshot: DepthSafetySnapshot,
@@ -339,17 +411,14 @@ enum DepthSafetyEvaluator {
         for index in 0...steps {
             let travel = horizon * Double(index) / Double(steps)
             let pose = pose(at: travel, curvature: curvature)
-            var boundary: [(Double, Double)] = [
+            let boundary: [(Double, Double)] = [
                 (-halfWidth, halfLength),
                 (0, halfLength),
                 (halfWidth, halfLength),
             ]
-            if motion == .curved {
-                boundary.append(contentsOf: [
-                    (-halfWidth, 0), (-halfWidth, -halfLength),
-                    (halfWidth, 0), (halfWidth, -halfLength),
-                ])
-            }
+            // For forward arcs, validate the leading edge that the forward-facing
+            // depth camera can actually observe. Occupied cells still use the full
+            // rover footprint in firstContactTravel.
             for (localLateral, localForward) in boundary {
                 let lateral = pose.x
                     + localLateral * cos(pose.heading)

@@ -127,6 +127,20 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertEqual(state, .failed("Obstacle ahead at 0.28 m."))
     }
 
+    func testDepthVisibleForwardCommandLimitsAggressiveCurvature() {
+        let rightTurn = NavigationController.depthVisibleForwardCommand(
+            WheelCommand(left: 0.10, right: 0.30)
+        )
+        XCTAssertEqual(rightTurn.left, 0.225, accuracy: 0.000_001)
+        XCTAssertEqual(rightTurn.right, 0.30, accuracy: 0.000_001)
+
+        let leftTurn = NavigationController.depthVisibleForwardCommand(
+            WheelCommand(left: 0.30, right: 0.10)
+        )
+        XCTAssertEqual(leftTurn.left, 0.30, accuracy: 0.000_001)
+        XCTAssertEqual(leftTurn.right, 0.225, accuracy: 0.000_001)
+    }
+
     func testVisualTargetApproachStopsAtThirtyCentimeters() {
         XCTAssertEqual(
             NavigationController.visualTargetApproachDecision(

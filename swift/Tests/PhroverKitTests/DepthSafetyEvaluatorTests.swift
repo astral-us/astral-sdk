@@ -74,6 +74,37 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         XCTAssertEqual(observation.state, .clear)
     }
 
+    func testFloorPlaneDoesNotBecomeObstacleWhenConfiguredMountHeightIsTooHigh() {
+        let map = makeDepthBuffer(width: 80, height: 60, constantDepth: 3.0)
+        fillFloorPlane(cameraHeight: 0.40, in: map)
+
+        let snapshot = DepthSafetyEvaluator.ingest(
+            rawDepthMap: map,
+            intrinsics: wideIntrinsics,
+            cameraTransform: cameraTransform(height: 0.40),
+            timestamp: 10,
+            calibration: CameraMountCalibration(cameraHeight: 0.55),
+            geometry: geometry
+        )
+        let commands = [
+            WheelCommand(left: 0.20, right: 0.20),
+            WheelCommand(left: 0.15, right: 0.20),
+        ]
+
+        for command in commands {
+            let observation = DepthSafetyEvaluator.evaluate(snapshot, command: command, now: 10.05)
+            XCTAssertEqual(observation.state, .clear, "command=\(command)")
+        }
+        XCTAssertEqual(
+            DepthSafetyEvaluator.evaluate(
+                snapshot,
+                command: WheelCommand(left: 0.10, right: 0.30),
+                now: 10.05
+            ).state,
+            .unavailable(.blindSweptVolume)
+        )
+    }
+
     func testIntrinsicsAreScaledFromCameraImageToDepthResolution() {
         let map = makeDepthBuffer(width: 80, height: 60, constantDepth: 3.0)
         fill(depth: 0.70, x: 35...44, y: 33...37, in: map)
@@ -231,6 +262,23 @@ final class DepthSafetyEvaluatorTests: XCTestCase {
         let base = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: Float32.self)
         for row in y {
             for column in x {
+                base[row * stride + column] = depth
+            }
+        }
+    }
+
+    private func fillFloorPlane(cameraHeight: Float, in buffer: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let stride = CVPixelBufferGetBytesPerRow(buffer) / MemoryLayout<Float32>.size
+        let base = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: Float32.self)
+        let fy = wideIntrinsics[1][1]
+        let cy = wideIntrinsics[2][1]
+        for row in Int(cy + 1)..<height {
+            let depth = cameraHeight * fy / (Float(row) - cy)
+            for column in 0..<width {
                 base[row * stride + column] = depth
             }
         }
