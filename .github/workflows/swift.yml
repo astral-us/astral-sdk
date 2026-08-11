@@ -24,17 +24,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: xcodebuild version
         run: xcodebuild -version
-      - name: Pick an available iPhone simulator
+      - name: Pick an available iOS 26+ iPhone simulator
         id: sim
-        run: |
-          UDID=$(xcrun simctl list devices available -j \
-            | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(e['udid'] for k,v in d.items() if 'iOS' in k for e in v if e['isAvailable'] and 'iPhone' in e['name']))")
-          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-      - name: Build all three products + run RoverNavTests
-        run: |
-          xcodebuild test -scheme astral-sdk-Package \
-            -destination "id=${{ steps.sim.outputs.udid }}" \
-            -only-testing:RoverNavTests
+        run: echo "udid=$(scripts/test-swift-sdk.sh --print-udid)" >> "$GITHUB_OUTPUT"
+      - name: Build all three products + run regular package tests
+        run: scripts/test-swift-sdk.sh
       - name: Build the PhroverOperator example app
         working-directory: examples/PhroverOperator
         run: |

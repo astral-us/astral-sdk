@@ -114,6 +114,15 @@ try await control.send(WheelCommand(left: 0.2, right: 0.2))
 try await control.stop()
 ```
 
+Run the regular Swift package tests on an available iOS 26+ iPhone Simulator with:
+
+```bash
+scripts/test-swift-sdk.sh
+```
+
+Set `SIM_UDID` to choose a simulator explicitly. Additional arguments are forwarded to
+`xcodebuild`, for example `scripts/test-swift-sdk.sh -only-testing:RoverNavTests/FrontierFinderTests`.
+
 ### Hardware compatibility
 
 - **Chassis**: Waveshare WAVE ROVER (or any base speaking the same Waveshare JSON
