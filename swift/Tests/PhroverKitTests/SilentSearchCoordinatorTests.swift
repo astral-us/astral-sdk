@@ -187,6 +187,23 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.sharedFrame)
     }
 
+    func testLimitedTrackingDuringCalibrationRemainsCalibratingUntilStopped() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 7)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+
+        harness.safety.send(.trackingLimited(generation: 7))
+        harness.clock.advance(nanoseconds: 5_000_000_000)
+        await taskTurn()
+
+        XCTAssertEqual(coordinator.phase, .calibrating)
+        XCTAssertNil(coordinator.sharedFrame)
+        await coordinator.stop()
+        XCTAssertEqual(coordinator.phase, .terminal(.operatorStopped))
+    }
+
     func testTrackingRecoveryCapturesNavigationBeforeStopClearsPath() async throws {
         let harness = SilentSearchTestHarness()
         let goal = try XCTUnwrap(MissionPoint(x: -1, y: 2))
@@ -312,6 +329,39 @@ final class SilentSearchCoordinatorTests: XCTestCase {
 
         XCTAssertNil(coordinator.sharedFrame)
         XCTAssertTrue(harness.motion.navigationRequests.isEmpty)
+    }
+
+    func testPartnerDeadlineWaitIsSuspendedUntilNormalTrackingRecovers() async throws {
+        let harness = SilentSearchTestHarness()
+        let coordinator = try await searchingCoordinator(harness, deadline: -56_000_000_000)
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+        await eventually { harness.clock.pendingDeadlines.contains(4_000_000_000) }
+
+        harness.safety.send(.trackingLimited(generation: 1))
+        await eventually { !harness.clock.pendingDeadlines.contains(4_000_000_000) }
+        harness.clock.advance(nanoseconds: 4_000_000_000)
+        await taskTurn()
+
+        XCTAssertEqual(coordinator.phase, .rendezvous(.waiting))
+
+        harness.safety.send(.trackingNormal(generation: 1))
+        await eventually { coordinator.phase == .terminal(.partnerTimeout) }
+    }
+
+    func testTrackingRecoveryInvalidationWinsEqualPartnerDeadlineAndNormalRecoveryRace() async throws {
+        let harness = SilentSearchTestHarness()
+        let coordinator = try await searchingCoordinator(harness, deadline: -55_000_000_000)
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+        await eventually { harness.clock.pendingDeadlines.contains(5_000_000_000) }
+
+        harness.safety.send(.trackingLimited(generation: 1))
+        await eventually { !harness.clock.pendingDeadlines.contains(5_000_000_000) }
+        harness.clock.advance(nanoseconds: 5_000_000_000)
+        harness.safety.send(.trackingNormal(generation: 1))
+        await eventually { coordinator.phase == .terminal(.calibrationInvalidated) }
+
+        XCTAssertNil(coordinator.sharedFrame)
+        XCTAssertNotEqual(coordinator.phase, .terminal(.partnerTimeout))
     }
 
     func testGenerationChangeAlwaysStopsAndInvalidatesCalibration() async throws {

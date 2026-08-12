@@ -24,6 +24,7 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var retryHeading: Double?
     @ObservationIgnored private var trackingRecovery: TrackingRecovery?
     @ObservationIgnored private var searchDeadline: SilentSearchInstant?
+    @ObservationIgnored private var rendezvousPartnerDeadline: SilentSearchInstant?
     @ObservationIgnored private var rendezvousTimedOut = false
     @ObservationIgnored private var localStatus: StatusBody?
     @ObservationIgnored private var rendezvousDecision: DecisionBody?
@@ -161,6 +162,7 @@ public final class SilentSearchCoordinator {
         trackingRecovery = nil
         targetConfirmation = nil
         searchDeadline = nil
+        rendezvousPartnerDeadline = nil
         scheduledSearchStart = nil
         scheduledConvergenceRelease = nil
         rendezvousTimedOut = false
@@ -575,17 +577,25 @@ public final class SilentSearchCoordinator {
     }
 
     private func startRendezvous() {
+        if rendezvousPartnerDeadline == nil {
+            rendezvousPartnerDeadline = calculatedPartnerDeadline()
+        }
         if partnerDeadlineTask == nil {
-            let deadline = partnerDeadline()
-            partnerDeadlineTask = Task { [weak self] in
-                guard let self else { return }
-                do { try await self.dependencies.clock.sleep(until: deadline) }
-                catch { return }
-                guard case .rendezvous = self.phase else { return }
-                await self.finish(with: .partnerTimeout)
-            }
+            armPartnerDeadline()
         }
         missionTask = Task { [weak self] in await self?.runRendezvous() }
+    }
+
+    private func armPartnerDeadline() {
+        guard let deadline = rendezvousPartnerDeadline else { return }
+        partnerDeadlineTask?.cancel()
+        partnerDeadlineTask = Task { [weak self] in
+            guard let self else { return }
+            do { try await self.dependencies.clock.sleep(until: deadline) }
+            catch { return }
+            guard case .rendezvous = self.phase, self.trackingRecovery == nil else { return }
+            await self.finish(with: .partnerTimeout)
+        }
     }
 
     private func runRendezvous() async {
@@ -797,6 +807,7 @@ public final class SilentSearchCoordinator {
         let timeoutTask = Task { [weak self] in
             guard let self else { return }
             do { try await self.dependencies.clock.sleep(until: deadline) } catch { return }
+            guard self.trackingRecovery == nil else { return }
             self.rendezvousTimedOut = true
             self.dependencies.opticalExchange.cancel()
         }
@@ -808,6 +819,7 @@ public final class SilentSearchCoordinator {
             return result
         } catch {
             timeoutTask.cancel()
+            if trackingRecovery != nil { throw CancellationError() }
             if rendezvousTimedOut {
                 diagnostic = .opticalTimedOut
                 if deadline == partnerDeadline { throw PartnerTimeout() }
@@ -822,6 +834,10 @@ public final class SilentSearchCoordinator {
     }
 
     private func partnerDeadline() -> SilentSearchInstant {
+        rendezvousPartnerDeadline ?? calculatedPartnerDeadline()
+    }
+
+    private func calculatedPartnerDeadline() -> SilentSearchInstant {
         guard let searchDeadline else { return dependencies.clock.monotonicNow }
         let deadline = searchDeadline.addingReportingOverflow(60_000_000_000)
         return deadline.overflow ? Int64.max : deadline.partialValue
@@ -954,6 +970,10 @@ public final class SilentSearchCoordinator {
         if interruptedPhase == .searching {
             searchDeadlineTask?.cancel()
             searchDeadlineTask = nil
+        }
+        if case .rendezvous = interruptedPhase {
+            partnerDeadlineTask?.cancel()
+            partnerDeadlineTask = nil
         }
         dependencies.opticalExchange.cancel()
         await dependencies.motion.stop()

@@ -38,6 +38,7 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                 )
                 for await snapshot in sessionManager.snapshots() {
                     guard !Task.isCancelled else { break }
+                    guard snapshot.trackingQuality == .normal else { continue }
                     guard snapshot.id.generation == sessionGeneration else {
                         continuation.yield(.rejected(.generationMismatch))
                         break
@@ -76,7 +77,8 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
 
     nonisolated static func ground(observation: OpticalObservation, in snapshot: ARFrameSnapshot,
                                   expectedMarkerID: String) -> SharedMissionCalibrationObservation? {
-        guard observation.frameID == snapshot.id.sequence,
+        guard snapshot.trackingQuality == .normal,
+              observation.frameID == snapshot.id.sequence,
               observation.monotonicTimestamp == snapshot.timestamp,
               let payload = String(data: observation.payload, encoding: .utf8),
               SharedMissionCalibrator.markerID(fromPayload: payload) == expectedMarkerID else {
