@@ -154,10 +154,12 @@ final class FakeSilentSearchExplorer: SilentSearchExploring {
 
 @MainActor
 final class FakeSilentSearchTargetObserver: SilentSearchTargetObserving {
+    weak var clock: ManualSilentSearchClock?
     var result: SilentSearchTargetObservationResult = .pending
     var results: [SilentSearchTargetObservationResult] = []
     private(set) var deadlines: [SilentSearchInstant] = []
     var suspend = false
+    var pendingFrameInterval: Int64 = 700_000_000
     private var continuations: [CheckedContinuation<SilentSearchTargetObservationResult, Never>] = []
 
     func observeNextFrame(until deadline: SilentSearchInstant) async -> SilentSearchTargetObservationResult {
@@ -165,7 +167,11 @@ final class FakeSilentSearchTargetObserver: SilentSearchTargetObserving {
         if suspend {
             return await withCheckedContinuation { continuations.append($0) }
         }
-        return results.isEmpty ? result : results.removeFirst()
+        let next = results.isEmpty ? result : results.removeFirst()
+        if next == .pending, let clock, clock.monotonicNow < deadline {
+            clock.advance(nanoseconds: min(pendingFrameInterval, deadline - clock.monotonicNow))
+        }
+        return next
     }
 
     func resume(with result: SilentSearchTargetObservationResult = .pending) {
@@ -184,6 +190,7 @@ final class FakeSilentSearchMotion: SilentSearchMotion {
     var suspendNavigation = false
     var suspendRotation = false
     var suspendStop = false
+    var clearPathOnStop = false
     private(set) var stopCount = 0
     private(set) var navigationRequests: [(MissionPoint, SilentSearchMotionPolicy)] = []
     private(set) var rotationRequests: [(heading: Double, tolerance: Double)] = []
@@ -225,6 +232,7 @@ final class FakeSilentSearchMotion: SilentSearchMotion {
     func stop() async {
         stopCount += 1
         onStop?()
+        if clearPathOnStop { currentMissionPath = [] }
         if suspendStop {
             await withCheckedContinuation { stopContinuations.append($0) }
         }
@@ -295,6 +303,7 @@ struct SilentSearchTestHarness {
     ) {
         self.clock = clock
         self.optical = optical
+        targetObserver.clock = clock
     }
 
     func coordinator() -> SilentSearchCoordinator {

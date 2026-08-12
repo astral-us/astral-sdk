@@ -25,14 +25,62 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(opticalA.presentedPayloads.count, 2)
         XCTAssertEqual(opticalB.presentedPayloads.count, 2)
         XCTAssertEqual(coordinatorA.phase, .waitingForSearch)
-        a.clock.advance(nanoseconds: 29_999_000_000)
-        b.clock.advance(nanoseconds: 29_999_000_000)
+        a.clock.advance(nanoseconds: 34_999_000_000)
+        b.clock.advance(nanoseconds: 34_999_000_000)
         await taskTurn()
         XCTAssertEqual(coordinatorA.phase, .waitingForSearch)
 
         a.clock.advance(nanoseconds: 1_000_000)
         b.clock.advance(nanoseconds: 1_000_000)
         await eventually { coordinatorA.phase == .searching && coordinatorB.phase == .searching }
+    }
+
+    func testRoverBAdoptsValidatedOfferMissionAndRejectsAnotherMissionAfterBinding() async throws {
+        let opticalA = FakeSilentSearchOpticalExchange()
+        let opticalB = FakeSilentSearchOpticalExchange()
+        opticalA.peer = opticalB
+        opticalB.peer = opticalA
+        let a = SilentSearchTestHarness(optical: opticalA)
+        let b = SilentSearchTestHarness(optical: opticalB)
+        a.clock.advance(nanoseconds: wallNow * 1_000_000)
+        b.clock.advance(nanoseconds: wallNow * 1_000_000)
+        let coordinatorA = try await calibratedCoordinator(a, role: .a, label: "table", duration: 240)
+        let coordinatorB = try await calibratedCoordinator(b, role: .b, label: "chair", duration: 120)
+        var adopted: SilentSearchMission?
+        coordinatorB.missionDidChange = { adopted = $0 }
+
+        XCTAssertTrue(coordinatorA.startHandshake())
+        XCTAssertTrue(coordinatorB.startHandshake())
+        await eventually { adopted != nil }
+
+        XCTAssertEqual(coordinatorB.mission?.id, coordinatorA.mission?.id)
+        XCTAssertEqual(coordinatorB.mission?.targetLabel, "table")
+        XCTAssertEqual(coordinatorB.mission?.searchDurationSeconds, 240)
+        XCTAssertEqual(adopted, coordinatorB.mission)
+
+        await eventually { coordinatorB.phase == .waitingForSearch }
+    }
+
+    func testTrackingRecoveryRecreatesWaitingForSearchSleepAndStartsWhenExpired() async throws {
+        let opticalA = FakeSilentSearchOpticalExchange()
+        let opticalB = FakeSilentSearchOpticalExchange()
+        opticalA.peer = opticalB
+        opticalB.peer = opticalA
+        let a = SilentSearchTestHarness(optical: opticalA)
+        let b = SilentSearchTestHarness(optical: opticalB)
+        a.clock.advance(nanoseconds: wallNow * 1_000_000)
+        b.clock.advance(nanoseconds: wallNow * 1_000_000)
+        let coordinatorA = try await calibratedCoordinator(a, role: .a)
+        let coordinatorB = try await calibratedCoordinator(b, role: .b)
+        XCTAssertTrue(coordinatorA.startHandshake())
+        XCTAssertTrue(coordinatorB.startHandshake())
+        await eventually { coordinatorA.phase == .waitingForSearch }
+
+        a.safety.send(.trackingLimited(generation: 1))
+        await eventually { a.motion.stopCount == 1 }
+        a.clock.advance(nanoseconds: 35_000_000_000)
+        a.safety.send(.trackingNormal(generation: 1))
+        await eventually { coordinatorA.phase == .searching }
     }
 
     func testOpticalTimeoutRetryReusesIdenticalPayloadAndAbortStops() async throws {
@@ -101,7 +149,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         let acknowledgement = try roverB.prepareOutgoing(body: .searchAck(HashAcknowledgementBody(
             hash: OpticalMessageCodec().messageLinkHash(for: firstCommit)
         )), at: wallNow)
-        harness.clock.advance(nanoseconds: 25_001_000_000)
+        harness.clock.advance(nanoseconds: 30_001_000_000)
         harness.optical.sendToScanner(acknowledgement)
         await eventually { harness.optical.presentedPayloads.count == 3 }
 
@@ -137,6 +185,39 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         harness.clock.advance(nanoseconds: 5_000_000_000)
         await eventually { coordinator.phase == .terminal(.calibrationInvalidated) }
         XCTAssertNil(coordinator.sharedFrame)
+    }
+
+    func testTrackingRecoveryCapturesNavigationBeforeStopClearsPath() async throws {
+        let harness = SilentSearchTestHarness()
+        let goal = try XCTUnwrap(MissionPoint(x: -1, y: 2))
+        _ = try await searchingCoordinator(harness, deadline: 100_000_000_000)
+        harness.motion.currentMissionPath = [goal]
+        harness.motion.clearPathOnStop = true
+
+        harness.safety.send(.trackingLimited(generation: 1))
+        await eventually { harness.motion.stopCount == 2 }
+        harness.safety.send(.trackingNormal(generation: 1))
+        await eventually { harness.motion.navigationRequests.contains { $0.0 == goal } }
+
+        XCTAssertTrue(harness.motion.currentMissionPath.isEmpty)
+    }
+
+    func testTrackingRecoveryReturnsToFixedStagingWhenInterruptedPathWasCleared() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.motion.suspendNavigation = true
+        let coordinator = try await searchingCoordinator(harness, role: .b, deadline: 100_000_000_000)
+        await eventually { coordinator.phase == .returning }
+        let staging = SilentSearchGeometry.rendezvousPoint(for: .b)
+        harness.motion.currentMissionPath = [staging]
+        harness.motion.clearPathOnStop = true
+
+        harness.safety.send(.trackingLimited(generation: 1))
+        await eventually { harness.motion.stopCount == 3 }
+        harness.safety.send(.trackingNormal(generation: 1))
+        await eventually { harness.motion.navigationRequests.count == 2 }
+
+        XCTAssertEqual(harness.motion.navigationRequests.last?.0, staging)
+        XCTAssertEqual(harness.motion.navigationRequests.last?.1, .sectorConstrained(.east))
     }
 
     func testTrackingRecoveryResumesInterruptedInitialSearchScan() async throws {
@@ -199,18 +280,19 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.motion.navigationRequests.last?.1, .sectorConstrained(.west))
     }
 
-    func testSettledScanConsumesFramesUntilThirdSampleConfirmsWithoutMoving() async throws {
+    func testSettledScanConsumesMoreThanThreeFramesUntilConfirmationWithoutMoving() async throws {
         let harness = SilentSearchTestHarness()
         let target = TargetConfirmation(
             label: "chair", coordinate: MissionPoint(x: -1, y: 2)!, sampleCount: 3, meanConfidence: 0.96
         )
-        harness.targetObserver.results = [.pending, .pending, .confirmed(target)]
+        harness.targetObserver.results = [.pending, .pending, .pending, .pending, .confirmed(target)]
+        harness.targetObserver.pendingFrameInterval = 100_000_000
         let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
 
         harness.clock.advance(nanoseconds: 750_000_000)
         await eventually { coordinator.phase == .rendezvous(.waiting) }
 
-        XCTAssertEqual(harness.targetObserver.deadlines.count, 3)
+        XCTAssertEqual(harness.targetObserver.deadlines.count, 5)
         XCTAssertEqual(Set(harness.targetObserver.deadlines), [2_750_000_000])
         XCTAssertEqual(harness.motion.navigationRequests.map(\.0), [SilentSearchGeometry.rendezvousPoint(for: .a)])
         XCTAssertEqual(coordinator.targetConfirmation, target)
@@ -302,25 +384,23 @@ final class SilentSearchCoordinatorTests: XCTestCase {
 
     func testDeadlineAwaitsStopBeforeReturningToFixedStaging() async throws {
         let harness = SilentSearchTestHarness()
-        harness.explorer.selection = .candidate(candidate("frontier_1", x: -2, y: 0))
-        harness.motion.suspendNavigation = true
+        harness.targetObserver.suspend = true
         let coordinator = try await searchingCoordinator(harness, deadline: 1_000_000_000)
 
         harness.clock.advance(nanoseconds: 750_000_000)
-        await eventually { harness.motion.navigationRequests.count == 1 }
+        await eventually { harness.targetObserver.deadlines == [1_000_000_000] }
         harness.motion.suspendStop = true
         harness.clock.advance(nanoseconds: 250_000_000)
         await eventually { harness.motion.stopCount == 2 }
 
         XCTAssertEqual(coordinator.phase, .searching)
-        XCTAssertEqual(harness.motion.navigationRequests.count, 1)
-        harness.motion.suspendNavigation = false
+        XCTAssertTrue(harness.motion.navigationRequests.isEmpty)
         harness.motion.resumeStops()
         await eventually { coordinator.phase == .rendezvous(.waiting) }
 
-        XCTAssertEqual(harness.motion.navigationRequests.count, 2)
-        XCTAssertEqual(harness.motion.navigationRequests[1].0, SilentSearchGeometry.rendezvousPoint(for: .a))
-        XCTAssertEqual(harness.motion.navigationRequests[1].1, .sectorConstrained(.west))
+        XCTAssertEqual(harness.motion.navigationRequests.count, 1)
+        XCTAssertEqual(harness.motion.navigationRequests[0].0, SilentSearchGeometry.rendezvousPoint(for: .a))
+        XCTAssertEqual(harness.motion.navigationRequests[0].1, .sectorConstrained(.west))
     }
 
     func testCalibrationRequiresCompleteReadiness() async throws {
@@ -546,11 +626,13 @@ final class SilentSearchCoordinatorTests: XCTestCase {
     private func calibratedCoordinator(
         _ harness: SilentSearchTestHarness,
         role: RoverRole,
-        generation: UInt64 = 1
+        generation: UInt64 = 1,
+        label: String = "chair",
+        duration: UInt32 = 120
     ) async throws -> SilentSearchCoordinator {
         harness.readiness.snapshot = .ready(sessionGeneration: generation)
         let coordinator = harness.coordinator()
-        coordinator.configure(try mission(role: role))
+        coordinator.configure(try mission(role: role, label: label, duration: duration))
         XCTAssertTrue(coordinator.startCalibration())
         harness.calibration.send(.accepted(try frame(generation: generation)))
         await eventually { coordinator.phase == .handshake(.ready) }
@@ -590,12 +672,12 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         ))
     }
 
-    private func mission(role: RoverRole = .a) throws -> SilentSearchMission {
+    private func mission(role: RoverRole = .a, label: String = "chair", duration: UInt32 = 120) throws -> SilentSearchMission {
         try XCTUnwrap(SilentSearchMission(
             id: UUID(uuidString: "00000000-0000-0000-0000-000000000010")!,
             role: role,
-            targetLabel: "chair",
-            searchDurationSeconds: 120,
+            targetLabel: label,
+            searchDurationSeconds: duration,
             markerID: "SILENT_SEARCH_01"
         ))
     }

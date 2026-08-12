@@ -139,9 +139,9 @@ public struct OpticalProtocolSession: Sendable {
             if phase == .terminalConflict, message.kind == .converge {
                 throw OpticalProtocolRejection.convergenceAfterConflict
             }
-            guard expectedIncomingKind == message.kind else { throw OpticalProtocolRejection.unexpectedPhase }
             guard message.missionID == context.missionID else { throw OpticalProtocolRejection.wrongMission }
             guard message.markerID == context.markerID else { throw OpticalProtocolRejection.wrongMarker }
+            guard expectedIncomingKind == message.kind else { throw OpticalProtocolRejection.unexpectedPhase }
             guard message.role != context.localRole else { throw OpticalProtocolRejection.wrongRole }
             do { try codec.validateTimestamp(of: message, nowMilliseconds: nowMilliseconds) }
             catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }

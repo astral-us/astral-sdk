@@ -73,6 +73,22 @@ final class OpticalProtocolSessionTests: XCTestCase {
         XCTAssertEqual(roverB.incomingSequence.lastAccepted, 1)
     }
 
+    func testBoundRoverBStillRejectsAnotherMission() throws {
+        let boundID = UUID(uuidString: "30000000-0000-0000-0000-000000000003")!
+        var roverA = OpticalProtocolSession(context: OpticalProtocolContext(
+            missionID: boundID, markerID: markerID, localRole: .a))
+        var roverB = OpticalProtocolSession(context: OpticalProtocolContext(
+            missionID: boundID, markerID: markerID, localRole: .b))
+        try roverB.receive(roverA.prepareOutgoing(body: offerBody(), at: now), at: now)
+        let wrong = OpticalMessage(
+            missionID: UUID(), kind: .offer, sequence: 2, role: .a,
+            markerID: markerID, timestampMilliseconds: now, body: offerBody())
+
+        XCTAssertThrowsError(try roverB.receive(OpticalMessageCodec().encode(wrong), at: now)) {
+            XCTAssertEqual($0 as? OpticalProtocolRejection, .wrongMission)
+        }
+    }
+
     func testStructuredTelemetryRecordsKindSequenceOutcomeAndRejectionWithoutPayload() throws {
         let sink = RecordingProtocolSink()
         var roverA = OpticalProtocolSession(context: context(.a), events: sink)
@@ -138,6 +154,16 @@ final class OpticalProtocolSessionTests: XCTestCase {
         XCTAssertThrowsError(try sessions.a.receive(ack, at: now + 25_001)) {
             XCTAssertEqual($0 as? OpticalProtocolRejection, .invalidSchedule)
         }
+    }
+
+    func testReceiverRetainsThirtySecondScheduleValidation() throws {
+        var sessions = try sessionsThroughAcceptance()
+        let acceptHash = OpticalMessageCodec().messageLinkHash(for: try sessions.b.retryOutgoing())
+        let commit = try sessions.a.prepareOutgoing(body: .searchCommit(SearchCommitBody(
+            deadlineMilliseconds: now + 210_000, acceptanceHash: acceptHash,
+            startMilliseconds: now + 30_000)), at: now)
+
+        XCTAssertNoThrow(try sessions.b.receive(commit, at: now))
     }
 
     func testLateSearchAcknowledgementCanBeReplacedWithoutCorruptingSequenceOrPhase() throws {

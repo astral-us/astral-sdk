@@ -11,6 +11,7 @@ public final class SilentSearchCoordinator {
     public private(set) var calibrationProgress = 0
     public private(set) var diagnostic: SilentSearchCoordinatorDiagnostic?
     public private(set) var targetConfirmation: TargetConfirmation?
+    @ObservationIgnored public var missionDidChange: ((SilentSearchMission) -> Void)?
 
     @ObservationIgnored private let dependencies: SilentSearchDependencies
     @ObservationIgnored private var missionTask: Task<Void, Never>?
@@ -29,6 +30,8 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var lastPresentedPayload: Data?
     @ObservationIgnored private var currentSearchCandidateID: String?
     @ObservationIgnored private var convergenceTarget: MissionPoint?
+    @ObservationIgnored private var scheduledSearchStart: SilentSearchInstant?
+    @ObservationIgnored private var scheduledConvergenceRelease: SilentSearchInstant?
 
     private enum OpticalAction {
         case present(Data)
@@ -64,6 +67,7 @@ public final class SilentSearchCoordinator {
     public func configure(_ mission: SilentSearchMission) {
         guard phase == .setup else { return }
         self.mission = mission
+        missionDidChange?(mission)
         diagnostic = nil
         record("silent_search_mission")
     }
@@ -157,6 +161,8 @@ public final class SilentSearchCoordinator {
         trackingRecovery = nil
         targetConfirmation = nil
         searchDeadline = nil
+        scheduledSearchStart = nil
+        scheduledConvergenceRelease = nil
         rendezvousTimedOut = false
         localStatus = nil
         rendezvousDecision = nil
@@ -265,6 +271,9 @@ public final class SilentSearchCoordinator {
                            session.context.localRole == .b,
                            let localMission = mission {
                             let incoming = try OpticalMessageCodec().decode(payload)
+                            guard case let .offer(offer) = incoming.body else {
+                                throw OpticalProtocolRejection.unexpectedPhase
+                            }
                             if incoming.missionID != session.context.missionID {
                                 var bound = OpticalProtocolSession(context: OpticalProtocolContext(
                                     missionID: incoming.missionID,
@@ -273,15 +282,17 @@ public final class SilentSearchCoordinator {
                                 ), events: dependencies.events)
                                 try bound.receive(payload, at: dependencies.clock.wallNowMilliseconds)
                                 session = bound
-                                mission = SilentSearchMission(
-                                    id: incoming.missionID, role: localMission.role,
-                                    targetLabel: localMission.targetLabel,
-                                    searchDurationSeconds: localMission.searchDurationSeconds,
-                                    markerID: localMission.markerID
-                                )
                             } else {
                                 try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
                             }
+                            guard let adoptedMission = SilentSearchMission(
+                                id: incoming.missionID, role: localMission.role,
+                                targetLabel: offer.targetLabel,
+                                searchDurationSeconds: UInt32(offer.searchDurationSeconds),
+                                markerID: localMission.markerID
+                            ) else { throw OpticalProtocolRejection.codec(.invalidBody) }
+                            mission = adoptedMission
+                            missionDidChange?(adoptedMission)
                         } else {
                             try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
                         }
@@ -315,10 +326,9 @@ public final class SilentSearchCoordinator {
                     try transition(to: .waitingForSearch)
                     let startInstant = try monotonicInstant(forWallMilliseconds: start)
                     let deadlineInstant = try monotonicInstant(forWallMilliseconds: deadline)
-                    try await dependencies.clock.sleep(until: startInstant)
-                    guard !Task.isCancelled, phase == .waitingForSearch else { return }
-                    try transition(to: .searching)
-                    startSearch(until: deadlineInstant)
+                    scheduledSearchStart = startInstant
+                    searchDeadline = deadlineInstant
+                    try await waitForSearchStart()
                     return
                 default:
                     throw OpticalProtocolRejection.unexpectedPhase
@@ -340,7 +350,7 @@ public final class SilentSearchCoordinator {
     private func makeSearchCommit(session: inout OpticalProtocolSession) throws -> Data {
         guard let mission else { throw OpticalProtocolRejection.unexpectedPhase }
         let now = dependencies.clock.wallNowMilliseconds
-        let start = now.addingReportingOverflow(30_000)
+        let start = now.addingReportingOverflow(35_000)
         guard !start.overflow else { throw OpticalProtocolRejection.invalidSchedule }
         let duration = Int64(mission.searchDurationSeconds).multipliedReportingOverflow(by: 1_000)
         let deadline = start.partialValue.addingReportingOverflow(duration.partialValue)
@@ -350,6 +360,14 @@ public final class SilentSearchCoordinator {
             acceptanceHash: linkHashOfLastIncoming(),
             startMilliseconds: start.partialValue
         )), at: now)
+    }
+
+    private func waitForSearchStart() async throws {
+        guard let start = scheduledSearchStart, let deadline = searchDeadline else { return }
+        try await dependencies.clock.sleep(until: start)
+        guard !Task.isCancelled, phase == .waitingForSearch else { return }
+        try transition(to: .searching)
+        startSearch(until: deadline)
     }
 
     private func linkHashOfLastIncoming() -> String {
@@ -482,13 +500,12 @@ public final class SilentSearchCoordinator {
               dependencies.clock.monotonicNow < deadline else { return false }
         let window = dependencies.clock.monotonicNow.addingReportingOverflow(2_000_000_000)
         let scanDeadline = window.overflow ? deadline : min(deadline, window.partialValue)
-        var consumedFrames = 0
         while !Task.isCancelled, phase == .searching,
-              dependencies.clock.monotonicNow < scanDeadline, consumedFrames < 3 {
-            consumedFrames += 1
+              dependencies.clock.monotonicNow < scanDeadline {
             switch await dependencies.targetObserver.observeNextFrame(until: scanDeadline) {
             case .pending:
                 record("silent_search_target_evidence", fields: ["outcome": "pending"])
+                await Task.yield()
             case let .confirmed(confirmation):
                 if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
                 targetConfirmation = confirmation
@@ -640,7 +657,7 @@ public final class SilentSearchCoordinator {
                           let decisionPayload = lastPresentedPayload else {
                         throw OpticalProtocolRejection.invalidDecision
                     }
-                    let release = dependencies.clock.wallNowMilliseconds.addingReportingOverflow(30_000)
+                    let release = dependencies.clock.wallNowMilliseconds.addingReportingOverflow(35_000)
                     guard !release.overflow else { throw OpticalProtocolRejection.invalidSchedule }
                     let payload = try session.prepareOutgoing(body: .converge(ConvergeBody(
                         decisionHash: OpticalMessageCodec().messageLinkHash(for: decisionPayload),
@@ -678,10 +695,9 @@ public final class SilentSearchCoordinator {
                         "stage": "scheduled",
                     ])
                     try transition(to: .waitingForConvergence)
-                    try await dependencies.clock.sleep(until: monotonicInstant(forWallMilliseconds: release))
-                    guard !Task.isCancelled, phase == .waitingForConvergence else { return }
-                    try transition(to: .converging)
-                    await converge(to: MissionPoint(x: Double(x) / 1_000, y: Double(y) / 1_000)!)
+                    scheduledConvergenceRelease = try monotonicInstant(forWallMilliseconds: release)
+                    convergenceTarget = MissionPoint(x: Double(x) / 1_000, y: Double(y) / 1_000)!
+                    try await waitForConvergenceRelease()
                     return
                 default:
                     throw OpticalProtocolRejection.unexpectedPhase
@@ -701,6 +717,14 @@ public final class SilentSearchCoordinator {
         } catch {
             if !Task.isCancelled { await finish(with: .safetyFailure(.transport)) }
         }
+    }
+
+    private func waitForConvergenceRelease() async throws {
+        guard let release = scheduledConvergenceRelease, let target = convergenceTarget else { return }
+        try await dependencies.clock.sleep(until: release)
+        guard !Task.isCancelled, phase == .waitingForConvergence else { return }
+        try transition(to: .converging)
+        await converge(to: target)
     }
 
     private func makeStatus() throws -> StatusBody {
@@ -912,16 +936,18 @@ public final class SilentSearchCoordinator {
     private func suspendForLimitedTracking(generation: UInt64) async {
         guard let frame = sharedFrame, frame.sessionGeneration == generation,
               trackingRecovery == nil else { return }
+        let interruptedPhase = phase
+        let interruptedGoal = dependencies.motion.currentMissionPath.last
+        let interruptedCandidateID = currentSearchCandidateID
         missionTask?.cancel()
         dependencies.opticalExchange.cancel()
         await dependencies.motion.stop()
         let deadline = dependencies.clock.monotonicNow.addingReportingOverflow(5_000_000_000)
-        let goal = dependencies.motion.currentMissionPath.last
         trackingRecovery = TrackingRecovery(
-            phase: phase,
+            phase: interruptedPhase,
             deadline: deadline.overflow ? Int64.max : deadline.partialValue,
-            goal: goal,
-            candidateID: currentSearchCandidateID
+            goal: interruptedGoal,
+            candidateID: interruptedCandidateID
         )
         missionTask = Task { [weak self] in
             guard let self, let recovery = self.trackingRecovery else { return }
@@ -967,11 +993,20 @@ public final class SilentSearchCoordinator {
             guard let deadline = searchDeadline else { return }
             await runSearch(until: deadline)
         case .returning:
-            guard let goal = recovery.goal, let mission else { return }
+            guard let mission else { return }
+            let goal = recovery.goal ?? SilentSearchGeometry.rendezvousPoint(for: mission.role)
             let result = await dependencies.motion.navigate(
                 to: goal, policy: .sectorConstrained(mission.role.searchSector)
             )
             await completeReturn(result)
+        case .waitingForSearch:
+            do { try await waitForSearchStart() }
+            catch is CancellationError { return }
+            catch { await finish(with: .protocolFailure(.invalidSchedule)) }
+        case .waitingForConvergence:
+            do { try await waitForConvergenceRelease() }
+            catch is CancellationError { return }
+            catch { await finish(with: .protocolFailure(.invalidSchedule)) }
         case .handshake:
             launchHandshake()
         case .rendezvous:

@@ -192,6 +192,12 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         self.explorer = explorer
         self.motion = motion
         self.targetObserver = targetObserver
+        coordinator.missionDidChange = { [weak self] mission in
+            guard let self else { return }
+            self.role = mission.role
+            self.targetLabel = mission.targetLabel
+            self.durationSeconds = Int(mission.searchDurationSeconds)
+        }
     }
 
     static func compose(ar: ARSessionManager, control: RoverControl,
@@ -590,6 +596,14 @@ final class LiveSilentSearchSafetyMonitor: SilentSearchSafetyMonitoring {
     private let ar: ARSessionManager
     init(ar: ARSessionManager) { self.ar = ar }
 
+    static func safetyEvent(for lifecycle: ARSessionLifecycleEvent) -> SilentSearchSafetyEvent? {
+        switch lifecycle {
+        case .reset, .failed: .generationChanged
+        case let .interrupted(generation): .trackingLimited(generation: generation)
+        case .interruptionEnded: nil
+        }
+    }
+
     func events() -> AsyncStream<SilentSearchSafetyEvent> {
         AsyncStream { continuation in
             let snapshots = Task { @MainActor [ar] in
@@ -603,12 +617,7 @@ final class LiveSilentSearchSafetyMonitor: SilentSearchSafetyMonitoring {
             }
             let lifecycle = Task { @MainActor [ar] in
                 for await event in ar.lifecycleEvents() {
-                    switch event {
-                    case .reset: continuation.yield(.generationChanged)
-                    case let .interrupted(generation): continuation.yield(.trackingLimited(generation: generation))
-                    case let .interruptionEnded(generation): continuation.yield(.trackingNormal(generation: generation))
-                    case .failed: continuation.yield(.generationChanged)
-                    }
+                    if let event = Self.safetyEvent(for: event) { continuation.yield(event) }
                 }
             }
             continuation.onTermination = { @Sendable _ in

@@ -2,7 +2,16 @@ import CoreGraphics
 import XCTest
 @testable import PhroverOperator
 
+@MainActor
 final class SilentSearchMapTransformTests: XCTestCase {
+    func testInterruptionEndDoesNotClaimNormalTracking() {
+        XCTAssertNil(LiveSilentSearchSafetyMonitor.safetyEvent(for: .interruptionEnded(generation: 7)))
+        XCTAssertEqual(
+            LiveSilentSearchSafetyMonitor.safetyEvent(for: .interrupted(generation: 7)),
+            .trackingLimited(generation: 7)
+        )
+    }
+
     func testFitUsesCommonScaleAndCentersMissionBounds() throws {
         let transform = SilentSearchMapTransform.fit(
             points: [CGPoint(x: -1, y: -2), CGPoint(x: 3, y: 2)],

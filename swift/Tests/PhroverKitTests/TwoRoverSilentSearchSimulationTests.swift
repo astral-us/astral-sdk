@@ -51,7 +51,7 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         XCTAssertTrue(simulation.a.startHandshake())
         XCTAssertTrue(simulation.b.startHandshake())
         await eventually { simulation.a.phase == .waitingForSearch && simulation.b.phase == .waitingForSearch }
-        simulation.clock.advance(nanoseconds: 30_000_000_000)
+        simulation.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { simulation.a.phase == .searching && simulation.b.phase == .searching }
         await eventually {
             simulation.aHarness.motion.stopCount > 0 && simulation.bHarness.motion.stopCount > 0
@@ -91,7 +91,7 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         XCTAssertTrue(simulation.a.startHandshake())
         XCTAssertTrue(simulation.b.startHandshake())
         await eventually { simulation.a.phase == .waitingForSearch && simulation.b.phase == .waitingForSearch }
-        simulation.clock.advance(nanoseconds: 30_000_000_000)
+        simulation.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { simulation.a.phase == .searching && simulation.b.phase == .searching }
         await eventually {
             simulation.aHarness.motion.stopCount > 0 && simulation.bHarness.motion.stopCount > 0
@@ -126,7 +126,7 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         XCTAssertFalse(simulation.aHarness.motion.navigationRequests.contains { $0.1 == .unrestrictedConvergence })
         XCTAssertFalse(simulation.bHarness.motion.navigationRequests.contains { $0.1 == .unrestrictedConvergence })
 
-        simulation.clock.advance(nanoseconds: 30_000_000_000)
+        simulation.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { simulation.a.phase == .terminal(.success) && simulation.b.phase == .terminal(.success) }
 
         XCTAssertEqual(simulation.aHarness.motion.navigationRequests.last?.0, point(-1.6, 2))
@@ -148,17 +148,30 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
     func testSoleBFinderSelectsBReport() async throws {
         let simulation = try await simulation(aTarget: nil, bTarget: point(1, 3))
         await simulation.startAndReachRendezvous()
-        simulation.clock.advance(nanoseconds: 30_000_000_000)
+        simulation.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { simulation.a.phase == .terminal(.success) && simulation.b.phase == .terminal(.success) }
 
         XCTAssertEqual(simulation.aHarness.motion.navigationRequests.last?.0, point(0.4, 3))
         XCTAssertEqual(simulation.bHarness.motion.navigationRequests.last?.0, point(1.6, 3))
     }
 
+    func testTrackingRecoveryRecreatesWaitingForConvergenceActionWhenReleaseExpired() async throws {
+        let simulation = try await simulation(aTarget: point(-1, 2), bTarget: nil)
+        await simulation.startAndReachRendezvous()
+        simulation.aHarness.safety.send(.trackingLimited(generation: 1))
+        simulation.bHarness.safety.send(.trackingLimited(generation: 1))
+        await eventually { simulation.aHarness.motion.stopCount >= 3 && simulation.bHarness.motion.stopCount >= 3 }
+
+        simulation.clock.advance(nanoseconds: 35_000_000_000)
+        simulation.aHarness.safety.send(.trackingNormal(generation: 1))
+        simulation.bHarness.safety.send(.trackingNormal(generation: 1))
+        await eventually { simulation.a.phase == .terminal(.success) && simulation.b.phase == .terminal(.success) }
+    }
+
     func testDualFinderUsesMedianAndNeitherFinderCommitsNotFoundWithoutMovement() async throws {
         let dual = try await simulation(aTarget: point(-0.1, 2), bTarget: point(0.3, 2.2))
         await dual.startAndReachRendezvous()
-        dual.clock.advance(nanoseconds: 30_000_000_000)
+        dual.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { dual.a.phase == .terminal(.success) && dual.b.phase == .terminal(.success) }
         XCTAssertEqual(dual.aHarness.motion.navigationRequests.last?.0, point(-0.5, 2.1))
         XCTAssertEqual(dual.bHarness.motion.navigationRequests.last?.0, point(0.7, 2.1))
@@ -200,7 +213,8 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
             simulation.bHarness.optical.shouldRelay = simulation.aHarness.optical.shouldRelay
             await simulation.startAndReachRendezvous(waitForProtocol: false)
 
-            simulation.clock.advance(nanoseconds: 179_249_000_000)
+            let partnerDeadline: Int64 = 215_000_000_000
+            simulation.clock.advance(nanoseconds: partnerDeadline - 1_000_000 - simulation.clock.monotonicNow)
             await taskTurn()
             XCTAssertNotEqual(simulation.a.phase, .terminal(.partnerTimeout), "\(missingKind) \(missingRole)")
             XCTAssertNotEqual(simulation.b.phase, .terminal(.partnerTimeout), "\(missingKind) \(missingRole)")
@@ -261,7 +275,7 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
             (try? OpticalMessageCodec().decode($0).kind) == .searchAck
         }!
         outOfOrder.bHarness.optical.sendToScanner(oldAcknowledgement)
-        outOfOrder.clock.advance(nanoseconds: 30_000_000_000)
+        outOfOrder.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { outOfOrder.a.phase == .searching && outOfOrder.b.phase == .searching }
         await eventually { outOfOrder.aHarness.motion.stopCount > 0 && outOfOrder.bHarness.motion.stopCount > 0 }
         outOfOrder.clock.advance(nanoseconds: 750_000_000)
@@ -284,7 +298,7 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         XCTAssertTrue(deadline.a.startHandshake())
         XCTAssertTrue(deadline.b.startHandshake())
         await eventually { deadline.a.phase == .waitingForSearch && deadline.b.phase == .waitingForSearch }
-        deadline.clock.advance(nanoseconds: 30_000_000_000)
+        deadline.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { deadline.a.phase == .searching && deadline.b.phase == .searching }
         await eventually { deadline.aHarness.motion.stopCount > 0 && deadline.bHarness.motion.stopCount > 0 }
         deadline.clock.advance(nanoseconds: 750_000_000)
@@ -316,14 +330,14 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         let unsafe = try await simulation(aTarget: point(-1, 2), bTarget: nil)
         unsafe.aHarness.motion.results = [.arrived, .failed(.obstacle)]
         await unsafe.startAndReachRendezvous()
-        unsafe.clock.advance(nanoseconds: 30_000_000_000)
+        unsafe.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { unsafe.a.phase == .terminal(.motionFailure(.obstacle)) }
         XCTAssertEqual(unsafe.aHarness.motion.navigationRequests.filter { $0.1 == .unrestrictedConvergence }.count, 1)
 
         let heading = try await simulation(aTarget: point(-1, 2), bTarget: nil)
         heading.aHarness.motion.updatePoseOnArrival = false
         await heading.startAndReachRendezvous()
-        heading.clock.advance(nanoseconds: 30_000_000_000)
+        heading.clock.advance(nanoseconds: 35_000_000_000)
         await eventually { if case .terminal = heading.a.phase { true } else { false } }
         XCTAssertNotEqual(heading.a.phase, .terminal(.success))
     }
@@ -402,7 +416,7 @@ private struct Simulation {
         XCTAssertTrue(a.startHandshake())
         XCTAssertTrue(b.startHandshake())
         await eventually { a.phase == .waitingForSearch && b.phase == .waitingForSearch }
-        clock.advance(nanoseconds: 30_000_000_000)
+        clock.advance(nanoseconds: 35_000_000_000)
         await eventually { a.phase == .searching && b.phase == .searching }
         await eventually { aHarness.motion.stopCount > 0 && bHarness.motion.stopCount > 0 }
         clock.advance(nanoseconds: 750_000_000)
