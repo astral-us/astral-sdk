@@ -27,6 +27,7 @@ public final class NavigationController {
     private let sendCommand: (WheelCommand) async throws -> Void
     private let stopRover: () async throws -> Void
     private let sleep: (Duration) async -> Void
+    private let now: () -> Date
     private let pursuit = PursuitController(params: .init(
         wheelBase: RoverConfig.wheelBase,
         goalTolerance: 0.2,
@@ -51,6 +52,7 @@ public final class NavigationController {
         sendCommand = { try await control.sendNavigation($0) }
         stopRover = { try await control.stop() }
         sleep = { try? await Task.sleep(for: $0) }
+        now = Date.init
     }
 
     init(currentPose: @escaping () -> Pose2D?,
@@ -59,7 +61,8 @@ public final class NavigationController {
          lastAckAt: @escaping () async -> Date?,
          sendCommand: @escaping (WheelCommand) async throws -> Void,
          stopRover: @escaping () async throws -> Void,
-         sleep: @escaping (Duration) async -> Void) {
+         sleep: @escaping (Duration) async -> Void,
+         now: @escaping () -> Date = Date.init) {
         self.currentPose = currentPose
         self.currentForwardClearance = forwardClearance
         self.makePlan = plan
@@ -67,6 +70,7 @@ public final class NavigationController {
         self.sendCommand = sendCommand
         self.stopRover = stopRover
         self.sleep = sleep
+        self.now = now
     }
 
     /// Begin autonomously driving to a nav-plane goal.
@@ -368,6 +372,7 @@ public final class NavigationController {
     private func performRotate(to targetYaw: Double, mode: RotationMode) async -> NavigationResult {
         let angularTolerance = mode == .scan ? RoverConfig.scanTurnYawTolerance : 0.05
         var hasSentCommand = false
+        var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
             guard let pose = currentPose() else {
                 try? await stopRover()
@@ -384,7 +389,7 @@ public final class NavigationController {
             }
 
             let lastAck = await currentLastAck()
-            let now = Date()
+            let now = now()
             let decision = guardLayer.evaluate(forwardClearance: currentForwardClearance(),
                                                lastAckAt: lastAck,
                                                now: now,
@@ -420,6 +425,18 @@ public final class NavigationController {
             }
 
             let cmd = RotationCommand.command(forYawError: error)
+            if progressWatchdog.observe(distanceToGoal: abs(error), now: now, commanded: true) {
+                try? await stopRover()
+                let result = NavigationResult.failed(.stalled)
+                finish(result)
+                RuntimeFileLog.append("nav_safety_stop", fields: [
+                    "reason": "no_yaw_progress",
+                    "target_yaw_deg": Self.formatDegrees(targetYaw),
+                    "yaw_error_deg": Self.formatDegrees(error),
+                    "timeout": "2.50"
+                ])
+                return result
+            }
             RuntimeFileLog.append("nav_rotate_tick", fields: [
                 "pose_x": Self.formatMeters(pose.position.x),
                 "pose_y": Self.formatMeters(pose.position.y),
