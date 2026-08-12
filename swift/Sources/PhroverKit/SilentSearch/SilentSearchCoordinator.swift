@@ -430,15 +430,19 @@ public final class SilentSearchCoordinator {
     func startSearch(until deadline: SilentSearchInstant) {
         guard phase == .searching else { return }
         searchDeadline = deadline
+        armSearchDeadline(until: deadline)
+        missionTask = Task { [weak self] in
+            await self?.runSearch(until: deadline)
+        }
+    }
+
+    private func armSearchDeadline(until deadline: SilentSearchInstant) {
         searchDeadlineTask?.cancel()
         searchDeadlineTask = Task { [weak self] in
             guard let self else { return }
             do { try await self.dependencies.clock.sleep(until: deadline) }
             catch { return }
             await self.searchDeadlineReached()
-        }
-        missionTask = Task { [weak self] in
-            await self?.runSearch(until: deadline)
         }
     }
 
@@ -525,12 +529,12 @@ public final class SilentSearchCoordinator {
     }
 
     private func searchDeadlineReached() async {
-        guard phase == .searching else { return }
+        guard phase == .searching, trackingRecovery == nil else { return }
         record("silent_search_deadline", fields: ["outcome": "reached"])
         missionTask?.cancel()
         missionTask = nil
         await dependencies.motion.stop()
-        guard phase == .searching else { return }
+        guard phase == .searching, trackingRecovery == nil else { return }
         await returnToRendezvous(alreadyStopped: true)
     }
 
@@ -939,9 +943,6 @@ public final class SilentSearchCoordinator {
         let interruptedPhase = phase
         let interruptedGoal = dependencies.motion.currentMissionPath.last
         let interruptedCandidateID = currentSearchCandidateID
-        missionTask?.cancel()
-        dependencies.opticalExchange.cancel()
-        await dependencies.motion.stop()
         let deadline = dependencies.clock.monotonicNow.addingReportingOverflow(5_000_000_000)
         trackingRecovery = TrackingRecovery(
             phase: interruptedPhase,
@@ -949,6 +950,13 @@ public final class SilentSearchCoordinator {
             goal: interruptedGoal,
             candidateID: interruptedCandidateID
         )
+        missionTask?.cancel()
+        if interruptedPhase == .searching {
+            searchDeadlineTask?.cancel()
+            searchDeadlineTask = nil
+        }
+        dependencies.opticalExchange.cancel()
+        await dependencies.motion.stop()
         missionTask = Task { [weak self] in
             guard let self, let recovery = self.trackingRecovery else { return }
             do { try await self.dependencies.clock.sleep(until: recovery.deadline) }
@@ -973,6 +981,13 @@ public final class SilentSearchCoordinator {
     private func resume(_ recovery: TrackingRecovery) async {
         switch recovery.phase {
         case .searching:
+            if let deadline = searchDeadline {
+                if dependencies.clock.monotonicNow >= deadline {
+                    await searchDeadlineReached()
+                    return
+                }
+                armSearchDeadline(until: deadline)
+            }
             if let goal = recovery.goal, let mission {
                 let result = await dependencies.motion.navigate(
                     to: goal, policy: .sectorConstrained(mission.role.searchSector)
