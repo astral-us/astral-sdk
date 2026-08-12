@@ -190,6 +190,7 @@ public final class SilentSearchCoordinator {
                 return false
             }
             sharedFrame = frame
+            calibrationProgress = 3
             diagnostic = nil
             record("silent_search_calibration_accepted", fields: [
                 "generation": "\(frame.sessionGeneration)",

@@ -343,6 +343,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(calibrationEvents.last?.fields["mission"], coordinator.mission?.id.uuidString.lowercased())
         XCTAssertEqual(calibrationEvents.last?.fields["marker"], "SILENT_SEARCH_01")
         XCTAssertEqual(calibrationEvents.last?.fields["role"], "a")
+        XCTAssertEqual(calibrationEvents.last?.fields["sample_count"], "3")
     }
 
     func testSafetyAndTerminalTelemetryAreStructuredAndContextual() async throws {
