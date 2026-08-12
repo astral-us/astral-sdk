@@ -163,8 +163,7 @@ public protocol SilentSearchSafetyMonitoring: AnyObject {
     func events() -> AsyncStream<SilentSearchSafetyEvent>
 }
 
-@MainActor
-public protocol SilentSearchEventSink: AnyObject {
+public protocol SilentSearchEventSink: AnyObject, Sendable {
     func record(event: String, fields: [String: String])
 }
 

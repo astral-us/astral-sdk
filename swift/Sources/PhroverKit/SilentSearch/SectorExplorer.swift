@@ -61,17 +61,20 @@ public final class SectorExplorer {
     private let sector: SearchSector
     private let policy: any PathAdmissibilityPolicy
     private let planner: (Vec2, Vec2, Costmap?) -> [Vec2]?
+    private let events: (any SilentSearchEventSink)?
     private var records: [String: Record] = [:]
     private var nextID = 1
 
     public init(
         frame: SharedMissionFrame,
         sector: SearchSector,
-        policy: any PathAdmissibilityPolicy
+        policy: any PathAdmissibilityPolicy,
+        events: (any SilentSearchEventSink)? = nil
     ) {
         self.frame = frame
         self.sector = sector
         self.policy = policy
+        self.events = events
         self.planner = { start, goal, costmap in
             guard let costmap else { return nil }
             return AStarPlanner().plan(from: start, to: goal, in: costmap)
@@ -82,11 +85,13 @@ public final class SectorExplorer {
         frame: SharedMissionFrame,
         sector: SearchSector,
         policy: any PathAdmissibilityPolicy,
+        events: (any SilentSearchEventSink)? = nil,
         planner: @escaping (Vec2, Vec2) -> [Vec2]?
     ) {
         self.frame = frame
         self.sector = sector
         self.policy = policy
+        self.events = events
         self.planner = { start, goal, _ in planner(start, goal) }
     }
 
@@ -106,8 +111,13 @@ public final class SectorExplorer {
             $0.status == .available && $0.rejectionReason == nil && $0.pathLength != nil
         }
         guard let selected = eligible.sorted(by: Self.ranksBefore).first else {
+            events?.record(event: "silent_search_frontier_exhausted", fields: [:])
             return .exhausted
         }
+        events?.record(event: "silent_search_frontier_ranked", fields: [
+            "frontier_id": selected.stableID,
+            "path_length_mm": "\(Int(((selected.pathLength ?? 0) * 1_000).rounded()))",
+        ])
         return .candidate(selected)
     }
 
@@ -117,6 +127,7 @@ public final class SectorExplorer {
         record.persistentRejection = nil
         records[stableID] = record
         refreshCurrentCandidate(stableID)
+        events?.record(event: "silent_search_frontier_visited", fields: ["frontier_id": stableID])
     }
 
     public func markRejected(_ stableID: String, reason: SectorFrontierRejectionReason) {
@@ -125,6 +136,10 @@ public final class SectorExplorer {
         record.persistentRejection = reason
         records[stableID] = record
         refreshCurrentCandidate(stableID)
+        events?.record(event: "silent_search_frontier_rejected", fields: [
+            "frontier_id": stableID,
+            "reason": String(describing: reason),
+        ])
     }
 
     private func rebuild(
@@ -212,6 +227,19 @@ public final class SectorExplorer {
             rebuilt.append(candidate(stableID: stableID, record: record, start: start, costmap: costmap))
         }
         candidates = rebuilt.sorted { Self.numericID($0.stableID) < Self.numericID($1.stableID) }
+        for candidate in candidates {
+            events?.record(event: "silent_search_frontier_discovered", fields: [
+                "frontier_id": candidate.stableID,
+                "x_mm": "\(Int((candidate.missionCentroid.x * 1_000).rounded()))",
+                "y_mm": "\(Int((candidate.missionCentroid.y * 1_000).rounded()))",
+            ])
+            if let rejection = candidate.rejectionReason {
+                events?.record(event: "silent_search_frontier_rejected", fields: [
+                    "frontier_id": candidate.stableID,
+                    "reason": String(describing: rejection),
+                ])
+            }
+        }
     }
 
     private func candidate(

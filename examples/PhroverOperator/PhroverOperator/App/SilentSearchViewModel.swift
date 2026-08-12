@@ -188,21 +188,23 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
             }
         }
         let frameProvider = LiveSharedFrameProvider()
-        let explorer = LiveSectorExplorer(ar: ar, frameProvider: frameProvider)
+        let events = RuntimeSilentSearchEventSink()
+        let explorer = LiveSectorExplorer(ar: ar, frameProvider: frameProvider, events: events)
         let motion = LiveSilentSearchMotion(ar: ar, navigation: navigation, frameProvider: frameProvider)
         let target = LiveTargetObserver(
-            ar: ar, clock: clock, detector: detector, frameProvider: frameProvider, targetLabel: "chair"
+            ar: ar, clock: clock, detector: detector, frameProvider: frameProvider,
+            targetLabel: "chair", events: events
         )
         let coordinator = SilentSearchCoordinator(dependencies: SilentSearchDependencies(
             clock: clock,
             readiness: environment,
-            calibration: ARSharedMissionFrameCalibrator(sessionManager: ar),
+            calibration: ARSharedMissionFrameCalibrator(sessionManager: ar, events: events),
             opticalExchange: optical,
             explorer: explorer,
             targetObserver: target,
             motion: motion,
             safety: LiveSilentSearchSafetyMonitor(ar: ar),
-            events: RuntimeSilentSearchEventSink()
+            events: events
         ))
         frameProvider.coordinator = coordinator
         return LiveSilentSearchViewModel(
@@ -477,11 +479,14 @@ final class LiveSectorExplorer: SilentSearchExploring {
     private let frameProvider: LiveSharedFrameProvider
     private var explorer: SectorExplorer?
     private var explorerFrame: SharedMissionFrame?
+    private let events: any SilentSearchEventSink
     private(set) var candidates: [SectorFrontierCandidate] = []
 
-    init(ar: ARSessionManager, frameProvider: LiveSharedFrameProvider) {
+    init(ar: ARSessionManager, frameProvider: LiveSharedFrameProvider,
+         events: any SilentSearchEventSink) {
         self.ar = ar
         self.frameProvider = frameProvider
+        self.events = events
     }
 
     func nextCandidate() async -> SectorExplorerSelection {
@@ -492,7 +497,7 @@ final class LiveSectorExplorer: SilentSearchExploring {
             explorerFrame = frame
             explorer = SectorExplorer(
                 frame: frame, sector: role.searchSector,
-                policy: SectorPathPolicy(sector: role.searchSector, frame: frame)
+                policy: SectorPathPolicy(sector: role.searchSector, frame: frame), events: events
             )
         }
         guard let explorer else { return .exhausted }
@@ -519,16 +524,19 @@ final class LiveTargetObserver: SilentSearchTargetObserving {
     private let detector: Detector
     private let frameProvider: LiveSharedFrameProvider
     private let targetLabel: String
+    private let events: any SilentSearchEventSink
     private var source: ARRoverTargetObservationSource?
     private var sourceFrame: SharedMissionFrame?
 
     init(ar: ARSessionManager, clock: any SilentSearchClock, detector: Detector,
-         frameProvider: LiveSharedFrameProvider, targetLabel: String) {
+         frameProvider: LiveSharedFrameProvider, targetLabel: String,
+         events: any SilentSearchEventSink) {
         self.ar = ar
         self.clock = clock
         self.detector = detector
         self.frameProvider = frameProvider
         self.targetLabel = targetLabel
+        self.events = events
     }
 
     func observeNextFrame(until deadline: SilentSearchInstant) async -> SilentSearchTargetObservationResult {
@@ -537,7 +545,7 @@ final class LiveTargetObserver: SilentSearchTargetObserving {
             sourceFrame = frame
             source = ARRoverTargetObservationSource(
                 sessionManager: ar, clock: clock, detector: detector,
-                canonicalLabel: targetLabel, sharedFrame: frame
+                canonicalLabel: targetLabel, sharedFrame: frame, events: events
             )
         }
         return await source?.observeNextFrame(until: deadline) ?? .pending

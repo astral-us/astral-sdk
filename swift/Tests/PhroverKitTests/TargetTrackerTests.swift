@@ -100,6 +100,31 @@ final class TargetTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.confirmation, confirmation(first))
     }
 
+    func testStructuredTelemetryContainsEvidenceButNoImageOrDetectionContents() {
+        let sink = RecordingStructuredSink()
+        let tracker = TargetTracker(
+            canonicalLabel: "chair",
+            frame: SharedMissionFrame(localOrigin: .zero, localNorthHeading: 0, sessionGeneration: 1)!,
+            events: sink
+        )
+
+        _ = tracker.process(frame(1, 0, [detection("chair", 0.95, point: p(-2, -1))]))
+        _ = tracker.process(frame(2, 0.1, [detection("chair", 0.96, point: p(-2, -1))]))
+        _ = tracker.process(frame(3, 0.2, [detection("chair", 0.97, point: p(-2, -1))]))
+
+        XCTAssertEqual(sink.entries.map(\.event), [
+            "silent_search_target_evidence",
+            "silent_search_target_evidence",
+            "silent_search_target_evidence",
+            "silent_search_target_confirmed",
+        ])
+        XCTAssertEqual(sink.entries.last?.fields["sample_count"], "3")
+        XCTAssertEqual(sink.entries.last?.fields["confidence_basis_points"], "9600")
+        XCTAssertTrue(sink.entries.allSatisfy { entry in
+            entry.fields.keys.allSatisfy { !["payload", "image", "detections", "pixel_buffer"].contains($0) }
+        })
+    }
+
     private func makeTracker(sink: TargetTrackerEventSink? = nil) -> TargetTracker {
         TargetTracker(
             canonicalLabel: "chair",
@@ -123,6 +148,15 @@ final class TargetTrackerTests: XCTestCase {
     private func confirmation(_ result: TargetTrackingResult) -> TargetConfirmation? {
         guard case .confirmed(let value) = result else { return nil }
         return value
+    }
+}
+
+private final class RecordingStructuredSink: SilentSearchEventSink, @unchecked Sendable {
+    struct Entry { let event: String; let fields: [String: String] }
+    private(set) var entries: [Entry] = []
+
+    func record(event: String, fields: [String: String]) {
+        entries.append(Entry(event: event, fields: fields))
     }
 }
 

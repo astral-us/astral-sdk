@@ -106,10 +106,13 @@ public struct SharedMissionCalibrator: Sendable {
     public let sessionGeneration: UInt64
     private var evidence: [Evidence] = []
     private var acceptedFrame: SharedMissionFrame?
+    private let events: (any SilentSearchEventSink)?
 
-    public init(configuration: SharedMissionCalibrationConfiguration, sessionGeneration: UInt64) {
+    public init(configuration: SharedMissionCalibrationConfiguration, sessionGeneration: UInt64,
+                events: (any SilentSearchEventSink)? = nil) {
         self.configuration = configuration
         self.sessionGeneration = sessionGeneration
+        self.events = events
     }
 
     public mutating func observe(_ observation: SharedMissionCalibrationObservation) -> Result {
@@ -127,6 +130,10 @@ public struct SharedMissionCalibrator: Sendable {
         evidence.append(derived)
         evidence.sort { $0.timestamp < $1.timestamp }
         if evidence.count < configuration.requiredFrameCount {
+            events?.record(event: "silent_search_calibration_progress", fields: [
+                "marker": configuration.markerID,
+                "sample_count": "\(evidence.count)",
+            ])
             return .collecting(frameCount: evidence.count)
         }
 
@@ -166,6 +173,11 @@ public struct SharedMissionCalibrator: Sendable {
             return .rejected(.nonFiniteObservation)
         }
         acceptedFrame = frame
+        events?.record(event: "silent_search_calibration_accepted", fields: [
+            "generation": "\(sessionGeneration)",
+            "marker": configuration.markerID,
+            "sample_count": "\(configuration.requiredFrameCount)",
+        ])
         return .accepted(frame)
     }
 

@@ -29,6 +29,8 @@ jobs:
         run: echo "udid=$(scripts/test-swift-sdk.sh --print-udid)" >> "$GITHUB_OUTPUT"
       - name: Build all three products + run regular package tests
         run: scripts/test-swift-sdk.sh
+      - name: Verify Silent Search log checker fixtures
+        run: scripts/tests/test-verify-silent-search-logs.sh
       - name: Build the PhroverOperator example app
         working-directory: examples/PhroverOperator
         run: |
@@ -40,3 +42,9 @@ jobs:
           xcodebuild test -scheme PhroverOperator \
             -destination "id=${{ steps.sim.outputs.udid }}" \
             -only-testing:PhroverOperatorUITests/PhroverOperatorUITests/testLaunch_showsAuthOrTabs
+      - name: Run focused Silent Search scanner-timeout scenario
+        working-directory: examples/PhroverOperator
+        run: |
+          xcodebuild test -scheme PhroverOperator \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:PhroverOperatorUITests/SilentSearchUITests/testScannerTimeoutOffersRetryAndAbort

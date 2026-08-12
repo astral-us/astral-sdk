@@ -73,6 +73,29 @@ final class OpticalProtocolSessionTests: XCTestCase {
         XCTAssertEqual(roverB.incomingSequence.lastAccepted, 1)
     }
 
+    func testStructuredTelemetryRecordsKindSequenceOutcomeAndRejectionWithoutPayload() throws {
+        let sink = RecordingProtocolSink()
+        var roverA = OpticalProtocolSession(context: context(.a), events: sink)
+        var roverB = OpticalProtocolSession(context: context(.b), events: sink)
+        let offer = try roverA.prepareOutgoing(body: offerBody(), at: now)
+        try roverB.receive(offer, at: now)
+
+        let wrongMission = OpticalMessage(
+            missionID: UUID(uuidString: "20000000-0000-0000-0000-000000000002")!, kind: .offer,
+            sequence: 2, role: .a, markerID: markerID, timestampMilliseconds: now, body: offerBody()
+        )
+        var invalidSession = OpticalProtocolSession(context: context(.b), events: sink)
+        XCTAssertThrowsError(try invalidSession.receive(OpticalMessageCodec().encode(wrongMission), at: now))
+
+        XCTAssertEqual(sink.entries[0].fields["direction"], "outgoing")
+        XCTAssertEqual(sink.entries[0].fields["kind"], "offer")
+        XCTAssertEqual(sink.entries[0].fields["sequence"], "1")
+        XCTAssertEqual(sink.entries[1].fields["outcome"], "accepted")
+        XCTAssertEqual(sink.entries[2].fields["outcome"], "rejected")
+        XCTAssertEqual(sink.entries[2].fields["reason"], "wrongMission")
+        XCTAssertTrue(sink.entries.allSatisfy { $0.fields["payload"] == nil && $0.fields["image"] == nil })
+    }
+
     func testOfferAndAcceptanceClockBoundariesAreExact() throws {
         var roverA = OpticalProtocolSession(context: context(.a))
         let offer = try roverA.prepareOutgoing(body: offerBody(), at: now)
@@ -285,4 +308,10 @@ final class OpticalProtocolSessionTests: XCTestCase {
     private func context(_ role: RoverRole) -> OpticalProtocolContext {
         OpticalProtocolContext(missionID: missionID, markerID: markerID, localRole: role)
     }
+}
+
+private final class RecordingProtocolSink: SilentSearchEventSink, @unchecked Sendable {
+    struct Entry { let event: String; let fields: [String: String] }
+    private(set) var entries: [Entry] = []
+    func record(event: String, fields: [String: String]) { entries.append(Entry(event: event, fields: fields)) }
 }

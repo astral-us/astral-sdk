@@ -59,6 +59,7 @@ public final class SilentSearchCoordinator {
         guard phase == .setup else { return }
         self.mission = mission
         diagnostic = nil
+        record("silent_search_mission")
     }
 
     public func refreshReadiness() {
@@ -108,7 +109,7 @@ public final class SilentSearchCoordinator {
             missionID: mission.id,
             markerID: mission.markerID,
             localRole: mission.role
-        ))
+        ), events: dependencies.events)
         lastIncomingPayload = nil
         retryAction = nil
         diagnostic = nil
@@ -164,7 +165,7 @@ public final class SilentSearchCoordinator {
         }
         let previous = phase
         phase = next
-        dependencies.events.record(event: "silent_search_phase_transition", fields: [
+        record("silent_search_phase_transition", fields: [
             "from": previous.telemetryName,
             "to": next.telemetryName,
         ])
@@ -176,17 +177,24 @@ public final class SilentSearchCoordinator {
         case let .progress(count):
             calibrationProgress = count
             diagnostic = nil
+            record("silent_search_calibration_progress", fields: ["sample_count": "\(count)"])
             return false
         case let .rejected(reason):
             diagnostic = .calibrationRejected(reason)
+            record("silent_search_calibration_rejected", fields: ["reason": String(describing: reason)])
             return false
         case let .accepted(frame):
             guard frame.sessionGeneration == readiness.sessionGeneration else {
                 diagnostic = .calibrationRejected(.generationMismatch)
+                record("silent_search_calibration_rejected", fields: ["reason": "generationMismatch"])
                 return false
             }
             sharedFrame = frame
             diagnostic = nil
+            record("silent_search_calibration_accepted", fields: [
+                "generation": "\(frame.sessionGeneration)",
+                "sample_count": "\(calibrationProgress)",
+            ])
             try? transition(to: .handshake(.ready))
             return true
         }
@@ -386,9 +394,11 @@ public final class SilentSearchCoordinator {
             if dependencies.clock.monotonicNow >= deadline { return }
             switch await dependencies.explorer.nextCandidate() {
             case .exhausted:
+                record("silent_search_frontier_exhausted")
                 await returnToRendezvous()
                 return
             case let .candidate(candidate):
+                record("silent_search_frontier_selected", fields: ["frontier_id": candidate.stableID])
                 let result = await dependencies.motion.navigate(
                     to: candidate.missionCentroid,
                     policy: .sectorConstrained(sector)
@@ -403,6 +413,10 @@ public final class SilentSearchCoordinator {
                     if !shouldContinue { return }
                 case .failed(.noPath):
                     dependencies.explorer.markRejected(candidate.stableID, reason: .unreachable)
+                    record("silent_search_frontier_rejected", fields: [
+                        "frontier_id": candidate.stableID,
+                        "reason": "unreachable",
+                    ])
                 case let .failed(failure):
                     await finish(with: .motionFailure(failure))
                     return
@@ -427,11 +441,19 @@ public final class SilentSearchCoordinator {
               dependencies.clock.monotonicNow < deadline else { return false }
         switch await dependencies.targetObserver.observeNextFrame(until: deadline) {
         case .pending:
+            record("silent_search_target_evidence", fields: ["outcome": "pending"])
             if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
             return true
         case let .confirmed(confirmation):
             if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
             targetConfirmation = confirmation
+            record("silent_search_target_confirmed", fields: [
+                "confidence_basis_points": "\(Int((confirmation.meanConfidence * 10_000).rounded()))",
+                "label": confirmation.label,
+                "sample_count": "\(confirmation.sampleCount)",
+                "x_mm": "\(Int((confirmation.coordinate.x * 1_000).rounded()))",
+                "y_mm": "\(Int((confirmation.coordinate.y * 1_000).rounded()))",
+            ])
             await returnToRendezvous()
             return false
         }
@@ -439,6 +461,7 @@ public final class SilentSearchCoordinator {
 
     private func searchDeadlineReached() async {
         guard phase == .searching else { return }
+        record("silent_search_deadline", fields: ["outcome": "reached"])
         missionTask?.cancel()
         missionTask = nil
         await dependencies.motion.stop()
@@ -454,6 +477,7 @@ public final class SilentSearchCoordinator {
         guard phase == .searching else { return }
         do { try transition(to: .returning) }
         catch { return }
+        record("silent_search_return", fields: ["stage": "started"])
         let result = await dependencies.motion.navigate(
             to: SilentSearchGeometry.rendezvousPoint(for: mission.role),
             policy: .sectorConstrained(mission.role.searchSector)
@@ -464,6 +488,7 @@ public final class SilentSearchCoordinator {
             await dependencies.motion.stop()
             guard phase == .returning else { return }
             try? transition(to: .rendezvous(.waiting))
+            record("silent_search_rendezvous", fields: ["stage": "arrived"])
             startRendezvous()
         case let .failed(failure):
             await finish(with: .motionFailure(failure))
@@ -573,6 +598,10 @@ public final class SilentSearchCoordinator {
                     await finish(with: .notFound)
                     return
                 case let .convergenceScheduled(_, release, x?, y?):
+                    record("silent_search_convergence", fields: [
+                        "release_epoch_ms": "\(release)",
+                        "stage": "scheduled",
+                    ])
                     try transition(to: .waitingForConvergence)
                     try await dependencies.clock.sleep(until: monotonicInstant(forWallMilliseconds: release))
                     guard !Task.isCancelled, phase == .waitingForConvergence else { return }
@@ -688,6 +717,7 @@ public final class SilentSearchCoordinator {
 
     private func converge(to target: MissionPoint) async {
         guard let mission else { return }
+        record("silent_search_convergence", fields: ["stage": "started"])
         let xOffset = mission.role == .a ? -SilentSearchGeometry.targetOffset : SilentSearchGeometry.targetOffset
         let standOff = MissionPoint(x: target.x + xOffset, y: target.y)!
         let navigation = await dependencies.motion.navigate(to: standOff, policy: .unrestrictedConvergence)
@@ -714,6 +744,7 @@ public final class SilentSearchCoordinator {
                 await finish(with: .motionFailure(.noPose))
                 return
             }
+            record("silent_search_convergence", fields: ["stage": "arrived"])
             await finish(with: .success)
         }
     }
@@ -746,6 +777,7 @@ public final class SilentSearchCoordinator {
             await dependencies.motion.stop()
             safetyListenerTask?.cancel()
             safetyListenerTask = nil
+            record("silent_search_terminal", fields: ["result": Self.terminalName(result)])
             try? transition(to: .terminal(result))
             return
         }
@@ -757,6 +789,7 @@ public final class SilentSearchCoordinator {
         safetyListenerTask = Task { [weak self] in
             for await event in events {
                 guard !Task.isCancelled, let self else { return }
+                self.record("silent_search_safety", fields: ["reason": Self.safetyName(event)])
                 switch event {
                 case .operatorStop:
                     await self.finish(with: .operatorStopped)
@@ -850,6 +883,42 @@ public final class SilentSearchCoordinator {
             true
         default:
             false
+        }
+    }
+
+    private func record(_ event: String, fields: [String: String] = [:]) {
+        var contextual = fields
+        if let mission {
+            contextual["mission"] = mission.id.uuidString.lowercased()
+            contextual["marker"] = mission.markerID
+            contextual["role"] = mission.role.rawValue
+        }
+        dependencies.events.record(event: event, fields: contextual)
+    }
+
+    private static func safetyName(_ event: SilentSearchSafetyEvent) -> String {
+        switch event {
+        case .trackingNormal: "tracking_normal"
+        case .trackingLimited: "tracking_limited"
+        case .generationChanged: "generation_changed"
+        case .transportFailed: "transport_failed"
+        case .reactiveSafetyFailed: "reactive_safety_failed"
+        case .operatorStop: "operator_stop"
+        }
+    }
+
+    private static func terminalName(_ result: SilentSearchTerminalResult) -> String {
+        switch result {
+        case .success: "success"
+        case .notFound: "not_found"
+        case .operatorStopped: "operator_stopped"
+        case .operatorAborted: "operator_aborted"
+        case .partnerTimeout: "partner_timeout"
+        case let .protocolFailure(reason): "protocol_\(String(describing: reason))"
+        case .calibrationInvalidated: "calibration_invalidated"
+        case let .motionFailure(reason): "motion_\(String(describing: reason))"
+        case .safetyFailure(.transport): "safety_transport"
+        case .safetyFailure(.reactiveSafety): "safety_reactive_safety"
         }
     }
 }

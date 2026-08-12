@@ -83,6 +83,7 @@ public struct OpticalProtocolSession: Sendable {
     public private(set) var outgoingSequence = OutboundOpticalSequence()
 
     private let codec = OpticalMessageCodec()
+    private let events: (any SilentSearchEventSink)?
     private var lastOutgoing: Data?
     private var offer: OfferBody?
     private var offerHash: String?
@@ -99,8 +100,9 @@ public struct OpticalProtocolSession: Sendable {
     private var convergenceRelease: Int64?
     private var convergenceHash: String?
 
-    public init(context: OpticalProtocolContext) {
+    public init(context: OpticalProtocolContext, events: (any SilentSearchEventSink)? = nil) {
         self.context = context
+        self.events = events
         phase = context.localRole == .a ? .readyToSendOffer : .awaitingOffer
     }
 
@@ -122,27 +124,43 @@ public struct OpticalProtocolSession: Sendable {
         outgoingSequence.allocate()
         applyOutgoing(body: body, data: data)
         lastOutgoing = data
+        recordProtocol(direction: "outgoing", kind: kind, sequence: sequence, outcome: "accepted")
         return data
     }
 
     public mutating func receive(_ data: Data, at nowMilliseconds: Int64) throws {
-        let message: OpticalMessage
-        do { message = try codec.decode(data) }
-        catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }
+        var decoded: OpticalMessage?
+        do {
+            let message: OpticalMessage
+            do { message = try codec.decode(data) }
+            catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }
+            decoded = message
 
-        if phase == .terminalConflict, message.kind == .converge {
-            throw OpticalProtocolRejection.convergenceAfterConflict
+            if phase == .terminalConflict, message.kind == .converge {
+                throw OpticalProtocolRejection.convergenceAfterConflict
+            }
+            guard expectedIncomingKind == message.kind else { throw OpticalProtocolRejection.unexpectedPhase }
+            guard message.missionID == context.missionID else { throw OpticalProtocolRejection.wrongMission }
+            guard message.markerID == context.markerID else { throw OpticalProtocolRejection.wrongMarker }
+            guard message.role != context.localRole else { throw OpticalProtocolRejection.wrongRole }
+            do { try codec.validateTimestamp(of: message, nowMilliseconds: nowMilliseconds) }
+            catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }
+            try incomingSequence.validate(message.sequence)
+            try validateIncoming(message, at: nowMilliseconds)
+            incomingSequence.accept(message.sequence)
+            applyIncoming(message, data: data)
+            recordProtocol(direction: "incoming", kind: message.kind,
+                           sequence: message.sequence, outcome: "accepted")
+        } catch {
+            recordProtocol(
+                direction: "incoming",
+                kind: decoded?.kind,
+                sequence: decoded?.sequence,
+                outcome: "rejected",
+                reason: String(describing: error)
+            )
+            throw error
         }
-        guard expectedIncomingKind == message.kind else { throw OpticalProtocolRejection.unexpectedPhase }
-        guard message.missionID == context.missionID else { throw OpticalProtocolRejection.wrongMission }
-        guard message.markerID == context.markerID else { throw OpticalProtocolRejection.wrongMarker }
-        guard message.role != context.localRole else { throw OpticalProtocolRejection.wrongRole }
-        do { try codec.validateTimestamp(of: message, nowMilliseconds: nowMilliseconds) }
-        catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }
-        try incomingSequence.validate(message.sequence)
-        try validateIncoming(message, at: nowMilliseconds)
-        incomingSequence.accept(message.sequence)
-        applyIncoming(message, data: data)
     }
 
     public mutating func beginRendezvous() throws {
@@ -393,6 +411,21 @@ public struct OpticalProtocolSession: Sendable {
         case .converge: .converge
         case .convergeAck: .convergeAck
         }
+    }
+
+    private func recordProtocol(direction: String, kind: OpticalMessageKind?, sequence: UInt64?,
+                                outcome: String, reason: String? = nil) {
+        var fields = [
+            "direction": direction,
+            "kind": kind?.rawValue ?? "unknown",
+            "marker": context.markerID,
+            "mission": context.missionID.uuidString.lowercased(),
+            "outcome": outcome,
+            "role": context.localRole.rawValue,
+            "sequence": sequence.map(String.init) ?? "unknown",
+        ]
+        if let reason { fields["reason"] = reason }
+        events?.record(event: "silent_search_protocol", fields: fields)
     }
 
     private func absDifference(_ lhs: Int64, _ rhs: Int64) -> UInt64 {

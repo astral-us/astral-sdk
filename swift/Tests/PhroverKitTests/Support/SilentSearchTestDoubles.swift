@@ -243,8 +243,7 @@ final class FakeSilentSearchSafetyMonitor: SilentSearchSafetyMonitoring {
     var consumerCount: Int { continuations.count }
 }
 
-@MainActor
-final class RecordingSilentSearchEventSink: SilentSearchEventSink {
+final class RecordingSilentSearchEventSink: SilentSearchEventSink, @unchecked Sendable {
     struct Entry: Equatable {
         let event: String
         let fields: [String: String]

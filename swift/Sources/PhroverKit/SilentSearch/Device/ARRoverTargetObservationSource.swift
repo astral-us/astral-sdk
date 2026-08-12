@@ -13,22 +13,26 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
 
     public init(sessionManager: ARSessionManager, clock: any SilentSearchClock,
                 detector: Detector, canonicalLabel: String, sharedFrame: SharedMissionFrame,
-                eventSink: TargetTrackerEventSink? = nil) {
+                eventSink: TargetTrackerEventSink? = nil,
+                events: (any SilentSearchEventSink)? = nil) {
         self.sessionManager = sessionManager
         self.clock = clock
         self.sharedFrame = sharedFrame
         self.detector = { detector.detect($0) }
-        tracker = TargetTracker(canonicalLabel: canonicalLabel, frame: sharedFrame, eventSink: eventSink)
+        tracker = TargetTracker(canonicalLabel: canonicalLabel, frame: sharedFrame,
+                                eventSink: eventSink, events: events)
     }
 
     init(sessionManager: ARSessionManager, clock: any SilentSearchClock, canonicalLabel: String,
          sharedFrame: SharedMissionFrame, eventSink: TargetTrackerEventSink? = nil,
+         events: (any SilentSearchEventSink)? = nil,
          detector: @escaping DetectorFunction) {
         self.sessionManager = sessionManager
         self.clock = clock
         self.sharedFrame = sharedFrame
         self.detector = detector
-        tracker = TargetTracker(canonicalLabel: canonicalLabel, frame: sharedFrame, eventSink: eventSink)
+        tracker = TargetTracker(canonicalLabel: canonicalLabel, frame: sharedFrame,
+                                eventSink: eventSink, events: events)
     }
 
     func frameObservation(in snapshot: ARFrameSnapshot) -> TargetFrameObservation? {

@@ -120,6 +120,30 @@ final class SectorExplorerTests: XCTestCase {
         XCTAssertEqual(explorer.nextCandidate(), .exhausted)
     }
 
+    func testStructuredTelemetryRecordsDiscoveryRejectionRankingVisitAndExhaustion() {
+        let sink = RecordingExplorerSink()
+        let explorer = SectorExplorer(
+            frame: Self.frame,
+            sector: .west,
+            policy: UnrestrictedPathPolicy(),
+            events: sink,
+            planner: { start, goal in goal == .zero ? nil : [start, goal] }
+        )
+        explorer.rebuild(observations: [observation(0, 0), observation(-1, 0)], from: start)
+
+        guard case let .candidate(candidate) = explorer.nextCandidate() else {
+            return XCTFail("expected candidate")
+        }
+        explorer.markVisited(candidate.stableID)
+        XCTAssertEqual(explorer.nextCandidate(), .exhausted)
+
+        XCTAssertTrue(sink.events.contains("silent_search_frontier_discovered"))
+        XCTAssertTrue(sink.events.contains("silent_search_frontier_rejected"))
+        XCTAssertTrue(sink.events.contains("silent_search_frontier_ranked"))
+        XCTAssertTrue(sink.events.contains("silent_search_frontier_visited"))
+        XCTAssertTrue(sink.events.contains("silent_search_frontier_exhausted"))
+    }
+
     private func makeExplorer(
         policy: any PathAdmissibilityPolicy = UnrestrictedPathPolicy(),
         planner: @escaping (Vec2, Vec2) -> [Vec2]? = { [$0, $1] }
@@ -145,6 +169,11 @@ final class SectorExplorerTests: XCTestCase {
         sessionGeneration: 1
     )!
     private var start: Vec2 { Self.frame.localPoint(from: MissionPoint(x: -2, y: 0)!) }
+}
+
+private final class RecordingExplorerSink: SilentSearchEventSink, @unchecked Sendable {
+    private(set) var events: [String] = []
+    func record(event: String, fields: [String: String]) { events.append(event) }
 }
 
 private struct TestPathPolicy: PathAdmissibilityPolicy {

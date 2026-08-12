@@ -332,6 +332,38 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.sharedFrame, frame)
         XCTAssertEqual(coordinator.phase, .handshake(.ready))
         XCTAssertNil(coordinator.diagnostic)
+
+        let calibrationEvents = harness.events.entries.filter { $0.event.hasPrefix("silent_search_calibration") }
+        XCTAssertEqual(calibrationEvents.map(\.event), [
+            "silent_search_calibration_progress",
+            "silent_search_calibration_rejected",
+            "silent_search_calibration_rejected",
+            "silent_search_calibration_accepted",
+        ])
+        XCTAssertEqual(calibrationEvents.last?.fields["mission"], coordinator.mission?.id.uuidString.lowercased())
+        XCTAssertEqual(calibrationEvents.last?.fields["marker"], "SILENT_SEARCH_01")
+        XCTAssertEqual(calibrationEvents.last?.fields["role"], "a")
+    }
+
+    func testSafetyAndTerminalTelemetryAreStructuredAndContextual() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 7)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        harness.calibration.send(.accepted(try frame(generation: 7)))
+        await eventually { coordinator.phase == .handshake(.ready) }
+
+        harness.safety.send(.reactiveSafetyFailed)
+        await eventually { coordinator.phase == .terminal(.safetyFailure(.reactiveSafety)) }
+
+        let safety = try XCTUnwrap(harness.events.entries.first { $0.event == "silent_search_safety" })
+        XCTAssertEqual(safety.fields["reason"], "reactive_safety_failed")
+        let terminal = try XCTUnwrap(harness.events.entries.first { $0.event == "silent_search_terminal" })
+        XCTAssertEqual(terminal.fields["result"], "safety_reactive_safety")
+        XCTAssertEqual(terminal.fields["role"], "a")
+        XCTAssertNil(terminal.fields["payload"])
+        XCTAssertNil(terminal.fields["image"])
     }
 
     func testTransitionTableAcceptsLegalEdgesAndRejectsIllegalEdges() throws {

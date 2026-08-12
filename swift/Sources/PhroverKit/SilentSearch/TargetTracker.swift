@@ -88,6 +88,7 @@ public final class TargetTracker {
     private let canonicalLabel: String
     private let frame: SharedMissionFrame
     private let eventSink: TargetTrackerEventSink?
+    private let events: (any SilentSearchEventSink)?
     private var processedFrameIDs = Set<UInt64>()
     private var evidence: [Evidence] = []
     private var latestTimestamp = -Double.infinity
@@ -95,11 +96,13 @@ public final class TargetTracker {
     public init(
         canonicalLabel: String,
         frame: SharedMissionFrame,
-        eventSink: TargetTrackerEventSink? = nil
+        eventSink: TargetTrackerEventSink? = nil,
+        events: (any SilentSearchEventSink)? = nil
     ) {
         self.canonicalLabel = canonicalLabel
         self.frame = frame
         self.eventSink = eventSink
+        self.events = events
     }
 
     public func process(_ observation: TargetFrameObservation) -> TargetTrackingResult {
@@ -152,6 +155,12 @@ public final class TargetTracker {
         ))
         evidence.removeAll { latestTimestamp - $0.timestamp > 2.0 + 1e-12 }
         eventSink?.record(.evidenceAccepted(frameID: observation.frameID, sampleCount: evidence.count))
+        events?.record(event: "silent_search_target_evidence", fields: [
+            "confidence_basis_points": Self.basisPoints(best.confidence),
+            "grounded": "true",
+            "outcome": "accepted",
+            "sample_count": "\(evidence.count)",
+        ])
 
         guard evidence.count >= 3 else { return .collecting(sampleCount: evidence.count) }
         let samples = Array(evidence.suffix(3))
@@ -174,15 +183,30 @@ public final class TargetTracker {
         )
         confirmation = result
         eventSink?.record(.confirmed(result))
+        events?.record(event: "silent_search_target_confirmed", fields: [
+            "confidence_basis_points": Self.basisPoints(result.meanConfidence),
+            "label": result.label,
+            "sample_count": "\(result.sampleCount)",
+            "x_mm": "\(Int((result.coordinate.x * 1_000).rounded()))",
+            "y_mm": "\(Int((result.coordinate.y * 1_000).rounded()))",
+        ])
         return .confirmed(result)
     }
 
     private func reject(_ frameID: UInt64, _ reason: TargetRejectionReason) {
         eventSink?.record(.rejected(frameID: frameID, reason: reason))
+        events?.record(event: "silent_search_target_evidence", fields: [
+            "outcome": "rejected",
+            "reason": String(describing: reason),
+        ])
     }
 
     private static func median(_ values: [Double]) -> Double {
         let sorted = values.sorted()
         return sorted[sorted.count / 2]
+    }
+
+    private static func basisPoints(_ confidence: Double) -> String {
+        "\(Int((confidence * 10_000).rounded()))"
     }
 }

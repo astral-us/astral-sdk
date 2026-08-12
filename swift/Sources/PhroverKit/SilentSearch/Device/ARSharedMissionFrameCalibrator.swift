@@ -7,29 +7,34 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
 
     private let sessionManager: ARSessionManager
     private let scanner: Scanner
+    private let eventSink: (any SilentSearchEventSink)?
     private var task: Task<Void, Never>?
 
-    public init(sessionManager: ARSessionManager, scanner: OpticalQRCodeScanner = OpticalQRCodeScanner()) {
+    public init(sessionManager: ARSessionManager, scanner: OpticalQRCodeScanner = OpticalQRCodeScanner(),
+                events: (any SilentSearchEventSink)? = nil) {
         self.sessionManager = sessionManager
         self.scanner = { try scanner.scan($0) }
+        self.eventSink = events
     }
 
-    init(sessionManager: ARSessionManager, scanner: @escaping Scanner) {
+    init(sessionManager: ARSessionManager, events: (any SilentSearchEventSink)? = nil,
+         scanner: @escaping Scanner) {
         self.sessionManager = sessionManager
         self.scanner = scanner
+        self.eventSink = events
     }
 
     public func events(markerID: String, sessionGeneration: UInt64) -> AsyncStream<SilentSearchCalibrationEvent> {
         cancel()
         return AsyncStream { continuation in
-            task = Task { @MainActor [sessionManager, scanner] in
+            task = Task { @MainActor [sessionManager, scanner, eventSink] in
                 guard let configuration = SharedMissionCalibrationConfiguration(markerID: markerID) else {
                     continuation.yield(.rejected(.invalidMarkerID))
                     continuation.finish()
                     return
                 }
                 var calibrator = SharedMissionCalibrator(
-                    configuration: configuration, sessionGeneration: sessionGeneration
+                    configuration: configuration, sessionGeneration: sessionGeneration, events: eventSink
                 )
                 for await snapshot in sessionManager.snapshots() {
                     guard !Task.isCancelled else { break }
