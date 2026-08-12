@@ -16,15 +16,19 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var missionTask: Task<Void, Never>?
     @ObservationIgnored private var safetyListenerTask: Task<Void, Never>?
     @ObservationIgnored private var searchDeadlineTask: Task<Void, Never>?
+    @ObservationIgnored private var partnerDeadlineTask: Task<Void, Never>?
     @ObservationIgnored private var protocolSession: OpticalProtocolSession?
     @ObservationIgnored private var lastIncomingPayload: Data?
     @ObservationIgnored private var retryAction: OpticalAction?
+    @ObservationIgnored private var retryHeading: Double?
     @ObservationIgnored private var trackingRecovery: TrackingRecovery?
     @ObservationIgnored private var searchDeadline: SilentSearchInstant?
     @ObservationIgnored private var rendezvousTimedOut = false
     @ObservationIgnored private var localStatus: StatusBody?
     @ObservationIgnored private var rendezvousDecision: DecisionBody?
     @ObservationIgnored private var lastPresentedPayload: Data?
+    @ObservationIgnored private var currentSearchCandidateID: String?
+    @ObservationIgnored private var convergenceTarget: MissionPoint?
 
     private enum OpticalAction {
         case present(Data)
@@ -35,6 +39,7 @@ public final class SilentSearchCoordinator {
         let phase: SilentSearchPhase
         let deadline: SilentSearchInstant
         let goal: MissionPoint?
+        let candidateID: String?
     }
 
     private struct OpticalTimeout: Error {}
@@ -53,6 +58,7 @@ public final class SilentSearchCoordinator {
         missionTask?.cancel()
         safetyListenerTask?.cancel()
         searchDeadlineTask?.cancel()
+        partnerDeadlineTask?.cancel()
     }
 
     public func configure(_ mission: SilentSearchMission) {
@@ -119,11 +125,15 @@ public final class SilentSearchCoordinator {
 
     @discardableResult
     public func retryOpticalExchange() -> Bool {
-        guard case .handshake = phase, diagnostic == .opticalTimedOut, retryAction != nil else {
+        guard diagnostic == .opticalTimedOut, retryAction != nil else {
             return false
         }
         diagnostic = nil
-        launchHandshake()
+        switch phase {
+        case .handshake: launchHandshake()
+        case .rendezvous: startRendezvous()
+        default: return false
+        }
         return true
     }
 
@@ -143,6 +153,7 @@ public final class SilentSearchCoordinator {
         sharedFrame = nil
         protocolSession = nil
         retryAction = nil
+        retryHeading = nil
         trackingRecovery = nil
         targetConfirmation = nil
         searchDeadline = nil
@@ -152,6 +163,8 @@ public final class SilentSearchCoordinator {
         lastPresentedPayload = nil
         searchDeadlineTask?.cancel()
         searchDeadlineTask = nil
+        partnerDeadlineTask?.cancel()
+        partnerDeadlineTask = nil
         calibrationProgress = 0
         diagnostic = nil
         readiness = dependencies.readiness.snapshot
@@ -248,7 +261,30 @@ public final class SilentSearchCoordinator {
                 case .awaitingOffer, .awaitingAccept, .awaitingSearchCommit, .awaitingSearchAck:
                     let payload = try await scan()
                     do {
-                        try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                        if session.phase == .awaitingOffer,
+                           session.context.localRole == .b,
+                           let localMission = mission {
+                            let incoming = try OpticalMessageCodec().decode(payload)
+                            if incoming.missionID != session.context.missionID {
+                                var bound = OpticalProtocolSession(context: OpticalProtocolContext(
+                                    missionID: incoming.missionID,
+                                    markerID: session.context.markerID,
+                                    localRole: session.context.localRole
+                                ), events: dependencies.events)
+                                try bound.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                                session = bound
+                                mission = SilentSearchMission(
+                                    id: incoming.missionID, role: localMission.role,
+                                    targetLabel: localMission.targetLabel,
+                                    searchDurationSeconds: localMission.searchDurationSeconds,
+                                    markerID: localMission.markerID
+                                )
+                            } else {
+                                try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                            }
+                        } else {
+                            try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                        }
                         lastIncomingPayload = payload
                         protocolSession = session
                     } catch OpticalProtocolRejection.invalidSchedule
@@ -400,6 +436,7 @@ public final class SilentSearchCoordinator {
                 return
             case let .candidate(candidate):
                 record("silent_search_frontier_selected", fields: ["frontier_id": candidate.stableID])
+                currentSearchCandidateID = candidate.stableID
                 let result = await dependencies.motion.navigate(
                     to: candidate.missionCentroid,
                     policy: .sectorConstrained(sector)
@@ -407,18 +444,21 @@ public final class SilentSearchCoordinator {
                 guard !Task.isCancelled, phase == .searching else { return }
                 switch result {
                 case .arrived:
+                    currentSearchCandidateID = nil
                     let shouldContinue = await settledTargetObservation(
                         until: deadline,
                         visitedCandidateID: candidate.stableID
                     )
                     if !shouldContinue { return }
                 case .failed(.noPath):
+                    currentSearchCandidateID = nil
                     dependencies.explorer.markRejected(candidate.stableID, reason: .unreachable)
                     record("silent_search_frontier_rejected", fields: [
                         "frontier_id": candidate.stableID,
                         "reason": "unreachable",
                     ])
                 case let .failed(failure):
+                    currentSearchCandidateID = nil
                     await finish(with: .motionFailure(failure))
                     return
                 case .cancelled:
@@ -440,24 +480,31 @@ public final class SilentSearchCoordinator {
         catch { return false }
         guard !Task.isCancelled, phase == .searching,
               dependencies.clock.monotonicNow < deadline else { return false }
-        switch await dependencies.targetObserver.observeNextFrame(until: deadline) {
-        case .pending:
-            record("silent_search_target_evidence", fields: ["outcome": "pending"])
-            if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
-            return true
-        case let .confirmed(confirmation):
-            if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
-            targetConfirmation = confirmation
-            record("silent_search_target_confirmed", fields: [
-                "confidence_basis_points": "\(Int((confirmation.meanConfidence * 10_000).rounded()))",
-                "label": confirmation.label,
-                "sample_count": "\(confirmation.sampleCount)",
-                "x_mm": "\(Int((confirmation.coordinate.x * 1_000).rounded()))",
-                "y_mm": "\(Int((confirmation.coordinate.y * 1_000).rounded()))",
-            ])
-            await returnToRendezvous()
-            return false
+        let window = dependencies.clock.monotonicNow.addingReportingOverflow(2_000_000_000)
+        let scanDeadline = window.overflow ? deadline : min(deadline, window.partialValue)
+        var consumedFrames = 0
+        while !Task.isCancelled, phase == .searching,
+              dependencies.clock.monotonicNow < scanDeadline, consumedFrames < 3 {
+            consumedFrames += 1
+            switch await dependencies.targetObserver.observeNextFrame(until: scanDeadline) {
+            case .pending:
+                record("silent_search_target_evidence", fields: ["outcome": "pending"])
+            case let .confirmed(confirmation):
+                if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
+                targetConfirmation = confirmation
+                record("silent_search_target_confirmed", fields: [
+                    "confidence_basis_points": "\(Int((confirmation.meanConfidence * 10_000).rounded()))",
+                    "label": confirmation.label,
+                    "sample_count": "\(confirmation.sampleCount)",
+                    "x_mm": "\(Int((confirmation.coordinate.x * 1_000).rounded()))",
+                    "y_mm": "\(Int((confirmation.coordinate.y * 1_000).rounded()))",
+                ])
+                await returnToRendezvous()
+                return false
+            }
         }
+        if let visitedCandidateID { dependencies.explorer.markVisited(visitedCandidateID) }
+        return !Task.isCancelled && phase == .searching
     }
 
     private func searchDeadlineReached() async {
@@ -483,6 +530,10 @@ public final class SilentSearchCoordinator {
             to: SilentSearchGeometry.rendezvousPoint(for: mission.role),
             policy: .sectorConstrained(mission.role.searchSector)
         )
+        await completeReturn(result)
+    }
+
+    private func completeReturn(_ result: SilentSearchMotionResult) async {
         guard phase == .returning else { return }
         switch result {
         case .arrived:
@@ -503,14 +554,37 @@ public final class SilentSearchCoordinator {
     }
 
     private func startRendezvous() {
+        if partnerDeadlineTask == nil {
+            let deadline = partnerDeadline()
+            partnerDeadlineTask = Task { [weak self] in
+                guard let self else { return }
+                do { try await self.dependencies.clock.sleep(until: deadline) }
+                catch { return }
+                guard case .rendezvous = self.phase else { return }
+                await self.finish(with: .partnerTimeout)
+            }
+        }
         missionTask = Task { [weak self] in await self?.runRendezvous() }
     }
 
     private func runRendezvous() async {
         guard var session = protocolSession else { return }
         do {
-            try session.beginRendezvous()
-            protocolSession = session
+            if case .searchScheduled = session.phase {
+                try session.beginRendezvous()
+                protocolSession = session
+            }
+            if let retryAction, let retryHeading {
+                switch retryAction {
+                case let .present(payload):
+                    try await rendezvousPresent(payload, heading: retryHeading)
+                case .scan:
+                    let payload = try await rendezvousScan(heading: retryHeading)
+                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                    lastIncomingPayload = payload
+                    protocolSession = session
+                }
+            }
             localStatus = try makeStatus()
 
             while !Task.isCancelled {
@@ -615,6 +689,9 @@ public final class SilentSearchCoordinator {
             }
         } catch is CancellationError {
             return
+        } catch is OpticalTimeout {
+            protocolSession = session
+            diagnostic = .opticalTimedOut
         } catch is PartnerTimeout {
             await finish(with: .partnerTimeout)
         } catch let error as RendezvousMotionError {
@@ -653,19 +730,24 @@ public final class SilentSearchCoordinator {
     }
 
     private func rendezvousPresent(_ payload: Data, heading: Double) async throws {
+        retryAction = .present(payload)
+        retryHeading = heading
         try await prepareRendezvousExchange(heading: heading, phase: .presenting)
-        try await partnerTimed { try await self.dependencies.opticalExchange.present(payload: payload) }
+        try await rendezvousTimed { try await self.dependencies.opticalExchange.present(payload: payload) }
         lastPresentedPayload = payload
     }
 
     private func rendezvousScan(heading: Double) async throws -> Data {
+        retryAction = .scan
+        retryHeading = heading
         try await prepareRendezvousExchange(heading: heading, phase: .scanning)
-        return try await partnerTimed {
-            try await self.dependencies.opticalExchange.scan(until: self.partnerDeadline())
+        return try await rendezvousTimed {
+            try await self.dependencies.opticalExchange.scan(until: self.rendezvousOpticalDeadline())
         }
     }
 
     private func prepareRendezvousExchange(heading: Double, phase step: SilentSearchRendezvousStep) async throws {
+        try transition(to: .rendezvous(.rotating))
         let result = await dependencies.motion.rotate(to: heading, tolerance: SilentSearchGeometry.headingTolerance)
         switch result {
         case .arrived:
@@ -677,11 +759,12 @@ public final class SilentSearchCoordinator {
         }
     }
 
-    private func partnerTimed<T: Sendable>(
+    private func rendezvousTimed<T: Sendable>(
         _ operation: @escaping @MainActor () async throws -> T
     ) async throws -> T {
-        let deadline = partnerDeadline()
-        if dependencies.clock.monotonicNow >= deadline { throw PartnerTimeout() }
+        let partnerDeadline = partnerDeadline()
+        if dependencies.clock.monotonicNow >= partnerDeadline { throw PartnerTimeout() }
+        let deadline = rendezvousOpticalDeadline()
         rendezvousTimedOut = false
         let timeoutTask = Task { [weak self] in
             guard let self else { return }
@@ -692,12 +775,22 @@ public final class SilentSearchCoordinator {
         do {
             let result = try await operation()
             timeoutTask.cancel()
+            retryAction = nil
+            retryHeading = nil
             return result
         } catch {
             timeoutTask.cancel()
-            if rendezvousTimedOut { throw PartnerTimeout() }
+            if rendezvousTimedOut {
+                diagnostic = .opticalTimedOut
+                if deadline == partnerDeadline { throw PartnerTimeout() }
+                throw OpticalTimeout()
+            }
             throw error
         }
+    }
+
+    private func rendezvousOpticalDeadline() -> SilentSearchInstant {
+        min(opticalDeadline(), partnerDeadline())
     }
 
     private func partnerDeadline() -> SilentSearchInstant {
@@ -718,6 +811,7 @@ public final class SilentSearchCoordinator {
 
     private func converge(to target: MissionPoint) async {
         guard let mission else { return }
+        convergenceTarget = target
         record("silent_search_convergence", fields: ["stage": "started"])
         let xOffset = mission.role == .a ? -SilentSearchGeometry.targetOffset : SilentSearchGeometry.targetOffset
         let standOff = MissionPoint(x: target.x + xOffset, y: target.y)!
@@ -773,6 +867,8 @@ public final class SilentSearchCoordinator {
             missionTask = nil
             searchDeadlineTask?.cancel()
             searchDeadlineTask = nil
+            partnerDeadlineTask?.cancel()
+            partnerDeadlineTask = nil
             dependencies.calibration.cancel()
             dependencies.opticalExchange.cancel()
             await dependencies.motion.stop()
@@ -824,7 +920,8 @@ public final class SilentSearchCoordinator {
         trackingRecovery = TrackingRecovery(
             phase: phase,
             deadline: deadline.overflow ? Int64.max : deadline.partialValue,
-            goal: goal
+            goal: goal,
+            candidateID: currentSearchCandidateID
         )
         missionTask = Task { [weak self] in
             guard let self, let recovery = self.trackingRecovery else { return }
@@ -841,20 +938,48 @@ public final class SilentSearchCoordinator {
               sharedFrame?.sessionGeneration == generation else { return }
         missionTask?.cancel()
         trackingRecovery = nil
-        guard let goal = recovery.goal, let mission,
-              recovery.phase == .searching || recovery.phase == .returning else {
-            if case .handshake = recovery.phase { launchHandshake() }
-            return
-        }
         missionTask = Task { [weak self] in
             guard let self else { return }
-            let sector: SearchSector = mission.role == .a ? .west : .east
-            let result = await self.dependencies.motion.navigate(
-                to: goal,
-                policy: .sectorConstrained(sector)
+            await self.resume(recovery)
+        }
+    }
+
+    private func resume(_ recovery: TrackingRecovery) async {
+        switch recovery.phase {
+        case .searching:
+            if let goal = recovery.goal, let mission {
+                let result = await dependencies.motion.navigate(
+                    to: goal, policy: .sectorConstrained(mission.role.searchSector)
+                )
+                switch result {
+                case .arrived:
+                    currentSearchCandidateID = nil
+                    guard let deadline = searchDeadline else { return }
+                    guard await settledTargetObservation(
+                        until: deadline, visitedCandidateID: recovery.candidateID
+                    ) else { return }
+                case let .failed(failure):
+                    await finish(with: .motionFailure(failure))
+                    return
+                case .cancelled: return
+                }
+            }
+            guard let deadline = searchDeadline else { return }
+            await runSearch(until: deadline)
+        case .returning:
+            guard let goal = recovery.goal, let mission else { return }
+            let result = await dependencies.motion.navigate(
+                to: goal, policy: .sectorConstrained(mission.role.searchSector)
             )
-            guard case let .failed(failure) = result else { return }
-            await self.finish(with: .motionFailure(failure))
+            await completeReturn(result)
+        case .handshake:
+            launchHandshake()
+        case .rendezvous:
+            startRendezvous()
+        case .converging:
+            if let convergenceTarget { await converge(to: convergenceTarget) }
+        default:
+            break
         }
     }
 

@@ -7,6 +7,113 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
     private let wallNow: Int64 = 1_786_406_400_000
     private let missionID = UUID(uuidString: "00000000-0000-0000-0000-000000000013")!
 
+    func testRoverBBindsToIncomingOfferMission() async throws {
+        let simulation = try await simulation(aTarget: nil, bTarget: nil, independentMissionIDs: true)
+        let originalBMissionID = try XCTUnwrap(simulation.b.mission?.id)
+
+        XCTAssertTrue(simulation.a.startHandshake())
+        XCTAssertTrue(simulation.b.startHandshake())
+        await eventually { simulation.a.phase == .waitingForSearch && simulation.b.phase == .waitingForSearch }
+
+        XCTAssertNotEqual(originalBMissionID, missionID)
+        XCTAssertEqual(simulation.b.mission?.id, missionID)
+    }
+
+    func testRoverBRejectsWrongMissionAfterBindingToOffer() async throws {
+        let simulation = try await simulation(aTarget: nil, bTarget: nil, independentMissionIDs: true)
+        simulation.aHarness.optical.shouldRelay = { payload in
+            (try? OpticalMessageCodec().decode(payload).kind) != .searchCommit
+        }
+        XCTAssertTrue(simulation.a.startHandshake())
+        XCTAssertTrue(simulation.b.startHandshake())
+        await eventually {
+            simulation.b.mission?.id == self.missionID &&
+                simulation.aHarness.optical.presentedPayloads.contains {
+                    (try? OpticalMessageCodec().decode($0).kind) == .searchCommit
+                }
+        }
+        let commitPayload = try XCTUnwrap(simulation.aHarness.optical.presentedPayloads.first {
+            (try? OpticalMessageCodec().decode($0).kind) == .searchCommit
+        })
+        let commit = try OpticalMessageCodec().decode(commitPayload)
+        let wrongPayload = try OpticalMessageCodec().encode(OpticalMessage(
+            missionID: UUID(), kind: commit.kind, sequence: commit.sequence, role: commit.role,
+            markerID: commit.markerID, timestampMilliseconds: commit.timestampMilliseconds,
+            body: commit.body
+        ))
+
+        simulation.bHarness.optical.sendToScanner(wrongPayload)
+        await eventually { simulation.b.phase == .terminal(.protocolFailure(.wrongMission)) }
+    }
+
+    func testRendezvousOpticalTimeoutRetriesByteIdenticalStatusAndSupportsAbort() async throws {
+        let simulation = try await simulation(aTarget: nil, bTarget: nil)
+        XCTAssertTrue(simulation.a.startHandshake())
+        XCTAssertTrue(simulation.b.startHandshake())
+        await eventually { simulation.a.phase == .waitingForSearch && simulation.b.phase == .waitingForSearch }
+        simulation.clock.advance(nanoseconds: 30_000_000_000)
+        await eventually { simulation.a.phase == .searching && simulation.b.phase == .searching }
+        await eventually {
+            simulation.aHarness.motion.stopCount > 0 && simulation.bHarness.motion.stopCount > 0
+        }
+        simulation.aHarness.optical.shouldRelay = { payload in
+            (try? OpticalMessageCodec().decode(payload).kind) != .status
+        }
+        simulation.aHarness.optical.suspendPresent = true
+        simulation.clock.advance(nanoseconds: 750_000_000)
+        await eventually { self.statusPayloads(in: simulation.aHarness).count == 1 }
+        await eventually { simulation.aHarness.optical.suspendedPresentationCount == 1 }
+        XCTAssertEqual(simulation.aHarness.optical.suspendedPresentationCount, 1)
+        let timeoutDeadline = simulation.clock.monotonicNow + 30_000_000_000
+        await eventually { simulation.clock.pendingDeadlines.contains(timeoutDeadline) }
+        XCTAssertTrue(simulation.clock.pendingDeadlines.contains(timeoutDeadline),
+                      "now=\(simulation.clock.monotonicNow) deadlines=\(simulation.clock.pendingDeadlines)")
+
+        simulation.clock.advance(nanoseconds: 29_999_000_000)
+        await taskTurn()
+        XCTAssertNil(simulation.a.diagnostic)
+        simulation.clock.advance(nanoseconds: 1_000_000)
+        await eventually { simulation.a.diagnostic == .opticalTimedOut }
+        XCTAssertEqual(simulation.a.diagnostic, .opticalTimedOut)
+        let first = try XCTUnwrap(statusPayloads(in: simulation.aHarness).first)
+
+        XCTAssertTrue(simulation.a.retryOpticalExchange(), "phase=\(simulation.a.phase) diagnostic=\(String(describing: simulation.a.diagnostic))")
+        await eventually { self.statusPayloads(in: simulation.aHarness).count == 2 }
+        let retried = statusPayloads(in: simulation.aHarness)
+        XCTAssertEqual(retried.count, 2)
+        XCTAssertEqual(retried.last, first)
+        await simulation.a.abort()
+        XCTAssertEqual(simulation.a.phase, .terminal(.operatorAborted))
+    }
+
+    func testTrackingRecoveryResumesInterruptedRendezvousRotationAndExchange() async throws {
+        let simulation = try await simulation(aTarget: nil, bTarget: nil)
+        XCTAssertTrue(simulation.a.startHandshake())
+        XCTAssertTrue(simulation.b.startHandshake())
+        await eventually { simulation.a.phase == .waitingForSearch && simulation.b.phase == .waitingForSearch }
+        simulation.clock.advance(nanoseconds: 30_000_000_000)
+        await eventually { simulation.a.phase == .searching && simulation.b.phase == .searching }
+        await eventually {
+            simulation.aHarness.motion.stopCount > 0 && simulation.bHarness.motion.stopCount > 0
+        }
+        simulation.aHarness.motion.suspendRotation = true
+        simulation.clock.advance(nanoseconds: 750_000_000)
+        await eventually { simulation.a.phase == .rendezvous(.rotating) }
+        let rotationsBeforeRecovery = simulation.aHarness.motion.rotationRequests.count
+
+        simulation.aHarness.safety.send(.trackingLimited(generation: 1))
+        await eventually { simulation.aHarness.motion.stopCount >= 3 }
+        simulation.aHarness.motion.suspendRotation = false
+        simulation.aHarness.safety.send(.trackingNormal(generation: 1))
+        await eventually { simulation.aHarness.motion.rotationRequests.count > rotationsBeforeRecovery }
+        await eventually {
+            simulation.a.phase == .terminal(.notFound) && simulation.b.phase == .terminal(.notFound)
+        }
+
+        XCTAssertEqual(simulation.a.phase, .terminal(.notFound))
+        XCTAssertEqual(simulation.b.phase, .terminal(.notFound))
+    }
+
     func testSoleFinderCompletesRoleOrderedProtocolAndBothReachFixedStandOffs() async throws {
         let simulation = try await simulation(aTarget: point(-1, 2), bTarget: nil)
 
@@ -221,7 +328,8 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         XCTAssertNotEqual(heading.a.phase, .terminal(.success))
     }
 
-    private func simulation(aTarget: MissionPoint?, bTarget: MissionPoint?) async throws -> Simulation {
+    private func simulation(aTarget: MissionPoint?, bTarget: MissionPoint?,
+                            independentMissionIDs: Bool = false) async throws -> Simulation {
         let clock = ManualSilentSearchClock(wallNowMilliseconds: wallNow)
         let opticalA = FakeSilentSearchOpticalExchange()
         let opticalB = FakeSilentSearchOpticalExchange()
@@ -238,7 +346,7 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         let a = aHarness.coordinator()
         let b = bHarness.coordinator()
         a.configure(mission(.a))
-        b.configure(mission(.b))
+        b.configure(mission(.b, id: independentMissionIDs ? UUID() : missionID))
         XCTAssertTrue(a.startCalibration())
         XCTAssertTrue(b.startCalibration())
         let frame = SharedMissionFrame(localOrigin: .zero, localNorthHeading: 0, sessionGeneration: 1)!
@@ -248,8 +356,8 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         return Simulation(clock: clock, aHarness: aHarness, bHarness: bHarness, a: a, b: b)
     }
 
-    private func mission(_ role: RoverRole) -> SilentSearchMission {
-        SilentSearchMission(id: missionID, role: role, targetLabel: "chair",
+    private func mission(_ role: RoverRole, id: UUID? = nil) -> SilentSearchMission {
+        SilentSearchMission(id: id ?? missionID, role: role, targetLabel: "chair",
                             searchDurationSeconds: 120, markerID: "SILENT_SEARCH_01")!
     }
 
@@ -261,10 +369,17 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
 
     private func point(_ x: Double, _ y: Double) -> MissionPoint { MissionPoint(x: x, y: y)! }
 
+    private func statusPayloads(in harness: SilentSearchTestHarness) -> [Data] {
+        harness.optical.presentedPayloads.filter {
+            guard let message = try? OpticalMessageCodec().decode($0) else { return false }
+            return message.kind == .status && message.role == .a
+        }
+    }
+
     private func taskTurn() async { await Task.yield(); await Task.yield() }
 
     private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
-        for _ in 0..<200 where !condition() { await Task.yield() }
+        for _ in 0..<1_000 where !condition() { await Task.yield() }
     }
 }
 

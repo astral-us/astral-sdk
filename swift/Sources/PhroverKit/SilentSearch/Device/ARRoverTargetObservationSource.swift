@@ -5,7 +5,7 @@ import RoverNav
 public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
     public typealias DetectorFunction = (ARFrameSnapshot) -> Detector.FrameDetections
 
-    private let sessionManager: ARSessionManager
+    private let snapshots: () -> AsyncStream<ARFrameSnapshot>
     private let clock: any SilentSearchClock
     private let sharedFrame: SharedMissionFrame
     private let detector: DetectorFunction
@@ -15,7 +15,7 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
                 detector: Detector, canonicalLabel: String, sharedFrame: SharedMissionFrame,
                 eventSink: TargetTrackerEventSink? = nil,
                 events: (any SilentSearchEventSink)? = nil) {
-        self.sessionManager = sessionManager
+        snapshots = { sessionManager.snapshots() }
         self.clock = clock
         self.sharedFrame = sharedFrame
         self.detector = { detector.detect($0) }
@@ -27,12 +27,22 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
          sharedFrame: SharedMissionFrame, eventSink: TargetTrackerEventSink? = nil,
          events: (any SilentSearchEventSink)? = nil,
          detector: @escaping DetectorFunction) {
-        self.sessionManager = sessionManager
+        snapshots = { sessionManager.snapshots() }
         self.clock = clock
         self.sharedFrame = sharedFrame
         self.detector = detector
         tracker = TargetTracker(canonicalLabel: canonicalLabel, frame: sharedFrame,
                                 eventSink: eventSink, events: events)
+    }
+
+    init(clock: any SilentSearchClock, canonicalLabel: String, sharedFrame: SharedMissionFrame,
+         snapshots: @escaping () -> AsyncStream<ARFrameSnapshot>,
+         detector: @escaping DetectorFunction) {
+        self.snapshots = snapshots
+        self.clock = clock
+        self.sharedFrame = sharedFrame
+        self.detector = detector
+        tracker = TargetTracker(canonicalLabel: canonicalLabel, frame: sharedFrame)
     }
 
     func frameObservation(in snapshot: ARFrameSnapshot) -> TargetFrameObservation? {
@@ -69,7 +79,7 @@ public final class ARRoverTargetObservationSource: SilentSearchTargetObserving {
                     continuation.finish()
                     return
                 }
-                for await snapshot in self.sessionManager.snapshots() {
+                for await snapshot in self.snapshots() {
                     if Task.isCancelled { break }
                     continuation.yield(snapshot)
                     continuation.finish()

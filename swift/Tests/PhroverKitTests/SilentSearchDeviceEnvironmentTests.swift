@@ -53,6 +53,19 @@ final class SilentSearchDeviceEnvironmentTests: XCTestCase {
         XCTAssertFalse(environment.snapshot.missingRequirements.contains(.commandLink))
     }
 
+    func testSelectedModelLabelDrivesReadiness() async {
+        let state = DeviceState()
+        state.labels = ["table", "chair"]
+        let environment = makeEnvironment(state)
+        await environment.refreshCommandLink()
+
+        XCTAssertEqual(environment.supportedTargetLabels, ["chair", "table"])
+        environment.targetLabel = "table"
+        XCTAssertFalse(environment.snapshot.missingRequirements.contains(.detectorLabel))
+        environment.targetLabel = "person"
+        XCTAssertTrue(environment.snapshot.missingRequirements.contains(.detectorLabel))
+    }
+
     private func makeEnvironment(_ state: DeviceState) -> SilentSearchDeviceEnvironment {
         SilentSearchDeviceEnvironment(
             targetLabel: "chair",

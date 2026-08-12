@@ -5,7 +5,7 @@ import Foundation
 public final class SilentSearchDeviceEnvironment: SilentSearchReadinessChecking {
     private static let probeFreshness: TimeInterval = 2
 
-    private let targetLabel: String
+    public var targetLabel: String
     private let tracking: () -> ARTrackingQuality
     private let generation: () -> UInt64
     private let lidarSupported: () -> Bool
@@ -68,6 +68,8 @@ public final class SilentSearchDeviceEnvironment: SilentSearchReadinessChecking 
             commandLinkAvailable: linkFresh
         )
     }
+
+    public var supportedTargetLabels: [String] { detectorLabels().sorted() }
 
     public func refreshCommandLink() async {
         do {

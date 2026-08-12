@@ -12,6 +12,7 @@ enum SilentSearchOperatorPhase: Equatable {
     case scanning
     case searching
     case returning
+    case rendezvousRotating
     case intentionalWait
     case converging
     case terminalFound
@@ -25,6 +26,7 @@ protocol SilentSearchViewModel: AnyObject, Observable {
     var role: RoverRole { get set }
     var targetLabel: String { get set }
     var durationSeconds: Int { get set }
+    var supportedTargetLabels: [String] { get }
     var title: String { get }
     var detail: String { get }
     var readinessItems: [(String, Bool)] { get }
@@ -47,9 +49,11 @@ enum SilentSearchLaunchScenario: String, CaseIterable {
     case setupNotReady = "setup-not-ready"
     case calibrating
     case displayOffer = "display-offer"
+    case displayTimeout = "display-timeout"
     case scanTimeout = "scan-timeout"
     case searching
     case returning
+    case rendezvousRotating = "rendezvous-rotating"
     case intentionalWait = "intentional-wait"
     case converging
     case notFound = "not-found"
@@ -63,6 +67,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     var role: RoverRole = .a
     var targetLabel = "chair"
     var durationSeconds = 180
+    let supportedTargetLabels = ["chair"]
     private(set) var phase: SilentSearchOperatorPhase
     private(set) var opticalTimedOut = false
     private(set) var failureReason: String?
@@ -72,11 +77,15 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .setupNotReady: phase = .setup
         case .calibrating: phase = .calibrating
         case .displayOffer: phase = .displayingQR
+        case .displayTimeout:
+            phase = .displayingQR
+            opticalTimedOut = true
         case .scanTimeout:
             phase = .scanning
             opticalTimedOut = true
         case .searching: phase = .searching
         case .returning: phase = .returning
+        case .rendezvousRotating: phase = .rendezvousRotating
         case .intentionalWait: phase = .intentionalWait
         case .converging: phase = .converging
         case .notFound: phase = .terminalNotFound
@@ -96,6 +105,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .scanning: "Scan partner QR"
         case .searching: "Searching west sector"
         case .returning: "Returning to rendezvous"
+        case .rendezvousRotating: "Aligning for optical exchange"
         case .intentionalWait: "Waiting for partner"
         case .converging: "Converging on target"
         case .terminalFound: "FOUND"
@@ -113,6 +123,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .scanning: opticalTimedOut ? "No valid QR code received within 30 seconds." : "Aim this rover's rear camera at the partner screen."
         case .searching: "Frontier frontier_4 · 118 seconds remaining"
         case .returning: "Navigating to Rover A staging pose."
+        case .rendezvousRotating: "Rotating rear camera toward the partner screen."
         case .intentionalWait: "Stopped intentionally while waiting for the other rover."
         case .converging: "Target chair · final stand-off 0.60 m"
         case .terminalFound: "Both position and heading tolerances passed."
@@ -134,7 +145,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
 
     var mapState: SilentSearchMapState { .preview }
     var canStart: Bool { phase == .readyForExchange }
-    var showsStop: Bool { [.searching, .returning, .converging].contains(phase) }
+    var showsStop: Bool { [.searching, .returning, .rendezvousRotating, .converging].contains(phase) }
 
     func refreshReadiness() {}
     func start() {}
@@ -154,7 +165,13 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
 @Observable
 final class LiveSilentSearchViewModel: SilentSearchViewModel {
     var role: RoverRole = .a
-    var targetLabel = "chair"
+    var targetLabel: String {
+        didSet {
+            environment.targetLabel = targetLabel
+            targetObserver.setTargetLabel(targetLabel)
+            coordinator.refreshReadiness()
+        }
+    }
     var durationSeconds = 180
 
     private let coordinator: SilentSearchCoordinator
@@ -162,22 +179,27 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     private let presentation: LiveOpticalPresentation
     private let explorer: LiveSectorExplorer
     private let motion: LiveSilentSearchMotion
+    private let targetObserver: LiveTargetObserver
 
     init(coordinator: SilentSearchCoordinator, environment: SilentSearchDeviceEnvironment,
          presentation: LiveOpticalPresentation, explorer: LiveSectorExplorer,
-         motion: LiveSilentSearchMotion) {
+         motion: LiveSilentSearchMotion, targetObserver: LiveTargetObserver,
+         targetLabel: String) {
+        self.targetLabel = targetLabel
         self.coordinator = coordinator
         self.environment = environment
         self.presentation = presentation
         self.explorer = explorer
         self.motion = motion
+        self.targetObserver = targetObserver
     }
 
     static func compose(ar: ARSessionManager, control: RoverControl,
                         navigation: NavigationController, detector: Detector) -> LiveSilentSearchViewModel {
         let clock = RuntimeSilentSearchClock()
+        let targetLabel = detector.supportedCanonicalLabels.sorted().first ?? ""
         let environment = SilentSearchDeviceEnvironment(
-            ar: ar, detector: detector, control: control, targetLabel: "chair"
+            ar: ar, detector: detector, control: control, targetLabel: targetLabel
         )
         let presentation = LiveOpticalPresentation()
         let optical = AROpticalExchangeService(sessionManager: ar, clock: clock) { payload in
@@ -193,7 +215,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         let motion = LiveSilentSearchMotion(ar: ar, navigation: navigation, frameProvider: frameProvider)
         let target = LiveTargetObserver(
             ar: ar, clock: clock, detector: detector, frameProvider: frameProvider,
-            targetLabel: "chair", events: events
+            targetLabel: targetLabel, events: events
         )
         let coordinator = SilentSearchCoordinator(dependencies: SilentSearchDependencies(
             clock: clock,
@@ -209,7 +231,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         frameProvider.coordinator = coordinator
         return LiveSilentSearchViewModel(
             coordinator: coordinator, environment: environment, presentation: presentation,
-            explorer: explorer, motion: motion
+            explorer: explorer, motion: motion, targetObserver: target, targetLabel: targetLabel
         )
     }
 
@@ -220,6 +242,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .handshake(.ready): .readyForExchange
         case .handshake(.presenting), .rendezvous(.presenting): .displayingQR
         case .handshake(.scanning), .rendezvous(.scanning): .scanning
+        case .rendezvous(.rotating): .rendezvousRotating
         case .waitingForSearch, .rendezvous(.ready), .rendezvous(.waiting), .waitingForConvergence:
             .intentionalWait
         case .searching: .searching
@@ -240,6 +263,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .scanning: "Scan partner QR"
         case .searching: "Searching \(role.searchSector.rawValue) sector"
         case .returning: "Returning to rendezvous"
+        case .rendezvousRotating: "Aligning for optical exchange"
         case .intentionalWait: "Waiting"
         case .converging: "Converging on target"
         case .terminalFound: "FOUND"
@@ -258,6 +282,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
             opticalTimedOut ? "No valid QR code received within 30 seconds." : "Aim this rover's rear camera at the partner screen."
         case .searching: "Following eligible frontiers with sector policy enforced."
         case .returning: "Navigating to the fixed \(role.rawValue.uppercased()) rendezvous pose."
+        case .rendezvousRotating: "Rotating rear camera toward the partner screen."
         case .intentionalWait: "Stopped intentionally while waiting for the other rover."
         case .converging: "Using unrestricted convergence after acknowledged release."
         case .terminalFound: "Both position and heading tolerances passed."
@@ -278,6 +303,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     }
 
     var calibrationProgress: Int { coordinator.calibrationProgress }
+    var supportedTargetLabels: [String] { environment.supportedTargetLabels }
     var qrImage: CGImage? {
         guard phase == .displayingQR, let payload = presentation.payload else { return nil }
         return try? OpticalQRCodeRenderer().render(payload: payload, moduleScale: 7)
@@ -320,7 +346,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         default: false
         }
     }
-    var showsStop: Bool { [.searching, .returning, .converging].contains(phase) }
+    var showsStop: Bool { [.searching, .returning, .rendezvousRotating, .converging].contains(phase) }
 
     func refreshReadiness() {
         Task {
@@ -523,7 +549,7 @@ final class LiveTargetObserver: SilentSearchTargetObserving {
     private let clock: any SilentSearchClock
     private let detector: Detector
     private let frameProvider: LiveSharedFrameProvider
-    private let targetLabel: String
+    private var targetLabel: String
     private let events: any SilentSearchEventSink
     private var source: ARRoverTargetObservationSource?
     private var sourceFrame: SharedMissionFrame?
@@ -549,6 +575,13 @@ final class LiveTargetObserver: SilentSearchTargetObserving {
             )
         }
         return await source?.observeNextFrame(until: deadline) ?? .pending
+    }
+
+    func setTargetLabel(_ label: String) {
+        guard targetLabel != label else { return }
+        targetLabel = label
+        source = nil
+        sourceFrame = nil
     }
 }
 

@@ -139,6 +139,23 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.sharedFrame)
     }
 
+    func testTrackingRecoveryResumesInterruptedInitialSearchScan() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.targetObserver.suspend = true
+        let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { harness.targetObserver.deadlines.count == 1 }
+
+        harness.safety.send(.trackingLimited(generation: 1))
+        await eventually { harness.motion.stopCount == 2 }
+        harness.targetObserver.suspend = false
+        harness.safety.send(.trackingNormal(generation: 1))
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { harness.targetObserver.deadlines.count == 2 }
+        harness.clock.advance(nanoseconds: 2_000_000_000)
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+    }
+
     func testGenerationChangeAlwaysStopsAndInvalidatesCalibration() async throws {
         let harness = SilentSearchTestHarness()
         let coordinator = try await calibratedCoordinator(harness, role: .a, generation: 3)
@@ -182,6 +199,37 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.motion.navigationRequests.last?.1, .sectorConstrained(.west))
     }
 
+    func testSettledScanConsumesFramesUntilThirdSampleConfirmsWithoutMoving() async throws {
+        let harness = SilentSearchTestHarness()
+        let target = TargetConfirmation(
+            label: "chair", coordinate: MissionPoint(x: -1, y: 2)!, sampleCount: 3, meanConfidence: 0.96
+        )
+        harness.targetObserver.results = [.pending, .pending, .confirmed(target)]
+        let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+
+        XCTAssertEqual(harness.targetObserver.deadlines.count, 3)
+        XCTAssertEqual(Set(harness.targetObserver.deadlines), [2_750_000_000])
+        XCTAssertEqual(harness.motion.navigationRequests.map(\.0), [SilentSearchGeometry.rendezvousPoint(for: .a)])
+        XCTAssertEqual(coordinator.targetConfirmation, target)
+    }
+
+    func testSettledScanStopsAtTwoSecondWindowAndContinuesSearch() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.targetObserver.suspend = true
+        let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
+
+        harness.clock.advance(nanoseconds: 750_000_000)
+        await eventually { harness.targetObserver.deadlines == [2_750_000_000] }
+        harness.clock.advance(nanoseconds: 2_000_000_000)
+        harness.targetObserver.resume()
+        await eventually { coordinator.phase == .rendezvous(.waiting) }
+
+        XCTAssertEqual(harness.targetObserver.deadlines, [2_750_000_000])
+    }
+
     func testCrossSectorTargetReturnsToFixedRoleStagingWithoutReleasingSectorPolicy() async throws {
         let harness = SilentSearchTestHarness()
         let target = TargetConfirmation(
@@ -207,7 +255,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
             label: "chair", coordinate: MissionPoint(x: -2, y: 0)!, sampleCount: 3, meanConfidence: 0.97
         )
         harness.explorer.selection = .candidate(visited)
-        harness.targetObserver.results = [.pending, .confirmed(target)]
+        harness.targetObserver.results = [.pending, .pending, .pending, .confirmed(target)]
         let coordinator = try await searchingCoordinator(harness, deadline: 100_000_000_000)
 
         harness.clock.advance(nanoseconds: 750_000_000)
@@ -467,7 +515,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
                 return false
             }
         }
-        await taskTurn()
+        await eventually { Set(harness.clock.pendingDeadlines) == [10, 20, 30] }
         cancelled.cancel()
         let cancellationObserved = await cancelled.value
         XCTAssertTrue(cancellationObserved)

@@ -13,6 +13,9 @@ final class SilentSearchUITests: XCTestCase {
         XCTAssertTrue(app.otherElements["silent_search_map"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Not ready"].exists)
         XCTAssertFalse(app.buttons["silent_search_start"].isEnabled)
+        XCTAssertTrue(app.segmentedControls["silent_search_role_picker"].exists)
+        XCTAssertTrue(app.buttons["silent_search_target_picker"].exists)
+        XCTAssertTrue(app.steppers["silent_search_duration"].exists)
     }
 
     func testCalibrationCannotAdvanceWithoutAcceptedSamples() {
@@ -42,8 +45,16 @@ final class SilentSearchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["silent_search_abort"].isEnabled)
     }
 
+    func testPresentationTimeoutOffersRetryAndAbort() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "display-timeout")
+
+        XCTAssertTrue(app.images["silent_search_qr"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["silent_search_retry"].isEnabled)
+        XCTAssertTrue(app.buttons["silent_search_abort"].isEnabled)
+    }
+
     func testStopPersistsInEveryMovingPhase() {
-        for scenario in ["searching", "returning", "converging"] {
+        for scenario in ["searching", "returning", "rendezvous-rotating", "converging"] {
             let app = XCUIApplication.launchingSilentSearch(scenario: scenario)
             XCTAssertTrue(
                 app.buttons["silent_search_stop"].waitForExistence(timeout: 10),

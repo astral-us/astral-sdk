@@ -59,6 +59,8 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
                      ("Policy", "Sector constrained"), ("Target", viewModel.targetLabel)])
         case .returning:
             metrics([("Destination", "Fixed rendezvous"), ("Policy", "Sector constrained")])
+        case .rendezvousRotating:
+            metrics([("Motion", "Optical alignment"), ("Timeout", "30 seconds after alignment")])
         case .intentionalWait:
             Label("Motors stopped", systemImage: "pause.circle.fill")
                 .font(.headline)
@@ -78,12 +80,18 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
                 Text("Rover B · East").tag(RoverRole.b)
             }
             .pickerStyle(.segmented)
-            LabeledContent("Target class") {
-                Text(viewModel.targetLabel).fontWeight(.semibold)
+            .accessibilityIdentifier("silent_search_role_picker")
+            Picker("Target class", selection: $viewModel.targetLabel) {
+                ForEach(viewModel.supportedTargetLabels, id: \.self) { label in
+                    Text(label).tag(label)
+                }
             }
+            .pickerStyle(.menu)
+            .accessibilityIdentifier("silent_search_target_picker")
             Stepper(value: $viewModel.durationSeconds, in: 30...3600, step: 30) {
                 LabeledContent("Search duration", value: "\(viewModel.durationSeconds) seconds")
             }
+            .accessibilityIdentifier("silent_search_duration")
             VStack(spacing: 9) {
                 ForEach(Array(viewModel.readinessItems.enumerated()), id: \.offset) { _, item in
                     HStack {
