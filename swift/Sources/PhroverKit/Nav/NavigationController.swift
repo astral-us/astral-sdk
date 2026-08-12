@@ -84,7 +84,10 @@ public final class NavigationController {
         stoppingAtForwardClearance clearance: Double? = nil,
         policy: (any PathAdmissibilityPolicy)? = nil
     ) async -> NavigationResult {
+        operationGeneration &+= 1
+        let reservation = operationGeneration
         await cancelAndWait()
+        guard operationGeneration == reservation else { return .cancelled }
         return await startNavigation(
             to: goal, stoppingAtForwardClearance: clearance, policy: policy, cancellingCurrent: false
         ).value
@@ -135,7 +138,10 @@ public final class NavigationController {
     }
 
     public func rotateAndWait(by angle: Double) async -> NavigationResult {
+        operationGeneration &+= 1
+        let reservation = operationGeneration
         await cancelAndWait()
+        guard operationGeneration == reservation else { return .cancelled }
         operationGeneration &+= 1
         guard let startYaw = currentPose()?.yaw else {
             let result = NavigationResult.failed(.noPose)
