@@ -77,11 +77,105 @@ final class NavigationPathPolicyTests: XCTestCase {
         XCTAssertEqual(Array(events.prefix(2)), ["stop", "plan"])
     }
 
+    func testStaleConcurrentCancellationCannotDetachReplacementNavigation() async {
+        let harness = ConcurrentCancellationHarness()
+        let controller = harness.makeController()
+        controller.navigate(to: Vec2(0, 1))
+        await harness.waitForSendCount(1)
+        await harness.waitForStopCount(1)
+
+        let firstCancellation = Task { await controller.cancelAndWait() }
+        let secondCancellation = Task { await controller.cancelAndWait() }
+        harness.resumeSend()
+        await harness.resumeSleepWhenSuspended()
+        await harness.waitForStopCount(3)
+        await harness.waitForResumedCancellation(controller: controller)
+
+        controller.navigate(to: Vec2(0, 2))
+        await harness.waitForSendCount(2)
+        harness.resumeSuspendedStop()
+        await firstCancellation.value
+        await secondCancellation.value
+
+        XCTAssertEqual(controller.state, .driving)
+        XCTAssertEqual(controller.path, [Vec2(0, 2)])
+
+        harness.pose = nil
+        let stopCount = harness.stopCount
+        let replacementCancellation = Task { await controller.cancelAndWait() }
+        await harness.resumeSleepWhenSuspended()
+        await replacementCancellation.value
+        await harness.waitForStopCount(stopCount + 2)
+        XCTAssertEqual(harness.sendCount, 2)
+    }
+
     private func westPolicy() -> SectorPathPolicy {
         SectorPathPolicy(
             sector: .west,
             frame: SharedMissionFrame(localOrigin: .zero, localNorthHeading: 0, sessionGeneration: 1)!
         )
+    }
+}
+
+@MainActor
+private final class ConcurrentCancellationHarness {
+    var pose: Pose2D? = Pose2D(position: .zero, yaw: 0)
+    private(set) var sendCount = 0
+    private(set) var stopCount = 0
+    private var sendContinuation: CheckedContinuation<Void, Never>?
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var sleepContinuation: CheckedContinuation<Void, Never>?
+
+    func makeController() -> NavigationController {
+        NavigationController(
+            currentPose: { self.pose },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { Date() },
+            sendCommand: { _ in
+                self.sendCount += 1
+                if self.sendCount == 1 {
+                    await withCheckedContinuation { self.sendContinuation = $0 }
+                }
+            },
+            stopRover: {
+                self.stopCount += 1
+                if self.stopCount == 3 {
+                    await withCheckedContinuation { self.stopContinuation = $0 }
+                }
+            },
+            sleep: { _ in
+                await withCheckedContinuation { self.sleepContinuation = $0 }
+            }
+        )
+    }
+
+    func resumeSend() {
+        sendContinuation?.resume()
+        sendContinuation = nil
+    }
+
+    func resumeSuspendedStop() {
+        stopContinuation?.resume()
+        stopContinuation = nil
+    }
+
+    func resumeSleepWhenSuspended() async {
+        while sleepContinuation == nil { await Task.yield() }
+        sleepContinuation?.resume()
+        sleepContinuation = nil
+    }
+
+    func waitForSendCount(_ expected: Int) async {
+        while sendCount < expected { await Task.yield() }
+    }
+
+    func waitForStopCount(_ expected: Int) async {
+        while stopCount < expected { await Task.yield() }
+    }
+
+    func waitForResumedCancellation(controller: NavigationController) async {
+        while controller.state != .idle { await Task.yield() }
     }
 }
 

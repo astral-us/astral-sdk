@@ -35,6 +35,7 @@ public final class NavigationController {
     private static let obstacleArrivalDistance = 0.65
 
     private var loop: Task<NavigationResult, Never>?
+    private var operationGeneration: UInt = 0
     private var replanCounter = 0
     private var activePolicy: (any PathAdmissibilityPolicy)?
 
@@ -97,6 +98,7 @@ public final class NavigationController {
         cancellingCurrent: Bool = true
     ) -> Task<NavigationResult, Never> {
         if cancellingCurrent { cancel() }
+        operationGeneration &+= 1
         replanCounter = 0
         activePolicy = policy
         guard let start = currentPose()?.position else {
@@ -134,6 +136,7 @@ public final class NavigationController {
 
     public func rotateAndWait(by angle: Double) async -> NavigationResult {
         await cancelAndWait()
+        operationGeneration &+= 1
         guard let startYaw = currentPose()?.yaw else {
             let result = NavigationResult.failed(.noPose)
             finish(result)
@@ -151,6 +154,7 @@ public final class NavigationController {
     /// process a stable frame.
     public func rotateForScan(by angle: Double) async {
         cancel()
+        operationGeneration &+= 1
         guard let startYaw = currentPose()?.yaw else {
             state = .failed("No ARKit pose yet — move the device to establish tracking.")
             return
@@ -164,6 +168,7 @@ public final class NavigationController {
 
     /// Stop and clear the current goal.
     public func cancel() {
+        operationGeneration &+= 1
         loop?.cancel()
         loop = nil
         activePolicy = nil
@@ -176,10 +181,13 @@ public final class NavigationController {
     }
 
     public func cancelAndWait() async {
+        let generation = operationGeneration
         let task = loop
         task?.cancel()
         _ = await task?.value
+        guard operationGeneration == generation else { return }
         try? await stopRover()
+        guard operationGeneration == generation else { return }
         loop = nil
         activePolicy = nil
         path = []
