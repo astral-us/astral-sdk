@@ -1,9 +1,80 @@
 import CoreGraphics
+import PhroverKit
 import XCTest
 @testable import PhroverOperator
 
 @MainActor
 final class SilentSearchMapTransformTests: XCTestCase {
+    func testLiveSafetyMonitorMapsTypedMovementFailuresWithoutParsingMessages() async {
+        let navigation = AsyncStream.makeStream(of: NavigationSafetyState.self)
+        let link = AsyncStream.makeStream(of: RoverCommandLinkReadiness.self)
+        let monitor = LiveSilentSearchSafetyMonitor(
+            navigationStates: { navigation.stream },
+            commandLinkReadiness: { link.stream }
+        )
+        let events = monitor.events()
+
+        navigation.continuation.yield(.moving)
+        navigation.continuation.yield(.failed(.tipping))
+
+        let event = await firstEvent(from: events)
+        XCTAssertEqual(event, .reactiveSafetyFailed)
+    }
+
+    func testLiveSafetyMonitorEmitsTransportForMovementFailureAndIdleLinkLoss() async {
+        let navigation = AsyncStream.makeStream(of: NavigationSafetyState.self)
+        let link = AsyncStream.makeStream(of: RoverCommandLinkReadiness.self)
+        let monitor = LiveSilentSearchSafetyMonitor(
+            navigationStates: { navigation.stream },
+            commandLinkReadiness: { link.stream }
+        )
+        let events = monitor.events()
+        let received = Task { await firstEvent(from: events) }
+
+        navigation.continuation.yield(.failed(.commandFailed))
+        let movementEvent = await received.value
+        XCTAssertEqual(movementEvent, .transportFailed)
+
+        let idleNavigation = AsyncStream.makeStream(of: NavigationSafetyState.self)
+        let idleLink = AsyncStream.makeStream(of: RoverCommandLinkReadiness.self)
+        let idleMonitor = LiveSilentSearchSafetyMonitor(
+            navigationStates: { idleNavigation.stream },
+            commandLinkReadiness: { idleLink.stream }
+        )
+        let idleEvents = idleMonitor.events()
+        let idleReceived = Task { await firstEvent(from: idleEvents) }
+        idleNavigation.continuation.yield(.idle)
+        idleLink.continuation.yield(.unavailable)
+
+        let idleEvent = await idleReceived.value
+        XCTAssertEqual(idleEvent, .transportFailed)
+    }
+
+    func testLiveSafetyMonitorDoesNotDuplicateUnsafeTransitions() async {
+        let navigation = AsyncStream.makeStream(of: NavigationSafetyState.self)
+        let link = AsyncStream.makeStream(of: RoverCommandLinkReadiness.self)
+        let monitor = LiveSilentSearchSafetyMonitor(
+            navigationStates: { navigation.stream },
+            commandLinkReadiness: { link.stream }
+        )
+        let events = monitor.events()
+        let received = Task { () -> [SilentSearchSafetyEvent] in
+            var iterator = events.makeAsyncIterator()
+            var result: [SilentSearchSafetyEvent] = []
+            if let event = await iterator.next() { result.append(event) }
+            if let event = await iterator.next() { result.append(event) }
+            return result
+        }
+
+        navigation.continuation.yield(.failed(.commandFailed))
+        navigation.continuation.yield(.failed(.commandFailed))
+        link.continuation.yield(.unavailable)
+        navigation.continuation.yield(.failed(.tipping))
+
+        let unsafeEvents = await received.value
+        XCTAssertEqual(unsafeEvents, [.transportFailed, .reactiveSafetyFailed])
+    }
+
     func testInterruptionEndDoesNotClaimNormalTracking() {
         XCTAssertNil(LiveSilentSearchSafetyMonitor.safetyEvent(for: .interruptionEnded(generation: 7)))
         XCTAssertEqual(
@@ -51,5 +122,12 @@ final class SilentSearchMapTransformTests: XCTestCase {
                              file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(point.x, x, accuracy: 0.000_001, file: file, line: line)
         XCTAssertEqual(point.y, y, accuracy: 0.000_001, file: file, line: line)
+    }
+
+    private func firstEvent(
+        from stream: AsyncStream<SilentSearchSafetyEvent>
+    ) async -> SilentSearchSafetyEvent? {
+        for await event in stream { return event }
+        return nil
     }
 }

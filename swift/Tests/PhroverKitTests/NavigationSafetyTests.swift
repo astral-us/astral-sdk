@@ -4,6 +4,32 @@ import RoverNav
 
 @MainActor
 final class NavigationSafetyTests: XCTestCase {
+    func testNavigationPublishesTypedCommandFailureDuringMovement() async {
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in throw FakeCommandError.timedOut },
+            stopRover: {},
+            sleep: { _ in }
+        )
+        let states = controller.safetyStates()
+        let received = Task { () -> [NavigationSafetyState] in
+            var iterator = states.makeAsyncIterator()
+            var result: [NavigationSafetyState] = []
+            if let state = await iterator.next() { result.append(state) }
+            if let state = await iterator.next() { result.append(state) }
+            if let state = await iterator.next() { result.append(state) }
+            return result
+        }
+
+        _ = await controller.navigateAndWait(to: Vec2(2, 0))
+
+        let safetyStates = await received.value
+        XCTAssertEqual(safetyStates, [.idle, .moving, .failed(.commandFailed)])
+    }
+
     func testObstacleAtTargetCountsAsArrived() {
         let state = NavigationController.stateAfterObstacleStop(
             pose: Pose2D(position: Vec2(0.4, 0), yaw: 0),

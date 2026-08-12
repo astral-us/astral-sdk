@@ -1,6 +1,12 @@
 import Foundation
 import RoverNav
 
+public enum NavigationSafetyState: Equatable, Sendable {
+    case idle
+    case moving
+    case failed(NavigationFailure)
+}
+
 /// Autonomy orchestrator. Runs the closed loop:
 ///
 ///   ARKit pose ─┐
@@ -19,6 +25,7 @@ public final class NavigationController {
 
     public private(set) var state: State = .idle
     public private(set) var path: [Vec2] = []
+    public private(set) var safetyState: NavigationSafetyState = .idle
 
     private let currentPose: () -> Pose2D?
     private let currentForwardClearance: () -> Double
@@ -39,6 +46,18 @@ public final class NavigationController {
     private var operationGeneration: UInt = 0
     private var replanCounter = 0
     private var activePolicy: (any PathAdmissibilityPolicy)?
+    private var safetyStateContinuations: [UUID: AsyncStream<NavigationSafetyState>.Continuation] = [:]
+
+    public func safetyStates() -> AsyncStream<NavigationSafetyState> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            safetyStateContinuations[id] = continuation
+            continuation.yield(safetyState)
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { @MainActor in self?.safetyStateContinuations[id] = nil }
+            }
+        }
+    }
 
     public init(ar: ARSessionManager, control: RoverControl) {
         let planner = AStarPlanner()
@@ -127,6 +146,7 @@ public final class NavigationController {
             "target_stop_clearance": stoppingAtForwardClearance.map(Self.formatMeters) ?? "none"
         ])
         state = .driving
+        publishSafetyState(.moving)
         let task = Task { await drive(to: goal, stoppingAtForwardClearance: stoppingAtForwardClearance) }
         loop = task
         return task
@@ -154,6 +174,7 @@ public final class NavigationController {
         }
         let targetYaw = normalizeAngle(startYaw + angle)
         state = .driving
+        publishSafetyState(.moving)
         let task = Task { await performRotate(to: targetYaw, mode: .continuous) }
         loop = task
         return await task.value
@@ -167,10 +188,12 @@ public final class NavigationController {
         operationGeneration &+= 1
         guard let startYaw = currentPose()?.yaw else {
             state = .failed("No ARKit pose yet — move the device to establish tracking.")
+            publishSafetyState(.failed(.noPose))
             return
         }
         let targetYaw = normalizeAngle(startYaw + angle)
         state = .driving
+        publishSafetyState(.moving)
         let task = Task { await performRotate(to: targetYaw, mode: .scan) }
         loop = task
         _ = await task.value
@@ -188,6 +211,7 @@ public final class NavigationController {
         // `state` at `.driving` forever, so anything polling `state == .driving` to know
         // when motion has settled never returns.
         state = .idle
+        publishSafetyState(.idle)
     }
 
     public func cancelAndWait() async {
@@ -202,6 +226,7 @@ public final class NavigationController {
         activePolicy = nil
         path = []
         state = .idle
+        publishSafetyState(.idle)
     }
 
     // MARK: - Loop
@@ -266,6 +291,7 @@ public final class NavigationController {
             case .stopObstacle(let clearance):
                 try? await stopRover()
                 state = Self.stateAfterObstacleStop(pose: pose, goal: goal, clearance: clearance)
+                if case .failed = state { publishSafetyState(.failed(.obstacle)) }
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "obstacle",
                     "clearance": String(format: "%.2f", clearance),
@@ -341,6 +367,7 @@ public final class NavigationController {
                 ]) { current, _ in current })
                 try? await stopRover()
                 state = Self.stateAfterCommandFailure(error)
+                publishSafetyState(.failed(.commandFailed))
                 RuntimeFileLog.append("nav_command_failed", fields: [
                     "error": error.localizedDescription,
                     "state": state.description
@@ -402,6 +429,7 @@ public final class NavigationController {
             case .stopObstacle(let clearance):
                 try? await stopRover()
                 state = .failed(Self.obstacleMessage(clearance: clearance))
+                publishSafetyState(.failed(.obstacle))
                 RuntimeFileLog.append("nav_safety_stop", fields: [
                     "reason": "obstacle_while_rotating",
                     "clearance": String(format: "%.2f", clearance)
@@ -453,6 +481,7 @@ public final class NavigationController {
             } catch {
                 try? await stopRover()
                 state = Self.stateAfterCommandFailure(error)
+                publishSafetyState(.failed(.commandFailed))
                 RuntimeFileLog.append("nav_command_failed", fields: [
                     "error": error.localizedDescription,
                     "state": state.description
@@ -479,11 +508,20 @@ public final class NavigationController {
         switch result {
         case .arrived:
             state = .arrived
+            publishSafetyState(.idle)
         case .cancelled:
             state = .idle
+            publishSafetyState(.idle)
         case .failed(let failure):
             state = .failed(Self.message(for: failure))
+            publishSafetyState(.failed(failure))
         }
+    }
+
+    private func publishSafetyState(_ newState: NavigationSafetyState) {
+        guard safetyState != newState else { return }
+        safetyState = newState
+        for continuation in safetyStateContinuations.values { continuation.yield(newState) }
     }
 
     private static func message(for failure: NavigationFailure) -> String {

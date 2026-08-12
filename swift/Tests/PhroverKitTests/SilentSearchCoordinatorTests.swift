@@ -622,6 +622,24 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertNil(terminal.fields["image"])
     }
 
+    func testTransportFailureTerminatesWhileOpticalExchangeIsWaiting() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 7)
+        harness.optical.suspendPresent = true
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        harness.calibration.send(.accepted(try frame(generation: 7)))
+        await eventually { coordinator.phase == .handshake(.ready) }
+        XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.phase == .handshake(.presenting) }
+
+        harness.safety.send(.transportFailed)
+
+        await eventually { coordinator.phase == .terminal(.safetyFailure(.transport)) }
+        XCTAssertEqual(harness.motion.stopCount, 1)
+    }
+
     func testTransitionTableAcceptsLegalEdgesAndRejectsIllegalEdges() throws {
         let coordinator = SilentSearchTestHarness().coordinator()
 

@@ -231,7 +231,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
             explorer: explorer,
             targetObserver: target,
             motion: motion,
-            safety: LiveSilentSearchSafetyMonitor(ar: ar),
+            safety: LiveSilentSearchSafetyMonitor(ar: ar, navigation: navigation, control: control),
             events: events
         ))
         frameProvider.coordinator = coordinator
@@ -593,8 +593,27 @@ final class LiveTargetObserver: SilentSearchTargetObserving {
 
 @MainActor
 final class LiveSilentSearchSafetyMonitor: SilentSearchSafetyMonitoring {
-    private let ar: ARSessionManager
-    init(ar: ARSessionManager) { self.ar = ar }
+    private let snapshots: () -> AsyncStream<ARFrameSnapshot>
+    private let lifecycleEvents: () -> AsyncStream<ARSessionLifecycleEvent>
+    private let navigationStates: () async -> AsyncStream<NavigationSafetyState>
+    private let commandLinkReadiness: () async -> AsyncStream<RoverCommandLinkReadiness>
+
+    init(ar: ARSessionManager, navigation: NavigationController, control: RoverControl) {
+        snapshots = { ar.snapshots() }
+        lifecycleEvents = { ar.lifecycleEvents() }
+        navigationStates = { navigation.safetyStates() }
+        commandLinkReadiness = { await control.commandLinkReadiness() }
+    }
+
+    init(
+        navigationStates: @escaping () async -> AsyncStream<NavigationSafetyState>,
+        commandLinkReadiness: @escaping () async -> AsyncStream<RoverCommandLinkReadiness>
+    ) {
+        snapshots = { AsyncStream { $0.finish() } }
+        lifecycleEvents = { AsyncStream { $0.finish() } }
+        self.navigationStates = navigationStates
+        self.commandLinkReadiness = commandLinkReadiness
+    }
 
     static func safetyEvent(for lifecycle: ARSessionLifecycleEvent) -> SilentSearchSafetyEvent? {
         switch lifecycle {
@@ -606,23 +625,52 @@ final class LiveSilentSearchSafetyMonitor: SilentSearchSafetyMonitoring {
 
     func events() -> AsyncStream<SilentSearchSafetyEvent> {
         AsyncStream { continuation in
-            let snapshots = Task { @MainActor [ar] in
-                for await snapshot in ar.snapshots() {
+            var emittedTransportFailure = false
+            var emittedReactiveSafetyFailure = false
+            func yield(_ event: SilentSearchSafetyEvent) {
+                if event == .transportFailed {
+                    guard !emittedTransportFailure else { return }
+                    emittedTransportFailure = true
+                } else if event == .reactiveSafetyFailed {
+                    guard !emittedReactiveSafetyFailure else { return }
+                    emittedReactiveSafetyFailure = true
+                }
+                continuation.yield(event)
+            }
+            let snapshots = Task { @MainActor [snapshots] in
+                for await snapshot in snapshots() {
                     switch snapshot.trackingQuality {
-                    case .normal: continuation.yield(.trackingNormal(generation: snapshot.id.generation))
+                    case .normal: yield(.trackingNormal(generation: snapshot.id.generation))
                     case .limited, .unavailable:
-                        continuation.yield(.trackingLimited(generation: snapshot.id.generation))
+                        yield(.trackingLimited(generation: snapshot.id.generation))
                     }
                 }
             }
-            let lifecycle = Task { @MainActor [ar] in
-                for await event in ar.lifecycleEvents() {
-                    if let event = Self.safetyEvent(for: event) { continuation.yield(event) }
+            let lifecycle = Task { @MainActor [lifecycleEvents] in
+                for await event in lifecycleEvents() {
+                    if let event = Self.safetyEvent(for: event) { yield(event) }
+                }
+            }
+            let navigation = Task { @MainActor [navigationStates] in
+                for await state in await navigationStates() {
+                    guard case let .failed(failure) = state else { continue }
+                    switch failure {
+                    case .commsLost, .commandFailed: yield(.transportFailed)
+                    case .obstacle, .tipping, .stalled: yield(.reactiveSafetyFailed)
+                    case .noPose, .noPath, .pathRejected, .trackingLost, .cancelled: break
+                    }
+                }
+            }
+            let commandLink = Task { @MainActor [commandLinkReadiness] in
+                for await readiness in await commandLinkReadiness() where readiness == .unavailable {
+                    yield(.transportFailed)
                 }
             }
             continuation.onTermination = { @Sendable _ in
                 snapshots.cancel()
                 lifecycle.cancel()
+                navigation.cancel()
+                commandLink.cancel()
             }
         }
     }
