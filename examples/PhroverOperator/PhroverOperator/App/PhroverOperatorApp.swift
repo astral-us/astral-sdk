@@ -11,36 +11,85 @@ import PhroverCloud
 /// straight to manual/voice driving using only on-device intelligence.
 @main
 struct PhroverOperatorApp: App {
-    @State private var ar: ARSessionManager
-    @State private var control: RoverControl
-    @State private var nav: NavigationController
-    @State private var cloud: CloudSession?
+    private enum Runtime {
+        case scripted(ScriptedSilentSearchViewModel)
+        case live(LiveAppRuntime)
+    }
+
+    @State private var runtime: Runtime
 
     init() {
-        let ar = ARSessionManager()
-        let control = RoverControl()
-        _ar = State(initialValue: ar)
-        _control = State(initialValue: control)
-        _nav = State(initialValue: NavigationController(ar: ar, control: control))
-        _cloud = State(initialValue: CloudSession.loadIfConfigured(ar: ar, nav: nav))
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-ui-testing"),
+           let index = arguments.firstIndex(of: "-silent-search-scenario"),
+           arguments.indices.contains(index + 1),
+           let scenario = SilentSearchLaunchScenario(rawValue: arguments[index + 1]) {
+            _runtime = State(initialValue: .scripted(ScriptedSilentSearchViewModel(scenario: scenario)))
+        } else {
+            _runtime = State(initialValue: .live(LiveAppRuntime()))
+        }
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView(ar: ar, control: control, nav: nav, cloud: cloud)
-                .task {
-                    ar.start()
-                    Task {
-                        do {
-                            try await control.enableFeedbackFlow()
-                            RuntimeFileLog.append("feedback_flow_enabled")
-                        } catch {
-                            RuntimeFileLog.append("feedback_flow_failed", fields: [
-                                "error": error.localizedDescription
-                            ])
-                        }
-                    }
+            switch runtime {
+            case let .scripted(viewModel):
+                TabView {
+                    SilentSearchView(viewModel: viewModel)
+                        .tabItem { Label("Silent Search", systemImage: "qrcode.viewfinder") }
+                        .accessibilityIdentifier("silent_search_tab")
                 }
+            case let .live(live):
+                RootView(
+                    ar: live.ar, control: live.control, nav: live.nav,
+                    cloud: live.cloud, silentSearch: live.silentSearch
+                )
+                .task { await live.start() }
+            }
+        }
+    }
+}
+
+@Observable
+@MainActor
+final class LiveAppRuntime {
+    let ar: ARSessionManager
+    let control: RoverControl
+    let nav: NavigationController
+    let cloud: CloudSession?
+    private(set) var silentSearch: LiveSilentSearchViewModel?
+    private var started = false
+
+    init() {
+        let ar = ARSessionManager()
+        let control = RoverControl()
+        let nav = NavigationController(ar: ar, control: control)
+        self.ar = ar
+        self.control = control
+        self.nav = nav
+        cloud = CloudSession.loadIfConfigured(ar: ar, nav: nav)
+    }
+
+    func start() async {
+        guard !started else { return }
+        started = true
+        ar.start()
+        async let feedback: Void = enableFeedback()
+        let detector = await Detector()
+        silentSearch = LiveSilentSearchViewModel.compose(
+            ar: ar, control: control, navigation: nav, detector: detector
+        )
+        await feedback
+    }
+
+    private func enableFeedback() async {
+        do {
+            try await control.enableFeedbackFlow()
+            RuntimeFileLog.append("feedback_flow_enabled")
+        } catch {
+            RuntimeFileLog.append("feedback_flow_failed", fields: [
+                "error": error.localizedDescription
+            ])
         }
     }
 }
@@ -96,6 +145,7 @@ struct RootView: View {
     let control: RoverControl
     let nav: NavigationController
     let cloud: CloudSession?
+    let silentSearch: LiveSilentSearchViewModel?
 
     var body: some View {
         Group {
@@ -121,6 +171,11 @@ struct RootView: View {
                 .tabItem { Label("Navigate", systemImage: "map") }
             ConversationView(ar: ar, nav: nav, cloudBrain: cloud?.brain)
                 .tabItem { Label("Talk", systemImage: "bubble.left.and.bubble.right") }
+            if let silentSearch {
+                SilentSearchView(viewModel: silentSearch)
+                    .tabItem { Label("Silent Search", systemImage: "qrcode.viewfinder") }
+                    .accessibilityIdentifier("silent_search_tab")
+            }
         }
     }
 }
