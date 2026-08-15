@@ -156,6 +156,28 @@ final class OpticalExchangeServiceTests: XCTestCase {
         }
     }
 
+    func testVisionPayloadPrefersDecodedTextOverRawSymbolBytes() {
+        let rawSymbolBytes = Data([0x00, 0xFF, 0x01])
+
+        let payload = OpticalQRCodeScanner.preferredPayload(
+            decodedString: "PHROVER-CAL|1|SILENT_SEARCH_01",
+            rawData: rawSymbolBytes
+        )
+
+        XCTAssertEqual(payload, Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8))
+    }
+
+    func testVisionPayloadFallsBackToRawBytesForBinaryQRCode() {
+        let rawSymbolBytes = Data([0x00, 0xFF, 0x01])
+
+        let payload = OpticalQRCodeScanner.preferredPayload(
+            decodedString: nil,
+            rawData: rawSymbolBytes
+        )
+
+        XCTAssertEqual(payload, rawSymbolBytes)
+    }
+
     func testGeneratedQRRoundTripsCanonicalGoldenAndLargestPayloads() throws {
         let codec = OpticalMessageCodec()
         let payloads = try (goldenMessages() + [largestStatus(), largestDecision()]).map(codec.encode)

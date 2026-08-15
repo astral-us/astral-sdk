@@ -100,6 +100,8 @@ public struct OpticalProtocolSession: Sendable {
     private var convergenceRelease: Int64?
     private var convergenceHash: String?
 
+    private static let maximumHandshakeClockDifferenceMilliseconds: Int64 = 15_000
+
     public init(context: OpticalProtocolContext, events: (any SilentSearchEventSink)? = nil) {
         self.context = context
         self.events = events
@@ -262,7 +264,7 @@ public struct OpticalProtocolSession: Sendable {
     private func validateIncoming(_ message: OpticalMessage, at now: Int64) throws {
         switch message.body {
         case let .offer(value):
-            guard absDifference(now, message.timestampMilliseconds) <= 2_000 else {
+            guard absDifference(now, message.timestampMilliseconds) <= Self.maximumHandshakeClockDifferenceMilliseconds else {
                 throw OpticalProtocolRejection.clockDisagreement
             }
             guard message.role == .a else { throw OpticalProtocolRejection.wrongRole }
@@ -271,7 +273,7 @@ public struct OpticalProtocolSession: Sendable {
             guard message.role == .b else { throw OpticalProtocolRejection.wrongRole }
             guard value.offerHash == offerHash else { throw OpticalProtocolRejection.invalidLinkedHash }
             guard value.roverBWallTimeMilliseconds == message.timestampMilliseconds,
-                  absDifference(now, value.roverBWallTimeMilliseconds) <= 2_000 else {
+                  absDifference(now, value.roverBWallTimeMilliseconds) <= Self.maximumHandshakeClockDifferenceMilliseconds else {
                 throw OpticalProtocolRejection.clockDisagreement
             }
         case let .searchCommit(value):

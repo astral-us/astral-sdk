@@ -271,6 +271,10 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
         return request.results ?? []
     }
 
+    nonisolated static func preferredPayload(decodedString: String?, rawData: Data?) -> Data? {
+        decodedString.map { Data($0.utf8) } ?? rawData
+    }
+
     private func observations(
         from results: [VNBarcodeObservation],
         frame: OpticalFrame,
@@ -278,7 +282,10 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
     ) -> [OpticalObservation] {
         results.compactMap { observation in
             guard observation.symbology == .qr,
-                  let payload = observation.payloadData ?? observation.payloadStringValue.map({ Data($0.utf8) }) else {
+                  let payload = Self.preferredPayload(
+                      decodedString: observation.payloadStringValue,
+                      rawData: observation.payloadData
+                  ) else {
                 return nil
             }
             return OpticalObservation(
