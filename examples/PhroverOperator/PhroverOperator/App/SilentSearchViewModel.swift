@@ -3,6 +3,7 @@ import Observation
 import PhroverKit
 import RoverNav
 import SwiftUI
+import UIKit
 
 enum SilentSearchOperatorPhase: Equatable {
     case setup
@@ -31,6 +32,10 @@ protocol SilentSearchViewModel: AnyObject, Observable {
     var detail: String { get }
     var readinessItems: [(String, Bool)] { get }
     var calibrationProgress: Int { get }
+    var calibrationPreviewImage: UIImage? { get }
+    var calibrationVisualState: SilentSearchCalibrationVisualState { get }
+    var calibrationProjection: CalibrationViewProjection { get }
+    var calibrationGuidance: String { get }
     var qrImage: CGImage? { get }
     var opticalTimedOut: Bool { get }
     var failureReason: String? { get }
@@ -43,11 +48,16 @@ protocol SilentSearchViewModel: AnyObject, Observable {
     func retry()
     func abort()
     func stop()
+    func startCalibrationPreview()
+    func stopCalibrationPreview()
 }
 
 enum SilentSearchLaunchScenario: String, CaseIterable {
     case setupNotReady = "setup-not-ready"
     case calibrating
+    case calibrationQRDetected = "calibration-qr-detected"
+    case calibrationGroundingFailed = "calibration-grounding-failed"
+    case calibrationSampleAccepted = "calibration-sample-accepted"
     case displayOffer = "display-offer"
     case displayTimeout = "display-timeout"
     case scanTimeout = "scan-timeout"
@@ -71,11 +81,31 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     private(set) var phase: SilentSearchOperatorPhase
     private(set) var opticalTimedOut = false
     private(set) var failureReason: String?
+    private(set) var calibrationVisualState = SilentSearchCalibrationVisualState()
 
     init(scenario: SilentSearchLaunchScenario) {
         switch scenario {
         case .setupNotReady: phase = .setup
-        case .calibrating: phase = .calibrating
+        case .calibrating:
+            phase = .calibrating
+        case .calibrationQRDetected:
+            phase = .calibrating
+            calibrationVisualState.qrDecoded = true
+            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
+            calibrationVisualState.currentCorners = Self.previewCorners
+        case .calibrationGroundingFailed:
+            phase = .calibrating
+            calibrationVisualState.qrDecoded = true
+            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
+            calibrationVisualState.currentCorners = Self.previewCorners
+            calibrationVisualState.currentIssue = .groundingFailure(.cornerUnavailable(.topLeft))
+        case .calibrationSampleAccepted:
+            phase = .calibrating
+            calibrationVisualState.qrDecoded = true
+            calibrationVisualState.cornersGrounded = true
+            calibrationVisualState.sampleAccepted = true
+            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
+            calibrationVisualState.currentCorners = Self.previewCorners
         case .displayOffer: phase = .displayingQR
         case .displayTimeout:
             phase = .displayingQR
@@ -137,6 +167,14 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     }
 
     var calibrationProgress: Int { phase == .calibrating ? 1 : 0 }
+    var calibrationPreviewImage: UIImage? {
+        guard phase == .calibrating else { return nil }
+        return UIImage(systemName: "camera.metering.center.weighted")
+    }
+    var calibrationProjection: CalibrationViewProjection {
+        CalibrationViewProjection(state: calibrationVisualState)
+    }
+    var calibrationGuidance: String { calibrationProjection.guidance }
 
     var qrImage: CGImage? {
         guard phase == .displayingQR else { return nil }
@@ -152,13 +190,22 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     func completeQRPresentation() { phase = .scanning }
     func retry() { opticalTimedOut = false }
     func abort() {
+        calibrationVisualState = SilentSearchCalibrationVisualState()
         phase = .terminalFailure
         failureReason = "Mission aborted by operator."
     }
     func stop() {
+        calibrationVisualState = SilentSearchCalibrationVisualState()
         phase = .terminalFailure
         failureReason = "Mission stopped by operator."
     }
+    func startCalibrationPreview() {}
+    func stopCalibrationPreview() {}
+
+    private static let previewCorners = OrientedMarkerCorners(
+        topLeft: Vec2(0.2, 0.8), topRight: Vec2(0.8, 0.8),
+        bottomLeft: Vec2(0.2, 0.2), bottomRight: Vec2(0.8, 0.2)
+    )
 }
 
 @MainActor
@@ -180,10 +227,12 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     private let explorer: LiveSectorExplorer
     private let motion: LiveSilentSearchMotion
     private let targetObserver: LiveTargetObserver
+    private let calibrationPreview: CalibrationPreviewModel
 
     init(coordinator: SilentSearchCoordinator, environment: SilentSearchDeviceEnvironment,
          presentation: LiveOpticalPresentation, explorer: LiveSectorExplorer,
          motion: LiveSilentSearchMotion, targetObserver: LiveTargetObserver,
+         calibrationPreview: CalibrationPreviewModel,
          targetLabel: String) {
         self.targetLabel = targetLabel
         self.coordinator = coordinator
@@ -192,6 +241,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         self.explorer = explorer
         self.motion = motion
         self.targetObserver = targetObserver
+        self.calibrationPreview = calibrationPreview
         coordinator.missionDidChange = { [weak self] mission in
             guard let self else { return }
             self.role = mission.role
@@ -237,7 +287,9 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         frameProvider.coordinator = coordinator
         return LiveSilentSearchViewModel(
             coordinator: coordinator, environment: environment, presentation: presentation,
-            explorer: explorer, motion: motion, targetObserver: target, targetLabel: targetLabel
+            explorer: explorer, motion: motion, targetObserver: target,
+            calibrationPreview: CalibrationPreviewModel(frames: { ar.snapshots() }),
+            targetLabel: targetLabel
         )
     }
 
@@ -309,6 +361,15 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     }
 
     var calibrationProgress: Int { coordinator.calibrationProgress }
+    var calibrationPreviewImage: UIImage? { calibrationPreview.image }
+    var calibrationVisualState: SilentSearchCalibrationVisualState { coordinator.calibrationVisualState }
+    var calibrationProjection: CalibrationViewProjection {
+        CalibrationViewProjection(
+            state: calibrationVisualState,
+            expectedMarkerID: coordinator.mission?.markerID ?? "SILENT_SEARCH_01"
+        )
+    }
+    var calibrationGuidance: String { calibrationProjection.guidance }
     var supportedTargetLabels: [String] { environment.supportedTargetLabels }
     var qrImage: CGImage? {
         guard phase == .displayingQR, let payload = presentation.payload else { return nil }
@@ -382,8 +443,19 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
 
     func completeQRPresentation() { presentation.complete() }
     func retry() { _ = coordinator.retryOpticalExchange() }
-    func abort() { Task { await coordinator.abort() } }
-    func stop() { Task { await coordinator.stop() } }
+    func abort() {
+        calibrationPreview.stop()
+        Task { await coordinator.abort() }
+    }
+    func stop() {
+        calibrationPreview.stop()
+        Task { await coordinator.stop() }
+    }
+    func startCalibrationPreview() {
+        guard phase == .calibrating else { return }
+        calibrationPreview.start()
+    }
+    func stopCalibrationPreview() { calibrationPreview.stop() }
 
     private static func failureMessage(_ result: SilentSearchTerminalResult) -> String? {
         switch result {

@@ -50,9 +50,13 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
                                            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4))
         )
 
-        let grounded = try XCTUnwrap(ARSharedMissionFrameCalibrator.ground(
-            observation: observation, in: snapshot, expectedMarkerID: "SILENT_SEARCH_01"
-        ))
+        let result = ARSharedMissionFrameCalibrator.ground(
+            observation: observation, in: snapshot, expectedMarkerID: "SILENT_SEARCH_01",
+            sessionGeneration: 7
+        )
+        guard case let .success(grounded) = result else {
+            return XCTFail("Expected grounded observation, got \(result)")
+        }
 
         XCTAssertEqual(grounded.sessionGeneration, 7)
         XCTAssertEqual(grounded.frameID, 3)
@@ -62,44 +66,262 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         XCTAssertEqual(grounded.corners.topRight.x, 0.1, accuracy: 0.001)
     }
 
-    func testRejectsMismatchedFrameMarkerAndMissingCornerDepth() {
-        let snapshot = makeSnapshot(generation: 7, sequence: 3, missingTopLeftDepth: true)
+    func testGroundingFailuresHaveDeterministicValidationPrecedence() {
+        let snapshot = makeSnapshot(generation: 7, sequence: 3, missingCorner: .topLeft)
         let corners = OrientedMarkerCorners(topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
-                                            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4))
-        XCTAssertNil(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
-            payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8), frameID: 2,
+                                             bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4))
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
+            payload: Data([0xFF]), frameID: 2,
             monotonicTimestamp: 1, corners: corners
-        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01"))
-        XCTAssertNil(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
+        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7), .failure(.frameMismatch))
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
+            payload: Data([0xFF]), frameID: 3,
+            monotonicTimestamp: 1, corners: corners
+        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7), .failure(.timestampMismatch))
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
+            payload: Data([0xFF]), frameID: 3,
+            monotonicTimestamp: 4.5, corners: corners
+        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7), .failure(.invalidPayload))
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
             payload: Data("PHROVER-CAL|1|OTHER".utf8), frameID: 3,
-            monotonicTimestamp: 1, corners: corners
-        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01"))
-        XCTAssertNil(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
+            monotonicTimestamp: 4.5, corners: corners
+        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7), .failure(.wrongMarkerID))
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(observation: OpticalObservation(
             payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8), frameID: 3,
-            monotonicTimestamp: 1, corners: corners
-        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01"))
+            monotonicTimestamp: 4.5, corners: corners
+        ), in: snapshot, expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7),
+                       .failure(.cornerUnavailable(.topLeft)))
+
+        let validObservation = OpticalObservation(
+            payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8), frameID: 3,
+            monotonicTimestamp: 4.5, corners: corners
+        )
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(
+            observation: validObservation,
+            in: makeSnapshot(generation: 7, sequence: 3, trackingQuality: .limited),
+            expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7
+        ), .failure(.trackingNotNormal))
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(
+            observation: validObservation, in: makeSnapshot(generation: 7, sequence: 3),
+            expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 8
+        ), .failure(.generationMismatch))
+        XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(
+            observation: validObservation,
+            in: makeSnapshot(generation: 7, sequence: 3, includesDepth: false),
+            expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7
+        ), .failure(.missingDepthMap))
+        for corner in [SilentSearchCalibrationCorner.topRight, .bottomLeft, .bottomRight] {
+            XCTAssertEqual(ARSharedMissionFrameCalibrator.ground(
+                observation: validObservation,
+                in: makeSnapshot(generation: 7, sequence: 3, missingCorner: corner),
+                expectedMarkerID: "SILENT_SEARCH_01", sessionGeneration: 7
+            ), .failure(.cornerUnavailable(corner)))
+        }
     }
 
-    private func makeSnapshot(generation: UInt64, sequence: UInt64,
-                              missingTopLeftDepth: Bool = false) -> ARFrameSnapshot {
+    func testExpectedMarkerFeedbackPrecedesGroundingFailureForTheSameFrame() async {
+        let manager = ARSessionManager()
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { frame in
+            [OpticalObservation(
+                payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                corners: corners
+            )]
+        }
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let received = Task { () -> [SilentSearchCalibrationEvent] in
+            var events: [SilentSearchCalibrationEvent] = []
+            for await event in stream {
+                events.append(event)
+                if events.count == 2 { break }
+            }
+            return events
+        }
+        await Task.yield()
+
+        manager.ingestForTesting(
+            image: makeImage(), timestamp: 2, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 100, height: 100),
+            depthMap: nil, trackingQuality: .normal
+        )
+
+        let frameID = ARFrameID(generation: 0, sequence: 1)
+        let events = await received.value
+        XCTAssertEqual(events, [
+            .feedback(.expectedMarkerDetected(
+                frameID: frameID, monotonicTimestamp: 2,
+                markerID: "SILENT_SEARCH_01", corners: corners
+            )),
+            .feedback(.groundingFailed(
+                frameID: frameID, monotonicTimestamp: 2, reason: .missingDepthMap
+            )),
+        ])
+    }
+
+    func testAllCornersGroundedFeedbackPrecedesCalibrationProgress() async {
+        let manager = ARSessionManager()
+        let snapshot = makeSnapshot(generation: 0, sequence: 1)
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { frame in
+            [OpticalObservation(
+                payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                corners: corners
+            )]
+        }
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let received = Task { () -> [SilentSearchCalibrationEvent] in
+            var events: [SilentSearchCalibrationEvent] = []
+            for await event in stream {
+                events.append(event)
+                if events.count == 3 { break }
+            }
+            return events
+        }
+        await Task.yield()
+
+        manager.ingestForTesting(
+            image: snapshot.image, timestamp: 4.5, cameraTransform: snapshot.cameraTransform,
+            intrinsics: snapshot.cameraIntrinsics, imageResolution: snapshot.imageResolution,
+            depthMap: snapshot.depthMap, trackingQuality: .normal
+        )
+
+        let events = await received.value
+        XCTAssertEqual(events[0], .feedback(.expectedMarkerDetected(
+            frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 4.5,
+            markerID: "SILENT_SEARCH_01", corners: corners
+        )))
+        XCTAssertEqual(events[1], .feedback(.allCornersGrounded(
+            frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 4.5
+        )))
+        XCTAssertEqual(events[2], .progress(acceptedFrameCount: 1))
+    }
+
+    func testScannerFailuresAreExplicitAndConsecutiveFailuresAreDeduplicated() async {
+        enum ScannerFailure: Error { case failed }
+        let manager = ARSessionManager()
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { _ in
+            throw ScannerFailure.failed
+        }
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let first = Task { () -> SilentSearchCalibrationEvent? in
+            for await event in stream { return event }
+            return nil
+        }
+        await Task.yield()
+
+        for timestamp in [1.0, 2.0] {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: timestamp, cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+                trackingQuality: .normal
+            )
+        }
+
+        let event = await first.value
+        XCTAssertEqual(event, .feedback(.scannerFailed(
+            frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
+        )))
+        await taskTurn()
+        calibrator.cancel()
+    }
+
+    func testQRLossEmitsOnceAfterHalfASecondAndDetectionCanResume() async {
+        let manager = ARSessionManager()
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { frame in
+            guard frame.monotonicTimestamp == 1 || frame.monotonicTimestamp == 2 else { return [] }
+            return [OpticalObservation(
+                payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                corners: corners
+            )]
+        }
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let received = Task { () -> [SilentSearchCalibrationEvent] in
+            var events: [SilentSearchCalibrationEvent] = []
+            for await event in stream {
+                events.append(event)
+                if events.count == 4 { break }
+            }
+            return events
+        }
+        await Task.yield()
+
+        for timestamp in [1.0, 1.4, 1.5, 1.8, 2.0] {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: timestamp, cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+                trackingQuality: .normal
+            )
+            await Task.yield()
+        }
+
+        let events = await received.value
+        XCTAssertEqual(events, [
+            .feedback(.expectedMarkerDetected(
+                frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1,
+                markerID: "SILENT_SEARCH_01", corners: corners
+            )),
+            .feedback(.groundingFailed(
+                frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1,
+                reason: .missingDepthMap
+            )),
+            .feedback(.qrLost(
+                frameID: ARFrameID(generation: 0, sequence: 3), monotonicTimestamp: 1.5
+            )),
+            .feedback(.expectedMarkerDetected(
+                frameID: ARFrameID(generation: 0, sequence: 5), monotonicTimestamp: 2,
+                markerID: "SILENT_SEARCH_01", corners: corners
+            )),
+        ])
+    }
+
+    private func makeSnapshot(
+        generation: UInt64,
+        sequence: UInt64,
+        missingCorner: SilentSearchCalibrationCorner? = nil,
+        includesDepth: Bool = true,
+        trackingQuality: ARTrackingQuality = .normal
+    ) -> ARFrameSnapshot {
         let image = makeImage()
         var depth: CVPixelBuffer?
-        CVPixelBufferCreate(kCFAllocatorDefault, 10, 10, kCVPixelFormatType_DepthFloat32, nil, &depth)
-        CVPixelBufferLockBaseAddress(depth!, [])
-        let stride = CVPixelBufferGetBytesPerRow(depth!) / MemoryLayout<Float>.size
-        let values = CVPixelBufferGetBaseAddress(depth!)!.assumingMemoryBound(to: Float.self)
-        for y in 0..<10 {
-            for x in 0..<10 { values[y * stride + x] = y < 5 ? 2 : 2.2 }
+        if includesDepth {
+            CVPixelBufferCreate(kCFAllocatorDefault, 10, 10, kCVPixelFormatType_DepthFloat32, nil, &depth)
+            CVPixelBufferLockBaseAddress(depth!, [])
+            let stride = CVPixelBufferGetBytesPerRow(depth!) / MemoryLayout<Float>.size
+            let values = CVPixelBufferGetBaseAddress(depth!)!.assumingMemoryBound(to: Float.self)
+            for y in 0..<10 {
+                for x in 0..<10 { values[y * stride + x] = y < 5 ? 2 : 2.2 }
+            }
+            switch missingCorner {
+            case .topLeft: values[4 * stride + 4] = 0
+            case .topRight: values[4 * stride + 6] = 0
+            case .bottomLeft: values[6 * stride + 4] = 0
+            case .bottomRight: values[6 * stride + 6] = 0
+            case nil: break
+            }
+            CVPixelBufferUnlockBaseAddress(depth!, [])
         }
-        if missingTopLeftDepth { values[4 * stride + 4] = 0 }
-        CVPixelBufferUnlockBaseAddress(depth!, [])
         let intrinsics = simd_float3x3(columns: (
             SIMD3<Float>(200, 0, 0), SIMD3<Float>(0, 200, 0), SIMD3<Float>(50, 50, 1)
         ))
         return ARFrameSnapshot(id: ARFrameID(generation: generation, sequence: sequence), timestamp: 4.5,
             image: image, cameraTransform: matrix_identity_float4x4, cameraIntrinsics: intrinsics,
-            imageResolution: CGSize(width: 100, height: 100), depthMap: depth!,
-            pose: Pose2D(position: Vec2(0, 0), yaw: 0), trackingQuality: .normal)
+            imageResolution: CGSize(width: 100, height: 100), depthMap: depth,
+            pose: Pose2D(position: Vec2(0, 0), yaw: 0), trackingQuality: trackingQuality)
     }
 
     private func makeImage() -> CVPixelBuffer {

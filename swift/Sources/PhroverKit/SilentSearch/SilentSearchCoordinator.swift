@@ -9,6 +9,7 @@ public final class SilentSearchCoordinator {
     public private(set) var readiness: SilentSearchReadiness
     public private(set) var sharedFrame: SharedMissionFrame?
     public private(set) var calibrationProgress = 0
+    public private(set) var calibrationVisualState = SilentSearchCalibrationVisualState()
     public private(set) var diagnostic: SilentSearchCoordinatorDiagnostic?
     public private(set) var targetConfirmation: TargetConfirmation?
     @ObservationIgnored public var missionDidChange: ((SilentSearchMission) -> Void)?
@@ -33,10 +34,18 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var convergenceTarget: MissionPoint?
     @ObservationIgnored private var scheduledSearchStart: SilentSearchInstant?
     @ObservationIgnored private var scheduledConvergenceRelease: SilentSearchInstant?
+    @ObservationIgnored private var calibrationMarkerPresent = false
+    @ObservationIgnored private var calibrationTelemetryState: CalibrationTelemetryState?
 
     private enum OpticalAction {
         case present(Data)
         case scan
+    }
+
+    private enum CalibrationTelemetryState: Equatable {
+        case scannerFailure
+        case groundingFailure(SilentSearchCalibrationGroundingFailure)
+        case cornersGrounded
     }
 
     private struct TrackingRecovery {
@@ -94,6 +103,9 @@ public final class SilentSearchCoordinator {
         do { try transition(to: .calibrating) }
         catch { return false }
         calibrationProgress = 0
+        calibrationVisualState = SilentSearchCalibrationVisualState()
+        calibrationMarkerPresent = false
+        calibrationTelemetryState = nil
         sharedFrame = nil
         diagnostic = nil
         let events = dependencies.calibration.events(
@@ -174,6 +186,9 @@ public final class SilentSearchCoordinator {
         partnerDeadlineTask?.cancel()
         partnerDeadlineTask = nil
         calibrationProgress = 0
+        calibrationVisualState = SilentSearchCalibrationVisualState()
+        calibrationMarkerPresent = false
+        calibrationTelemetryState = nil
         diagnostic = nil
         readiness = dependencies.readiness.snapshot
         try? transition(to: .setup)
@@ -195,8 +210,74 @@ public final class SilentSearchCoordinator {
     private func receiveCalibration(_ event: SilentSearchCalibrationEvent) -> Bool {
         guard phase == .calibrating else { return false }
         switch event {
+        case let .feedback(feedback):
+            switch feedback {
+            case let .expectedMarkerDetected(frameID, timestamp, markerID, corners):
+                calibrationVisualState.qrDecoded = true
+                calibrationVisualState.currentMarkerID = markerID
+                calibrationVisualState.currentCorners = corners
+                calibrationVisualState.lastDetectionTimestamp = timestamp
+                if !calibrationMarkerPresent {
+                    record("silent_search_qr_detected", fields: [
+                        "marker": markerID,
+                        "generation": "\(frameID.generation)",
+                        "frame_sequence": "\(frameID.sequence)",
+                    ])
+                    calibrationMarkerPresent = true
+                }
+            case let .qrLost(frameID, _):
+                calibrationVisualState.currentMarkerID = nil
+                calibrationVisualState.currentCorners = nil
+                calibrationVisualState.lastDetectionTimestamp = nil
+                if calibrationMarkerPresent {
+                    record("silent_search_qr_lost", fields: [
+                        "generation": "\(frameID.generation)",
+                        "frame_sequence": "\(frameID.sequence)",
+                    ])
+                    calibrationMarkerPresent = false
+                }
+            case let .scannerFailed(frameID, _):
+                calibrationVisualState.currentIssue = .scannerFailure
+                let state = CalibrationTelemetryState.scannerFailure
+                if calibrationTelemetryState != state {
+                    record("silent_search_grounding_failed", fields: [
+                        "generation": "\(frameID.generation)",
+                        "frame_sequence": "\(frameID.sequence)",
+                        "reason": "scanner_failure",
+                    ])
+                    calibrationTelemetryState = state
+                }
+            case let .groundingFailed(frameID, _, reason):
+                calibrationVisualState.currentIssue = .groundingFailure(reason)
+                let state = CalibrationTelemetryState.groundingFailure(reason)
+                if calibrationTelemetryState != state {
+                    var fields = [
+                        "generation": "\(frameID.generation)",
+                        "frame_sequence": "\(frameID.sequence)",
+                        "reason": Self.groundingReasonName(reason),
+                    ]
+                    if case let .cornerUnavailable(corner) = reason {
+                        fields["corner"] = Self.cornerName(corner)
+                    }
+                    record("silent_search_grounding_failed", fields: fields)
+                    calibrationTelemetryState = state
+                }
+            case let .allCornersGrounded(frameID, _):
+                calibrationVisualState.cornersGrounded = true
+                calibrationVisualState.currentIssue = nil
+                let state = CalibrationTelemetryState.cornersGrounded
+                if calibrationTelemetryState != state {
+                    record("silent_search_corners_grounded", fields: [
+                        "generation": "\(frameID.generation)",
+                        "frame_sequence": "\(frameID.sequence)",
+                    ])
+                    calibrationTelemetryState = state
+                }
+            }
+            return false
         case let .progress(count):
             calibrationProgress = count
+            calibrationVisualState.sampleAccepted = calibrationVisualState.sampleAccepted || count > 0
             diagnostic = nil
             record("silent_search_calibration_progress", fields: ["sample_count": "\(count)"])
             return false
@@ -212,6 +293,9 @@ public final class SilentSearchCoordinator {
             }
             sharedFrame = frame
             calibrationProgress = 3
+            calibrationVisualState = SilentSearchCalibrationVisualState()
+            calibrationMarkerPresent = false
+            calibrationTelemetryState = nil
             diagnostic = nil
             record("silent_search_calibration_accepted", fields: [
                 "generation": "\(frame.sessionGeneration)",
@@ -914,6 +998,9 @@ public final class SilentSearchCoordinator {
             partnerDeadlineTask?.cancel()
             partnerDeadlineTask = nil
             dependencies.calibration.cancel()
+            calibrationVisualState = SilentSearchCalibrationVisualState()
+            calibrationMarkerPresent = false
+            calibrationTelemetryState = nil
             dependencies.opticalExchange.cancel()
             await dependencies.motion.stop()
             safetyListenerTask?.cancel()
@@ -1079,6 +1166,30 @@ public final class SilentSearchCoordinator {
             true
         default:
             false
+        }
+    }
+
+    private static func groundingReasonName(
+        _ reason: SilentSearchCalibrationGroundingFailure
+    ) -> String {
+        switch reason {
+        case .trackingNotNormal: "tracking_not_normal"
+        case .generationMismatch: "generation_mismatch"
+        case .frameMismatch: "frame_mismatch"
+        case .timestampMismatch: "timestamp_mismatch"
+        case .invalidPayload: "invalid_payload"
+        case .wrongMarkerID: "wrong_marker_id"
+        case .missingDepthMap: "missing_depth_map"
+        case .cornerUnavailable: "corner_unavailable"
+        }
+    }
+
+    private static func cornerName(_ corner: SilentSearchCalibrationCorner) -> String {
+        switch corner {
+        case .topLeft: "top_left"
+        case .topRight: "top_right"
+        case .bottomLeft: "bottom_left"
+        case .bottomRight: "bottom_right"
         }
     }
 

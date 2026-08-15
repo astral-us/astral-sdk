@@ -22,9 +22,57 @@ final class SilentSearchUITests: XCTestCase {
         let app = XCUIApplication.launchingSilentSearch(scenario: "calibrating")
 
         XCTAssertTrue(app.staticTexts["Calibration 1 of 3"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.otherElements["silent_search_calibration_preview"].exists)
+        XCTAssertEqual(app.otherElements["silent_search_calibration_qr_stage"].value as? String, "Pending")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_grounding_stage"].value as? String, "Waiting")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_sample_stage"].value as? String, "Waiting")
+        XCTAssertEqual(
+            app.staticTexts["silent_search_calibration_guidance"].label,
+            "Center the complete marker with its white border visible."
+        )
+        XCTAssertEqual(app.staticTexts["silent_search_calibration_progress"].label, "1 of 3")
         XCTAssertFalse(app.buttons["silent_search_start"].exists)
         XCTAssertFalse(app.otherElements["silent_search_qr"].exists)
         XCTAssertFalse(app.otherElements["silent_search_scanner"].exists)
+    }
+
+    func testCalibrationPreviewAppearsOnlyDuringCalibration() {
+        var app = XCUIApplication.launchingSilentSearch(scenario: "calibrating")
+        XCTAssertTrue(app.otherElements["silent_search_calibration_preview"].waitForExistence(timeout: 10))
+        app.terminate()
+
+        app = XCUIApplication.launchingSilentSearch(scenario: "setup-not-ready")
+        XCTAssertTrue(app.descendants(matching: .any)["silent_search_tab"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.otherElements["silent_search_calibration_preview"].exists)
+    }
+
+    func testDecodedMarkerShowsPolygonMarkerAndPendingGrounding() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "calibration-qr-detected")
+
+        XCTAssertTrue(app.otherElements["silent_search_calibration_polygon"].waitForExistence(timeout: 10))
+        XCTAssertEqual(app.staticTexts["silent_search_calibration_marker"].label, "Marker SILENT_SEARCH_01")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_qr_stage"].value as? String, "Succeeded")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_grounding_stage"].value as? String, "Pending")
+    }
+
+    func testGroundingFailureShowsActionableGuidance() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "calibration-grounding-failed")
+
+        XCTAssertTrue(app.otherElements["silent_search_calibration_polygon"].waitForExistence(timeout: 10))
+        XCTAssertEqual(
+            app.staticTexts["silent_search_calibration_guidance"].label,
+            "Move the marker toward center or adjust the camera angle."
+        )
+    }
+
+    func testAcceptedSampleShowsAllLatchedStagesAndProgress() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "calibration-sample-accepted")
+
+        XCTAssertTrue(app.otherElements["silent_search_calibration_preview"].waitForExistence(timeout: 10))
+        XCTAssertEqual(app.otherElements["silent_search_calibration_qr_stage"].value as? String, "Succeeded")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_grounding_stage"].value as? String, "Succeeded")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_sample_stage"].value as? String, "Succeeded")
+        XCTAssertEqual(app.staticTexts["silent_search_calibration_progress"].label, "1 of 3")
     }
 
     func testOfferShowsFullQRCodeAndAbort() {

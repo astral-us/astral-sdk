@@ -17,6 +17,9 @@
 		16A000000000000000000003 /* SilentSearchMapView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000003 /* SilentSearchMapView.swift */; };
 		16A000000000000000000004 /* SilentSearchUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000004 /* SilentSearchUITests.swift */; };
 		16A000000000000000000005 /* SilentSearchMapTransformTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000005 /* SilentSearchMapTransformTests.swift */; };
+		16A000000000000000000006 /* CalibrationPreviewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000007 /* CalibrationPreviewModelTests.swift */; };
+		16A000000000000000000007 /* CalibrationPreviewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000008 /* CalibrationPreviewModel.swift */; };
+		16A000000000000000000008 /* CalibrationCameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000009 /* CalibrationCameraPreview.swift */; };
 		8FFCFF02ACA403C6A45A7CD2 /* PhroverOperatorApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B7B6DA99859F472611A5565 /* PhroverOperatorApp.swift */; };
 		B2EEC0187E90F315C30ED2E5 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBFEE1680DCB21877C94633F /* AuthView.swift */; };
 		C70F32962F9A479D5233BB02 /* ConversationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 825DADB380F51DD21F75FA9B /* ConversationView.swift */; };
@@ -48,6 +51,9 @@
 		16B000000000000000000004 /* SilentSearchUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SilentSearchUITests.swift; sourceTree = "<group>"; };
 		16B000000000000000000005 /* SilentSearchMapTransformTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SilentSearchMapTransformTests.swift; sourceTree = "<group>"; };
 		16B000000000000000000006 /* PhroverOperatorTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = PhroverOperatorTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		16B000000000000000000007 /* CalibrationPreviewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalibrationPreviewModelTests.swift; sourceTree = "<group>"; };
+		16B000000000000000000008 /* CalibrationPreviewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalibrationPreviewModel.swift; sourceTree = "<group>"; };
+		16B000000000000000000009 /* CalibrationCameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalibrationCameraPreview.swift; sourceTree = "<group>"; };
 		3304DDCFABDAC0EE11CAB10A /* NavigateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigateView.swift; sourceTree = "<group>"; };
 		53BB791CB7FE020013A1DA06 /* DriveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveView.swift; sourceTree = "<group>"; };
 		6017D80B2B300131026E7F5C /* PhroverCloud.example.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = PhroverCloud.example.plist; sourceTree = "<group>"; };
@@ -94,6 +100,7 @@
 		16D000000000000000000001 /* PhroverOperatorTests */ = {
 			isa = PBXGroup;
 			children = (
+				16B000000000000000000007 /* CalibrationPreviewModelTests.swift */,
 				16B000000000000000000005 /* SilentSearchMapTransformTests.swift */,
 			);
 			path = PhroverOperatorTests;
@@ -126,6 +133,7 @@
 			isa = PBXGroup;
 			children = (
 				CBFEE1680DCB21877C94633F /* AuthView.swift */,
+				16B000000000000000000009 /* CalibrationCameraPreview.swift */,
 				825DADB380F51DD21F75FA9B /* ConversationView.swift */,
 				53BB791CB7FE020013A1DA06 /* DriveView.swift */,
 				3304DDCFABDAC0EE11CAB10A /* NavigateView.swift */,
@@ -140,6 +148,7 @@
 			isa = PBXGroup;
 			children = (
 				6B7B6DA99859F472611A5565 /* PhroverOperatorApp.swift */,
+				16B000000000000000000008 /* CalibrationPreviewModel.swift */,
 				16B000000000000000000001 /* SilentSearchViewModel.swift */,
 			);
 			name = App;
@@ -253,6 +262,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				8FFCFF02ACA403C6A45A7CD2 /* PhroverOperatorApp.swift in Sources */,
+				16A000000000000000000007 /* CalibrationPreviewModel.swift in Sources */,
+				16A000000000000000000008 /* CalibrationCameraPreview.swift in Sources */,
 				16A000000000000000000001 /* SilentSearchViewModel.swift in Sources */,
 				B2EEC0187E90F315C30ED2E5 /* AuthView.swift in Sources */,
 				C70F32962F9A479D5233BB02 /* ConversationView.swift in Sources */,
@@ -276,6 +287,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				16A000000000000000000006 /* CalibrationPreviewModelTests.swift in Sources */,
 				16A000000000000000000005 /* SilentSearchMapTransformTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

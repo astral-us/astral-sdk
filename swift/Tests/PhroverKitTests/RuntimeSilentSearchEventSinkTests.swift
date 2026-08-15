@@ -17,4 +17,23 @@ final class RuntimeSilentSearchEventSinkTests: XCTestCase {
             "kind": "offer",
         ])
     }
+
+    func testCalibrationTelemetryAllowsOnlyDomainIdentifiersAndTypedReasons() {
+        XCTAssertEqual(RuntimeSilentSearchEventSink.sanitized([
+            "marker": "SILENT_SEARCH_01",
+            "generation": "4",
+            "frame_sequence": "12",
+            "reason": "corner_unavailable",
+            "corner": "top_right",
+            "unvalidated_payload": "PHROVER-CAL|1|SECRET",
+            "image_bytes": "bytes",
+            "detections": "raw scanner output",
+        ]), [
+            "marker": "SILENT_SEARCH_01",
+            "generation": "4",
+            "frame_sequence": "12",
+            "reason": "corner_unavailable",
+            "corner": "top_right",
+        ])
+    }
 }

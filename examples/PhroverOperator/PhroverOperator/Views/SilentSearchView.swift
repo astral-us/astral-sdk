@@ -111,17 +111,16 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
     }
 
     private var calibration: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "viewfinder.circle")
-                .font(.system(size: 52))
-                .foregroundStyle(.blue)
-            ProgressView(value: Double(viewModel.calibrationProgress), total: 3)
-            Text("Keep the printed north arrow and all four marker corners visible.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
+        CalibrationCameraPreview(
+            image: viewModel.calibrationPreviewImage,
+            corners: viewModel.calibrationVisualState.currentCorners,
+            projection: viewModel.calibrationProjection,
+            guidance: viewModel.calibrationGuidance,
+            progress: viewModel.calibrationProgress
+        )
         .padding()
+        .onAppear { viewModel.startCalibrationPreview() }
+        .onDisappear { viewModel.stopCalibrationPreview() }
     }
 
     @ViewBuilder
