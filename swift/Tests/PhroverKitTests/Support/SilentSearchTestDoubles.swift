@@ -307,6 +307,10 @@ struct SilentSearchTestHarness {
     }
 
     func coordinator() -> SilentSearchCoordinator {
+        coordinator(calibration: calibration)
+    }
+
+    func coordinator(calibration: any SilentSearchCalibrating) -> SilentSearchCoordinator {
         SilentSearchCoordinator(dependencies: SilentSearchDependencies(
             clock: clock,
             readiness: readiness,

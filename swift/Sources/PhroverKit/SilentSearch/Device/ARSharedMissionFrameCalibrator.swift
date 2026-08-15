@@ -114,6 +114,8 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                         if scans.isEmpty, attempt.lastFailure != nil {
                             continuation.yield(.feedback(.waitingForMarker(context: context)))
                             attempt.lastFailure = nil
+                        } else if scans.isEmpty, outcome.diagnostics.isEmpty {
+                            continuation.yield(.feedback(.scanCompleted(context: context)))
                         }
                     } catch {
                         if attempt.lastFailure != .scannerFailure {

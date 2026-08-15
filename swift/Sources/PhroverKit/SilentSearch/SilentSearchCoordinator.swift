@@ -247,6 +247,8 @@ public final class SilentSearchCoordinator {
                 completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.currentIssue = nil
                 calibrationTelemetryState = nil
+            case let .scanCompleted(context):
+                completeScannerDiagnosticCycle(context: context)
             case let .qrLost(context):
                 completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.clearDetections()

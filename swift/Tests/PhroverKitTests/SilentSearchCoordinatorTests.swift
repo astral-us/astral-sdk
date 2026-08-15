@@ -1,3 +1,5 @@
+import CoreVideo
+import simd
 import XCTest
 import RoverNav
 @testable import PhroverKit
@@ -914,6 +916,52 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertFalse(entries.contains { $0.fields["reason"] == "scanner_failure" })
     }
 
+    func testCleanCalibratorScanAllowsBackendDiagnosticRecurrenceToBeRecorded() async throws {
+        let manager = ARSessionManager()
+        let scans = CoordinatorScanCounter()
+        let diagnostic = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .right,
+            errorDomain: "VisionStableDomain", errorCode: 17
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            detailedScanner: { _ in
+                scans.increment()
+                return OpticalScanOutcome(
+                    observations: [],
+                    diagnostics: scans.value == 2 ? [] : [diagnostic]
+                )
+            }
+        )
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 0)
+        let coordinator = harness.coordinator(calibration: calibrator)
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        await Task.yield()
+
+        for timestamp in [1.0, 2.0, 3.0] {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: timestamp,
+                cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+                trackingQuality: .normal
+            )
+            await eventually { scans.value == Int(timestamp) }
+        }
+
+        await eventually {
+            harness.events.entries.filter {
+                $0.event == "silent_search_scanner_backend_failed"
+            }.count == 2
+        }
+        XCTAssertEqual(harness.events.entries.filter {
+            $0.event == "silent_search_scanner_backend_failed"
+        }.count, 2)
+        XCTAssertNil(coordinator.calibrationVisualState.currentIssue)
+    }
+
     func testCalibrationRejectionTelemetryRecordsTransitionsOnly() async throws {
         let harness = SilentSearchTestHarness()
         harness.readiness.snapshot = .ready(sessionGeneration: 4)
@@ -1190,6 +1238,12 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         )
     }
 
+    private func makeImage() -> CVPixelBuffer {
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 100, 100, kCVPixelFormatType_32BGRA, nil, &image)
+        return image!
+    }
+
     private func frame(generation: UInt64) throws -> SharedMissionFrame {
         try XCTUnwrap(SharedMissionFrame(
             localOrigin: Vec2(0, 0), localNorthHeading: 0, sessionGeneration: generation
@@ -1213,5 +1267,16 @@ final class SilentSearchCoordinatorTests: XCTestCase {
 
     private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
         for _ in 0..<100 where !condition() { await Task.yield() }
+    }
+}
+
+private final class CoordinatorScanCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int { lock.withLock { count } }
+
+    func increment() {
+        lock.withLock { count += 1 }
     }
 }

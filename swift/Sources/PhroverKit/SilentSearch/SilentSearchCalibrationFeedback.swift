@@ -52,6 +52,7 @@ public enum SilentSearchCalibrationFeedback: Equatable, Sendable {
         corners: OrientedMarkerCorners
     )
     case waitingForMarker(context: SilentSearchCalibrationFrameContext)
+    case scanCompleted(context: SilentSearchCalibrationFrameContext)
     case qrLost(context: SilentSearchCalibrationFrameContext)
     case scannerFailed(context: SilentSearchCalibrationFrameContext)
     case scannerBackendFailed(
