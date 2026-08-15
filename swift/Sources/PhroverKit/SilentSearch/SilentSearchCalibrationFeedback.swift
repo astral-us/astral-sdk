@@ -54,6 +54,10 @@ public enum SilentSearchCalibrationFeedback: Equatable, Sendable {
     case waitingForMarker(context: SilentSearchCalibrationFrameContext)
     case qrLost(context: SilentSearchCalibrationFrameContext)
     case scannerFailed(context: SilentSearchCalibrationFrameContext)
+    case scannerBackendFailed(
+        context: SilentSearchCalibrationFrameContext,
+        diagnostic: OpticalScannerBackendDiagnostic
+    )
     case groundingFailed(
         context: SilentSearchCalibrationFrameContext,
         reason: SilentSearchCalibrationGroundingFailure

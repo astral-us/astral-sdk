@@ -36,4 +36,33 @@ final class RuntimeSilentSearchEventSinkTests: XCTestCase {
             "corner": "top_right",
         ])
     }
+
+    func testScannerBackendTelemetryUsesAnExplicitSanitizedFieldAllowList() {
+        XCTAssertEqual(RuntimeSilentSearchEventSink.sanitized([
+            "mission": "mission-1",
+            "role": "a",
+            "marker": "SILENT_SEARCH_01",
+            "generation": "4",
+            "frame_sequence": "12",
+            "backend": "vision",
+            "orientation": "right",
+            "error_domain": "VisionStableDomain",
+            "error_code": "17",
+            "payload": "secret QR payload",
+            "image": "camera bytes",
+            "localized_description": "private device details",
+            "stack_trace": "private call stack",
+            "unexpected_backend_detail": "private implementation detail",
+        ]), [
+            "mission": "mission-1",
+            "role": "a",
+            "marker": "SILENT_SEARCH_01",
+            "generation": "4",
+            "frame_sequence": "12",
+            "backend": "vision",
+            "orientation": "right",
+            "error_domain": "VisionStableDomain",
+            "error_code": "17",
+        ])
+    }
 }

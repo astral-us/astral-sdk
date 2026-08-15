@@ -4,6 +4,7 @@ import RoverNav
 @MainActor
 public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     public typealias Scanner = @Sendable (OpticalFrame) throws -> [OpticalObservation]
+    typealias DetailedScanner = @Sendable (OpticalFrame) throws -> OpticalScanOutcome
     typealias Grounder = @MainActor @Sendable (
         OpticalObservation, ARFrameSnapshot, String, UInt64
     ) -> Result<SharedMissionCalibrationObservation, SilentSearchCalibrationGroundingFailure>
@@ -21,7 +22,7 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     }
 
     private let sessionManager: ARSessionManager
-    private let scanner: Scanner
+    private let scanner: DetailedScanner
     private let grounder: Grounder
     private let eventSink: (any SilentSearchEventSink)?
     private let markerExpirySleep: @MainActor @Sendable () async throws -> Void
@@ -33,7 +34,7 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     public init(sessionManager: ARSessionManager, scanner: OpticalQRCodeScanner = OpticalQRCodeScanner(),
                 events: (any SilentSearchEventSink)? = nil) {
         self.sessionManager = sessionManager
-        self.scanner = { try scanner.scan($0) }
+        self.scanner = { try scanner.scanDetailed($0) }
         grounder = Self.groundValidated
         self.eventSink = events
         markerExpirySleep = { try await Task.sleep(for: .milliseconds(500)) }
@@ -46,7 +47,20 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
          grounder: @escaping Grounder = ARSharedMissionFrameCalibrator.groundValidated,
          scanner: @escaping Scanner) {
         self.sessionManager = sessionManager
-        self.scanner = scanner
+        self.scanner = { OpticalScanOutcome(observations: try scanner($0)) }
+        self.grounder = grounder
+        self.eventSink = events
+        self.markerExpirySleep = markerExpirySleep
+    }
+
+    init(sessionManager: ARSessionManager, events: (any SilentSearchEventSink)? = nil,
+         markerExpirySleep: @escaping @MainActor @Sendable () async throws -> Void = {
+             try await Task.sleep(for: .milliseconds(500))
+         },
+         grounder: @escaping Grounder = ARSharedMissionFrameCalibrator.groundValidated,
+         detailedScanner: @escaping DetailedScanner) {
+        self.sessionManager = sessionManager
+        self.scanner = detailedScanner
         self.grounder = grounder
         self.eventSink = events
         self.markerExpirySleep = markerExpirySleep
@@ -90,7 +104,13 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                         arFrameID: snapshot.id, monotonicTimestamp: snapshot.timestamp)
                     let scans: [OpticalObservation]
                     do {
-                        scans = try scanner(opticalFrame)
+                        let outcome = try scanner(opticalFrame)
+                        for diagnostic in outcome.diagnostics {
+                            continuation.yield(.feedback(.scannerBackendFailed(
+                                context: context, diagnostic: diagnostic
+                            )))
+                        }
+                        scans = outcome.observations
                         if scans.isEmpty, attempt.lastFailure != nil {
                             continuation.yield(.feedback(.waitingForMarker(context: context)))
                             attempt.lastFailure = nil

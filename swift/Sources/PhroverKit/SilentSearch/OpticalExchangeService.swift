@@ -107,6 +107,43 @@ public struct OpticalObservation: Equatable, Sendable {
     }
 }
 
+public enum OpticalScannerBackend: String, Equatable, Sendable {
+    case vision
+    case coreImage = "core_image"
+}
+
+public struct OpticalScannerBackendDiagnostic: Equatable, Sendable {
+    public let backend: OpticalScannerBackend
+    public let orientation: CGImagePropertyOrientation?
+    public let errorDomain: String
+    public let errorCode: Int
+
+    public init(
+        backend: OpticalScannerBackend,
+        orientation: CGImagePropertyOrientation? = nil,
+        errorDomain: String,
+        errorCode: Int
+    ) {
+        self.backend = backend
+        self.orientation = orientation
+        self.errorDomain = errorDomain
+        self.errorCode = errorCode
+    }
+}
+
+public struct OpticalScanOutcome: Equatable, Sendable {
+    public let observations: [OpticalObservation]
+    public let diagnostics: [OpticalScannerBackendDiagnostic]
+
+    public init(
+        observations: [OpticalObservation],
+        diagnostics: [OpticalScannerBackendDiagnostic] = []
+    ) {
+        self.observations = observations
+        self.diagnostics = diagnostics
+    }
+}
+
 public struct OpticalQRCodeRenderer: Sendable {
     public static let quietZoneModules = 4
     private let context = CIContext(options: [.cacheIntermediates: false])
@@ -137,6 +174,15 @@ public struct OpticalQRCodeRenderer: Sendable {
 }
 
 public final class OpticalQRCodeScanner: @unchecked Sendable {
+    private enum CoreImageScannerError: Error {
+        case detectorUnavailable
+    }
+
+    typealias VisionScanner = @Sendable (
+        OpticalFrame, CGImagePropertyOrientation
+    ) throws -> [OpticalObservation]
+    typealias CoreImageScanner = @Sendable (OpticalFrame) throws -> [OpticalObservation]
+
     private enum FrameIdentity: Hashable {
         case sequence(UInt64)
         case ar(ARFrameID)
@@ -144,30 +190,78 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
 
     private var processedFrameIDs = Set<FrameIdentity>()
     private let lock = NSLock()
+    private let visionScanner: VisionScanner?
+    private let coreImageScanner: CoreImageScanner?
 
-    public init() {}
+    public init() {
+        visionScanner = nil
+        coreImageScanner = nil
+    }
+
+    init(
+        visionScanner: @escaping VisionScanner,
+        coreImageScanner: @escaping CoreImageScanner
+    ) {
+        self.visionScanner = visionScanner
+        self.coreImageScanner = coreImageScanner
+    }
 
     public func scan(_ frame: OpticalFrame) throws -> [OpticalObservation] {
+        try scanDetailed(frame).observations
+    }
+
+    public func scanDetailed(_ frame: OpticalFrame) throws -> OpticalScanOutcome {
         guard frame.monotonicTimestamp.isFinite else { throw OpticalExchangeError.invalidTimestamp }
         lock.lock()
         let identity = frame.arFrameID.map(FrameIdentity.ar) ?? .sequence(frame.frameID)
         let isNewFrame = processedFrameIDs.insert(identity).inserted
         lock.unlock()
-        guard isNewFrame else { return [] }
+        guard isNewFrame else { return OpticalScanOutcome(observations: []) }
 
+        var diagnostics: [OpticalScannerBackendDiagnostic] = []
         for orientation in [CGImagePropertyOrientation.right, .up, .left, .down] {
-            let results = try detect(in: frame.image, orientation: orientation)
-            let mapped = observations(from: results, frame: frame, orientation: orientation)
-            if !mapped.isEmpty { return mapped }
+            do {
+                let mapped: [OpticalObservation]
+                if let visionScanner {
+                    mapped = try visionScanner(frame, orientation)
+                } else {
+                    let results = try detect(in: frame.image, orientation: orientation)
+                    mapped = observations(from: results, frame: frame, orientation: orientation)
+                }
+                if !mapped.isEmpty {
+                    return OpticalScanOutcome(observations: mapped, diagnostics: diagnostics)
+                }
+            } catch {
+                diagnostics.append(Self.diagnostic(
+                    for: error, backend: .vision, orientation: orientation
+                ))
+            }
         }
-        return detectQRWithCoreImage(in: frame)
+        do {
+            let observations = try coreImageScanner?(frame) ?? detectQRWithCoreImage(in: frame)
+            return OpticalScanOutcome(observations: observations, diagnostics: diagnostics)
+        } catch {
+            diagnostics.append(Self.diagnostic(for: error, backend: .coreImage))
+            return OpticalScanOutcome(observations: [], diagnostics: diagnostics)
+        }
+    }
+
+    private static func diagnostic(
+        for error: Error,
+        backend: OpticalScannerBackend,
+        orientation: CGImagePropertyOrientation? = nil
+    ) -> OpticalScannerBackendDiagnostic {
+        let error = error as NSError
+        return OpticalScannerBackendDiagnostic(
+            backend: backend, orientation: orientation,
+            errorDomain: error.domain, errorCode: error.code
+        )
     }
 
     private func detect(in image: OpticalFrame.Image,
                         orientation: CGImagePropertyOrientation) throws -> [VNBarcodeObservation] {
         let request = VNDetectBarcodesRequest()
         request.symbologies = [.qr]
-        request.usesCPUOnly = true
         let handler: VNImageRequestHandler
         switch image {
         case let .cgImage(image): handler = VNImageRequestHandler(cgImage: image, orientation: orientation)
@@ -201,10 +295,10 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
         }
     }
 
-    private func detectQRWithCoreImage(in frame: OpticalFrame) -> [OpticalObservation] {
+    private func detectQRWithCoreImage(in frame: OpticalFrame) throws -> [OpticalObservation] {
         guard let detector = CIDetector(ofType: CIDetectorTypeQRCode, context: nil,
                                         options: [CIDetectorAccuracy: CIDetectorAccuracyHigh]) else {
-            return []
+            throw CoreImageScannerError.detectorUnavailable
         }
         let source: CIImage
         switch frame.image {

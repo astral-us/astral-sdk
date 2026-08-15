@@ -2,6 +2,13 @@ import Foundation
 
 public final class RuntimeSilentSearchEventSink: SilentSearchEventSink {
     private let lock = NSLock()
+    private static let allowedFields: Set<String> = [
+        "backend", "confidence_basis_points", "corner", "direction", "error_code",
+        "error_domain", "frame_sequence", "frontier_id", "from", "generation", "grounded",
+        "kind", "label", "marker", "mission", "monotonic_timestamp", "orientation", "outcome",
+        "path_length_mm", "reason", "release_epoch_ms", "result", "role", "sample_count",
+        "sequence", "stage", "to", "x_mm", "y_mm",
+    ]
 
     public init() {}
 
@@ -12,10 +19,6 @@ public final class RuntimeSilentSearchEventSink: SilentSearchEventSink {
     }
 
     static func sanitized(_ fields: [String: String]) -> [String: String] {
-        return fields.filter { key, _ in
-            let key = key.lowercased()
-            return !key.contains("payload") && !key.contains("image") &&
-                !["pixel_buffer", "frame_contents", "detections"].contains(key)
-        }
+        fields.filter { key, _ in allowedFields.contains(key.lowercased()) }
     }
 }

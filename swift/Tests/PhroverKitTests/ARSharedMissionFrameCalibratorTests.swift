@@ -44,9 +44,9 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
     func testNonNormalTrackingFeedbackIsDeduplicatedUntilTheIssueChanges() async {
         enum ScannerFailure: Error { case failed }
         let manager = ARSessionManager()
-        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { _ in
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager, scanner: { _ in
             throw ScannerFailure.failed
-        }
+        })
         let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
         let received = Task { () -> [SilentSearchCalibrationEvent] in
             var events: [SilentSearchCalibrationEvent] = []
@@ -249,6 +249,59 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         consumer.cancel()
     }
 
+    func testFallbackSuccessEmitsBackendDiagnosticBeforeQRDetectedFeedback() async {
+        let manager = ARSessionManager()
+        let collector = CalibrationEventCollector()
+        let diagnostic = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .right,
+            errorDomain: "VisionStableDomain", errorCode: 17
+        )
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            grounder: { _, _, _, _ in .failure(.missingDepthMap) },
+            detailedScanner: { frame in
+                OpticalScanOutcome(
+                    observations: [OpticalObservation(
+                        payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                        frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                        corners: corners
+                    )],
+                    diagnostics: [diagnostic]
+                )
+            }
+        )
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream { collector.append(event) }
+        }
+        await Task.yield()
+
+        manager.ingestForTesting(
+            image: makeImage(), timestamp: 2, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+            trackingQuality: .normal
+        )
+        await eventually { collector.events.count == 3 }
+
+        let context = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 2
+        )
+        XCTAssertEqual(collector.events, [
+            .feedback(.scannerBackendFailed(context: context, diagnostic: diagnostic)),
+            .feedback(.expectedMarkerDetected(
+                context: context, markerID: "SILENT_SEARCH_01", corners: corners
+            )),
+            .feedback(.groundingFailed(context: context, reason: .missingDepthMap)),
+        ])
+        XCTAssertFalse(collector.events.contains(.feedback(.scannerFailed(context: context))))
+        consumer.cancel()
+    }
+
     func testAllCornersGroundedFeedbackPrecedesCalibrationProgress() async {
         let manager = ARSessionManager()
         let snapshot = makeSnapshot(generation: 0, sequence: 1)
@@ -355,10 +408,10 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         enum ScannerFailure: Error { case failed }
         let manager = ARSessionManager()
         let scans = ScanCounter()
-        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { _ in
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager, scanner: { _ in
             scans.increment()
             throw ScannerFailure.failed
-        }
+        })
         let collector = CalibrationEventCollector()
         let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
         let consumer = Task {
@@ -423,6 +476,7 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         }
 
         await eventually { scans.value == 3 }
+        await eventually { collector.events.count == 2 }
         XCTAssertEqual(collector.events, [
             .feedback(.scannerFailed(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
@@ -430,6 +484,55 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
             .feedback(.waitingForMarker(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
             ))),
+        ])
+        consumer.cancel()
+    }
+
+    func testEmptyDetailedFallbackRestoresWaitingGuidanceAfterScannerFailure() async {
+        enum ScannerFailure: Error { case failed }
+        let manager = ARSessionManager()
+        let scans = ScanCounter()
+        let diagnostic = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .right,
+            errorDomain: "VisionStableDomain", errorCode: 17
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            detailedScanner: { _ in
+                scans.increment()
+                if scans.value == 1 { throw ScannerFailure.failed }
+                return OpticalScanOutcome(observations: [], diagnostics: [diagnostic])
+            }
+        )
+        let collector = CalibrationEventCollector()
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream { collector.append(event) }
+        }
+        await Task.yield()
+
+        for timestamp in [1.0, 2.0] {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: timestamp,
+                cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+                trackingQuality: .normal
+            )
+            await Task.yield()
+        }
+
+        await eventually { collector.events.count == 3 }
+        let first = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
+        )
+        let second = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
+        )
+        XCTAssertEqual(collector.events, [
+            .feedback(.scannerFailed(context: first)),
+            .feedback(.scannerBackendFailed(context: second, diagnostic: diagnostic)),
+            .feedback(.waitingForMarker(context: second)),
         ])
         consumer.cancel()
     }

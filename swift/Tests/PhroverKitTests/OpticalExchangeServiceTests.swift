@@ -6,6 +6,156 @@ import XCTest
 @testable import PhroverKit
 
 final class OpticalExchangeServiceTests: XCTestCase {
+    func testDetailedScanContinuesAfterVisionErrorAndReturnsLaterVisionDecode() throws {
+        let payload = Data("decoded-by-up".utf8)
+        let scanner = OpticalQRCodeScanner(
+            visionScanner: { frame, orientation in
+                if orientation == .right {
+                    throw NSError(
+                        domain: "VisionTest", code: 17,
+                        userInfo: [NSLocalizedDescriptionKey: "must not escape"]
+                    )
+                }
+                guard orientation == .up else { return [] }
+                return [OpticalObservation(
+                    payload: payload, frameID: frame.frameID,
+                    monotonicTimestamp: frame.monotonicTimestamp,
+                    corners: OrientedMarkerCorners(
+                        topLeft: Vec2(0.1, 0.9), topRight: Vec2(0.9, 0.9),
+                        bottomLeft: Vec2(0.1, 0.1), bottomRight: Vec2(0.9, 0.1)
+                    )
+                )]
+            },
+            coreImageScanner: { _ in
+                XCTFail("Core Image should not run after a Vision decode")
+                return []
+            }
+        )
+        let frame = OpticalFrame(
+            image: try OpticalQRCodeRenderer().render(payload: payload, moduleScale: 8),
+            frameID: 1, monotonicTimestamp: 2
+        )
+
+        let outcome = try scanner.scanDetailed(frame)
+
+        XCTAssertEqual(outcome.observations.map(\.payload), [payload])
+        XCTAssertEqual(outcome.diagnostics, [
+            OpticalScannerBackendDiagnostic(
+                backend: .vision, orientation: .right,
+                errorDomain: "VisionTest", errorCode: 17
+            ),
+        ])
+    }
+
+    func testDetailedScanReachesCoreImageAfterEveryVisionOrientationThrows() throws {
+        let payload = Data("decoded-by-core-image".utf8)
+        let attempts = OrientationCollector()
+        let scanner = OpticalQRCodeScanner(
+            visionScanner: { _, orientation in
+                attempts.append(orientation)
+                throw NSError(domain: "VisionTest", code: Int(orientation.rawValue))
+            },
+            coreImageScanner: { frame in
+                [Self.observation(payload: payload, frame: frame)]
+            }
+        )
+        let frame = try opticalFrame(payload: payload, frameID: 2)
+
+        let outcome = try scanner.scanDetailed(frame)
+
+        XCTAssertEqual(attempts.values, [.right, .up, .left, .down])
+        XCTAssertEqual(outcome.observations.map(\.payload), [payload])
+        XCTAssertEqual(outcome.diagnostics.map(\.orientation), [.right, .up, .left, .down])
+    }
+
+    func testDetailedScanReturnsDiagnosticsAndEmptyObservationsWithoutThrowing() throws {
+        let scanner = OpticalQRCodeScanner(
+            visionScanner: { _, orientation in
+                throw NSError(domain: "VisionTest", code: Int(orientation.rawValue))
+            },
+            coreImageScanner: { _ in [] }
+        )
+
+        let outcome = try scanner.scanDetailed(try opticalFrame(
+            payload: Data("not-decoded".utf8), frameID: 3
+        ))
+
+        XCTAssertEqual(outcome.observations, [])
+        XCTAssertEqual(outcome.diagnostics.count, 4)
+    }
+
+    func testDetailedScanCleanCycleHasNoDiagnosticsAndSuppressesDuplicateFrame() throws {
+        let payload = Data("clean-decode".utf8)
+        let scanner = OpticalQRCodeScanner(
+            visionScanner: { frame, orientation in
+                orientation == .right ? [Self.observation(payload: payload, frame: frame)] : []
+            },
+            coreImageScanner: { _ in [] }
+        )
+        let frame = try opticalFrame(payload: payload, frameID: 4)
+
+        let first = try scanner.scanDetailed(frame)
+        let duplicate = try scanner.scanDetailed(frame)
+
+        XCTAssertEqual(first.observations.map(\.payload), [payload])
+        XCTAssertEqual(first.diagnostics, [])
+        XCTAssertEqual(duplicate, OpticalScanOutcome(observations: []))
+    }
+
+    func testDetailedScanSanitizesBackendErrorsToDomainAndCode() throws {
+        let secret = "localized device details"
+        let scanner = OpticalQRCodeScanner(
+            visionScanner: { _, orientation in
+                if orientation == .right {
+                    throw NSError(
+                        domain: "VisionStableDomain", code: 91,
+                        userInfo: [NSLocalizedDescriptionKey: secret]
+                    )
+                }
+                return []
+            },
+            coreImageScanner: { _ in [] }
+        )
+
+        let outcome = try scanner.scanDetailed(try opticalFrame(
+            payload: Data("private-payload".utf8), frameID: 5
+        ))
+
+        XCTAssertEqual(outcome.diagnostics, [
+            OpticalScannerBackendDiagnostic(
+                backend: .vision, orientation: .right,
+                errorDomain: "VisionStableDomain", errorCode: 91
+            ),
+        ])
+        XCTAssertFalse(String(reflecting: outcome.diagnostics).contains(secret))
+        XCTAssertFalse(String(reflecting: outcome.diagnostics).contains("private-payload"))
+    }
+
+    func testDetailedScanConvertsCoreImageFailureToDiagnosticAndOnlyRejectsInvalidTimestamp() throws {
+        let scanner = OpticalQRCodeScanner(
+            visionScanner: { _, _ in [] },
+            coreImageScanner: { _ in
+                throw NSError(domain: "CoreImageStableDomain", code: 44)
+            }
+        )
+        let frame = try opticalFrame(payload: Data("not-decoded".utf8), frameID: 6)
+
+        XCTAssertEqual(try scanner.scanDetailed(frame), OpticalScanOutcome(
+            observations: [],
+            diagnostics: [OpticalScannerBackendDiagnostic(
+                backend: .coreImage, errorDomain: "CoreImageStableDomain", errorCode: 44
+            )]
+        ))
+        XCTAssertThrowsError(try scanner.scanDetailed(OpticalFrame(
+            image: try OpticalQRCodeRenderer().render(
+                payload: Data("invalid-time".utf8), moduleScale: 8
+            ),
+            frameID: 7, monotonicTimestamp: .infinity
+        ))) { error in
+            XCTAssertEqual(error as? OpticalExchangeError, .invalidTimestamp)
+        }
+    }
+
     func testGeneratedQRRoundTripsCanonicalGoldenAndLargestPayloads() throws {
         let codec = OpticalMessageCodec()
         let payloads = try (goldenMessages() + [largestStatus(), largestDecision()]).map(codec.encode)
@@ -175,6 +325,24 @@ final class OpticalExchangeServiceTests: XCTestCase {
         return pixels
     }
 
+    private func opticalFrame(payload: Data, frameID: UInt64) throws -> OpticalFrame {
+        OpticalFrame(
+            image: try OpticalQRCodeRenderer().render(payload: payload, moduleScale: 8),
+            frameID: frameID, monotonicTimestamp: Double(frameID)
+        )
+    }
+
+    private static func observation(payload: Data, frame: OpticalFrame) -> OpticalObservation {
+        OpticalObservation(
+            payload: payload, frameID: frame.frameID,
+            monotonicTimestamp: frame.monotonicTimestamp,
+            corners: OrientedMarkerCorners(
+                topLeft: Vec2(0.1, 0.9), topRight: Vec2(0.9, 0.9),
+                bottomLeft: Vec2(0.1, 0.1), bottomRight: Vec2(0.9, 0.1)
+            )
+        )
+    }
+
     private func pixel(_ pixels: [UInt8], width: Int, x: Int, y: Int) -> [UInt8] {
         let offset = (y * width + x) * 4
         return Array(pixels[offset..<(offset + 4)])
@@ -196,5 +364,18 @@ final class OpticalExchangeServiceTests: XCTestCase {
             XCTAssertEqual(actualPoint.y, expectedPoint.y, accuracy: 0.000_001,
                            "Unexpected y coordinate for \(orientation)", file: file, line: line)
         }
+    }
+}
+
+private final class OrientationCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [CGImagePropertyOrientation] = []
+
+    var values: [CGImagePropertyOrientation] {
+        lock.withLock { storage }
+    }
+
+    func append(_ orientation: CGImagePropertyOrientation) {
+        lock.withLock { storage.append(orientation) }
     }
 }

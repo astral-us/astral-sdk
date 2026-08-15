@@ -841,6 +841,79 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         })
     }
 
+    func testScannerBackendTelemetryDeduplicatesByScanCycleWithoutClearingSuccessState() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 4)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.2, 0.8), topRight: Vec2(0.8, 0.8),
+            bottomLeft: Vec2(0.2, 0.2), bottomRight: Vec2(0.8, 0.2)
+        )
+        func context(_ sequence: UInt64) -> SilentSearchCalibrationFrameContext {
+            .init(frameID: ARFrameID(generation: 4, sequence: sequence),
+                  monotonicTimestamp: Double(sequence))
+        }
+        let right = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .right,
+            errorDomain: "VisionStableDomain", errorCode: 17
+        )
+        let up = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .up,
+            errorDomain: "VisionStableDomain", errorCode: 17
+        )
+        let changedDomain = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .right,
+            errorDomain: "VisionChangedDomain", errorCode: 18
+        )
+
+        harness.calibration.send(.feedback(.expectedMarkerDetected(
+            context: context(1), markerID: "SILENT_SEARCH_01", corners: corners
+        )))
+        harness.calibration.send(.feedback(.allCornersGrounded(context: context(1))))
+        harness.calibration.send(.progress(context: context(1), acceptedFrameCount: 1))
+        harness.calibration.send(.feedback(.scannerBackendFailed(
+            context: context(2), diagnostic: right
+        )))
+        harness.calibration.send(.feedback(.scannerBackendFailed(
+            context: context(2), diagnostic: right
+        )))
+        harness.calibration.send(.feedback(.scannerBackendFailed(
+            context: context(3), diagnostic: right
+        )))
+        harness.calibration.send(.feedback(.scannerBackendFailed(
+            context: context(3), diagnostic: up
+        )))
+        harness.calibration.send(.feedback(.waitingForMarker(context: context(4))))
+        harness.calibration.send(.feedback(.scannerBackendFailed(
+            context: context(5), diagnostic: right
+        )))
+        harness.calibration.send(.feedback(.scannerBackendFailed(
+            context: context(6), diagnostic: changedDomain
+        )))
+
+        await eventually {
+            harness.events.entries.filter {
+                $0.event == "silent_search_scanner_backend_failed"
+            }.count >= 4
+        }
+        let entries = harness.events.entries.filter {
+            $0.event == "silent_search_scanner_backend_failed"
+        }
+        XCTAssertEqual(entries.count, 4)
+        XCTAssertEqual(entries.map { $0.fields["orientation"] }, ["right", "up", "right", "right"])
+        XCTAssertEqual(entries.map { $0.fields["error_domain"] }, [
+            "VisionStableDomain", "VisionStableDomain", "VisionStableDomain", "VisionChangedDomain",
+        ])
+        XCTAssertEqual(entries.map { $0.fields["error_code"] }, ["17", "17", "17", "18"])
+        XCTAssertTrue(coordinator.calibrationVisualState.qrDecoded)
+        XCTAssertTrue(coordinator.calibrationVisualState.cornersGrounded)
+        XCTAssertTrue(coordinator.calibrationVisualState.sampleAccepted)
+        XCTAssertNil(coordinator.calibrationVisualState.currentIssue)
+        XCTAssertFalse(entries.contains { $0.fields["reason"] == "scanner_failure" })
+    }
+
     func testCalibrationRejectionTelemetryRecordsTransitionsOnly() async throws {
         let harness = SilentSearchTestHarness()
         harness.readiness.snapshot = .ready(sessionGeneration: 4)

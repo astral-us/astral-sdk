@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import Observation
 
 @MainActor
@@ -38,6 +39,9 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var calibrationTelemetryState: CalibrationTelemetryState?
     @ObservationIgnored private var calibrationRejectionTelemetryState: SharedMissionCalibrationDiagnostic?
     @ObservationIgnored private var calibrationProgressContext: SilentSearchCalibrationFrameContext?
+    @ObservationIgnored private var scannerDiagnosticContext: SilentSearchCalibrationFrameContext?
+    @ObservationIgnored private var scannerDiagnosticsCurrent: [OpticalScannerBackendDiagnostic] = []
+    @ObservationIgnored private var scannerDiagnosticsPrevious: [OpticalScannerBackendDiagnostic] = []
 
     private enum OpticalAction {
         case present(Data)
@@ -214,6 +218,7 @@ public final class SilentSearchCoordinator {
         case let .feedback(feedback):
             switch feedback {
             case let .trackingNotNormal(context):
+                completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.currentIssue = .trackingNotNormal
                 let state = CalibrationTelemetryState.trackingNotNormal
                 if calibrationTelemetryState != state {
@@ -225,6 +230,7 @@ public final class SilentSearchCoordinator {
                     calibrationTelemetryState = state
                 }
             case let .expectedMarkerDetected(context, markerID, corners):
+                completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.qrDecoded = true
                 calibrationVisualState.recordDetection(.init(
                     context: context, markerID: markerID, corners: corners
@@ -237,10 +243,12 @@ public final class SilentSearchCoordinator {
                     ])
                     calibrationMarkerPresent = true
                 }
-            case .waitingForMarker:
+            case let .waitingForMarker(context):
+                completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.currentIssue = nil
                 calibrationTelemetryState = nil
             case let .qrLost(context):
+                completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.clearDetections()
                 switch calibrationVisualState.currentIssue {
                 case .some(.scannerFailure), .some(.groundingFailure(.wrongMarkerID)):
@@ -257,6 +265,7 @@ public final class SilentSearchCoordinator {
                     calibrationMarkerPresent = false
                 }
             case let .scannerFailed(context):
+                completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.currentIssue = .scannerFailure
                 let state = CalibrationTelemetryState.scannerFailure
                 if calibrationTelemetryState != state {
@@ -267,7 +276,31 @@ public final class SilentSearchCoordinator {
                     ])
                     calibrationTelemetryState = state
                 }
+            case let .scannerBackendFailed(context, diagnostic):
+                if scannerDiagnosticContext != context {
+                    scannerDiagnosticsPrevious = scannerDiagnosticsCurrent
+                    scannerDiagnosticsCurrent = []
+                    scannerDiagnosticContext = context
+                }
+                let shouldRecord = !scannerDiagnosticsCurrent.contains(diagnostic) &&
+                    !scannerDiagnosticsPrevious.contains(diagnostic)
+                if !scannerDiagnosticsCurrent.contains(diagnostic) {
+                    scannerDiagnosticsCurrent.append(diagnostic)
+                }
+                guard shouldRecord else { return false }
+                var fields = [
+                    "backend": diagnostic.backend.rawValue,
+                    "error_domain": diagnostic.errorDomain,
+                    "error_code": "\(diagnostic.errorCode)",
+                    "generation": "\(context.frameID.generation)",
+                    "frame_sequence": "\(context.frameID.sequence)",
+                ]
+                if let orientation = diagnostic.orientation {
+                    fields["orientation"] = Self.orientationName(orientation)
+                }
+                record("silent_search_scanner_backend_failed", fields: fields)
             case let .groundingFailed(context, reason):
+                completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.currentIssue = .groundingFailure(reason)
                 let state = CalibrationTelemetryState.groundingFailure(reason)
                 if calibrationTelemetryState != state {
@@ -283,6 +316,7 @@ public final class SilentSearchCoordinator {
                     calibrationTelemetryState = state
                 }
             case let .allCornersGrounded(context):
+                completeScannerDiagnosticCycle(context: context)
                 calibrationVisualState.cornersGrounded = true
                 calibrationVisualState.currentIssue = nil
                 let state = CalibrationTelemetryState.cornersGrounded
@@ -1051,6 +1085,16 @@ public final class SilentSearchCoordinator {
         calibrationMarkerPresent = false
         calibrationTelemetryState = nil
         calibrationRejectionTelemetryState = nil
+        scannerDiagnosticContext = nil
+        scannerDiagnosticsCurrent = []
+        scannerDiagnosticsPrevious = []
+    }
+
+    private func completeScannerDiagnosticCycle(context: SilentSearchCalibrationFrameContext) {
+        guard scannerDiagnosticContext != context else { return }
+        scannerDiagnosticContext = context
+        scannerDiagnosticsCurrent = []
+        scannerDiagnosticsPrevious = []
     }
 
     private func startSafetyListener() {
@@ -1232,6 +1276,20 @@ public final class SilentSearchCoordinator {
         case .topRight: "top_right"
         case .bottomLeft: "bottom_left"
         case .bottomRight: "bottom_right"
+        }
+    }
+
+    private static func orientationName(_ orientation: CGImagePropertyOrientation) -> String {
+        switch orientation {
+        case .up: "up"
+        case .upMirrored: "up_mirrored"
+        case .down: "down"
+        case .downMirrored: "down_mirrored"
+        case .left: "left"
+        case .leftMirrored: "left_mirrored"
+        case .right: "right"
+        case .rightMirrored: "right_mirrored"
+        @unknown default: "unknown"
         }
     }
 
