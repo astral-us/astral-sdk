@@ -238,8 +238,13 @@ public final class SilentSearchCoordinator {
                 calibrationTelemetryState = nil
             case let .qrLost(context):
                 calibrationVisualState.clearDetections()
-                calibrationVisualState.currentIssue = nil
-                calibrationTelemetryState = nil
+                switch calibrationVisualState.currentIssue {
+                case .some(.scannerFailure), .some(.groundingFailure(.wrongMarkerID)):
+                    break
+                default:
+                    calibrationVisualState.currentIssue = nil
+                    calibrationTelemetryState = nil
+                }
                 if calibrationMarkerPresent {
                     record("silent_search_qr_lost", fields: [
                         "generation": "\(context.frameID.generation)",

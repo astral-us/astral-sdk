@@ -686,7 +686,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.calibrationVisualState.recentDetections.isEmpty)
     }
 
-    func testWaitingForMarkerAndQRLossClearObsoleteIssues() async throws {
+    func testQRLossPreservesScannerFailureUntilSuccessfulEmptyScan() async throws {
         let harness = SilentSearchTestHarness()
         harness.readiness.snapshot = .ready(sessionGeneration: 4)
         let coordinator = harness.coordinator()
@@ -698,14 +698,53 @@ final class SilentSearchCoordinatorTests: XCTestCase {
 
         harness.calibration.send(.feedback(.scannerFailed(context: context)))
         await eventually { coordinator.calibrationVisualState.currentIssue == .scannerFailure }
+        harness.calibration.send(.feedback(.qrLost(context: context)))
+        await taskTurn()
+        XCTAssertEqual(coordinator.calibrationVisualState.currentIssue, .scannerFailure)
         harness.calibration.send(.feedback(.waitingForMarker(context: context)))
         await eventually { coordinator.calibrationVisualState.currentIssue == nil }
+    }
+
+    func testQRLossPreservesWrongMarkerUntilSuccessfulEmptyScan() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 4)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        let context = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 4, sequence: 1), monotonicTimestamp: 1
+        )
 
         harness.calibration.send(.feedback(.groundingFailed(
             context: context, reason: .wrongMarkerID
         )))
         await eventually {
             coordinator.calibrationVisualState.currentIssue == .groundingFailure(.wrongMarkerID)
+        }
+        harness.calibration.send(.feedback(.qrLost(context: context)))
+        await taskTurn()
+        XCTAssertEqual(
+            coordinator.calibrationVisualState.currentIssue, .groundingFailure(.wrongMarkerID)
+        )
+        harness.calibration.send(.feedback(.waitingForMarker(context: context)))
+        await eventually { coordinator.calibrationVisualState.currentIssue == nil }
+    }
+
+    func testQRLossClearsExpectedMarkerGroundingFailure() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 4)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        let context = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 4, sequence: 1), monotonicTimestamp: 1
+        )
+
+        harness.calibration.send(.feedback(.groundingFailed(
+            context: context, reason: .missingDepthMap
+        )))
+        await eventually {
+            coordinator.calibrationVisualState.currentIssue == .groundingFailure(.missingDepthMap)
         }
         harness.calibration.send(.feedback(.qrLost(context: context)))
         await eventually { coordinator.calibrationVisualState.currentIssue == nil }

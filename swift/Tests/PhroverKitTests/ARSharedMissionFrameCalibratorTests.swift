@@ -334,6 +334,49 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         consumer.cancel()
     }
 
+    func testSuccessfulEmptyScanClearsWrongMarkerFailureOnce() async {
+        let manager = ARSessionManager()
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { frame in
+            guard frame.monotonicTimestamp == 1 else { return [] }
+            return [OpticalObservation(
+                payload: Data("PHROVER-CAL|1|OTHER".utf8), frameID: frame.frameID,
+                monotonicTimestamp: frame.monotonicTimestamp, corners: corners
+            )]
+        }
+        let collector = CalibrationEventCollector()
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream { collector.append(event) }
+        }
+        await Task.yield()
+
+        for timestamp in [1.0, 2.0, 3.0] {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: timestamp,
+                cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+                trackingQuality: .normal
+            )
+            await Task.yield()
+        }
+
+        await eventually { collector.events.count == 2 }
+        XCTAssertEqual(collector.events, [
+            .feedback(.groundingFailed(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
+            ), reason: .wrongMarkerID)),
+            .feedback(.waitingForMarker(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
+            ))),
+        ])
+        consumer.cancel()
+    }
+
     func testQRLossEmitsAfterHalfASecondWithoutAnotherSnapshotAndDetectionCanResume() async {
         let manager = ARSessionManager()
         let corners = OrientedMarkerCorners(
