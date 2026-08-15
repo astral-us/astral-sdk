@@ -5,30 +5,51 @@ import RoverNav
 public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     public typealias Scanner = @Sendable (OpticalFrame) throws -> [OpticalObservation]
 
+    @MainActor
+    private final class CalibrationAttemptState {
+        var lastFailure: SilentSearchCalibrationIssue?
+
+        func markerExpired() {
+            switch lastFailure {
+            case .scannerFailure, .groundingFailure(.wrongMarkerID): break
+            default: lastFailure = nil
+            }
+        }
+    }
+
     private let sessionManager: ARSessionManager
     private let scanner: Scanner
     private let eventSink: (any SilentSearchEventSink)?
+    private let markerExpirySleep: @MainActor @Sendable () async throws -> Void
     private var task: Task<Void, Never>?
     private var markerExpiryTask: Task<Void, Never>?
     private var visibleMarkerContext: SilentSearchCalibrationFrameContext?
+    private var calibrationAttempt: CalibrationAttemptState?
 
     public init(sessionManager: ARSessionManager, scanner: OpticalQRCodeScanner = OpticalQRCodeScanner(),
                 events: (any SilentSearchEventSink)? = nil) {
         self.sessionManager = sessionManager
         self.scanner = { try scanner.scan($0) }
         self.eventSink = events
+        markerExpirySleep = { try await Task.sleep(for: .milliseconds(500)) }
     }
 
     init(sessionManager: ARSessionManager, events: (any SilentSearchEventSink)? = nil,
+         markerExpirySleep: @escaping @MainActor @Sendable () async throws -> Void = {
+             try await Task.sleep(for: .milliseconds(500))
+         },
          scanner: @escaping Scanner) {
         self.sessionManager = sessionManager
         self.scanner = scanner
         self.eventSink = events
+        self.markerExpirySleep = markerExpirySleep
     }
 
     public func events(markerID: String, sessionGeneration: UInt64) -> AsyncStream<SilentSearchCalibrationEvent> {
         cancel()
         return AsyncStream { continuation in
+            let attempt = CalibrationAttemptState()
+            calibrationAttempt = attempt
             task = Task { @MainActor [sessionManager, scanner, eventSink] in
                 guard let configuration = SharedMissionCalibrationConfiguration(markerID: markerID) else {
                     continuation.yield(.rejected(.invalidMarkerID))
@@ -38,7 +59,6 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                 var calibrator = SharedMissionCalibrator(
                     configuration: configuration, sessionGeneration: sessionGeneration, events: eventSink
                 )
-                var lastFailure: SilentSearchCalibrationIssue?
                 for await snapshot in sessionManager.snapshots() {
                     guard !Task.isCancelled else { break }
                     let context = SilentSearchCalibrationFrameContext(
@@ -46,9 +66,9 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                     )
                     guard snapshot.trackingQuality == .normal else {
                         let issue = SilentSearchCalibrationIssue.trackingNotNormal
-                        if issue != lastFailure {
+                        if issue != attempt.lastFailure {
                             continuation.yield(.feedback(.trackingNotNormal(context: context)))
-                            lastFailure = issue
+                            attempt.lastFailure = issue
                         }
                         continue
                     }
@@ -64,16 +84,16 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                     let scans: [OpticalObservation]
                     do {
                         scans = try scanner(opticalFrame)
-                        if scans.isEmpty, lastFailure != nil {
+                        if scans.isEmpty, attempt.lastFailure != nil {
                             continuation.yield(.feedback(.waitingForMarker(context: context)))
-                            lastFailure = nil
+                            attempt.lastFailure = nil
                         }
                     } catch {
-                        if lastFailure != .scannerFailure {
+                        if attempt.lastFailure != .scannerFailure {
                             continuation.yield(.feedback(.scannerFailed(
                                 context: context
                             )))
-                            lastFailure = .scannerFailure
+                            attempt.lastFailure = .scannerFailure
                         }
                         scans = []
                     }
@@ -95,7 +115,9 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                             }
                         }
                         if expectedMarkerWasValidated {
-                            scheduleMarkerExpiry(context: context, continuation: continuation)
+                            scheduleMarkerExpiry(
+                                context: context, attempt: attempt, continuation: continuation
+                            )
                             continuation.yield(.feedback(.expectedMarkerDetected(
                                 context: context, markerID: markerID, corners: scan.corners
                             )))
@@ -103,18 +125,18 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                         guard case let .success(observation) = result else {
                             guard case let .failure(reason) = result else { continue }
                             let issue = SilentSearchCalibrationIssue.groundingFailure(reason)
-                            if issue != lastFailure {
+                            if issue != attempt.lastFailure {
                                 continuation.yield(.feedback(.groundingFailed(
                                     context: context, reason: reason
                                 )))
-                                lastFailure = issue
+                                attempt.lastFailure = issue
                             }
                             continue
                         }
                         continuation.yield(.feedback(.allCornersGrounded(
                             context: context
                         )))
-                        lastFailure = nil
+                        attempt.lastFailure = nil
                         switch calibrator.observe(observation) {
                         case let .collecting(frameCount):
                             continuation.yield(.progress(
@@ -143,20 +165,25 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
         markerExpiryTask?.cancel()
         markerExpiryTask = nil
         visibleMarkerContext = nil
+        calibrationAttempt = nil
     }
 
     private func scheduleMarkerExpiry(
         context: SilentSearchCalibrationFrameContext,
+        attempt: CalibrationAttemptState,
         continuation: AsyncStream<SilentSearchCalibrationEvent>.Continuation
     ) {
         visibleMarkerContext = context
         markerExpiryTask?.cancel()
         markerExpiryTask = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .milliseconds(500)) }
+            guard let self else { return }
+            do { try await self.markerExpirySleep() }
             catch { return }
-            guard let self, self.visibleMarkerContext == context else { return }
+            guard self.calibrationAttempt === attempt,
+                  self.visibleMarkerContext == context else { return }
             self.visibleMarkerContext = nil
             self.markerExpiryTask = nil
+            attempt.markerExpired()
             continuation.yield(.feedback(.qrLost(context: context)))
         }
     }

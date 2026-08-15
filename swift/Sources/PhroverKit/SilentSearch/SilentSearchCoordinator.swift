@@ -36,6 +36,7 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var scheduledConvergenceRelease: SilentSearchInstant?
     @ObservationIgnored private var calibrationMarkerPresent = false
     @ObservationIgnored private var calibrationTelemetryState: CalibrationTelemetryState?
+    @ObservationIgnored private var calibrationRejectionTelemetryState: SharedMissionCalibrationDiagnostic?
 
     private enum OpticalAction {
         case present(Data)
@@ -305,7 +306,12 @@ public final class SilentSearchCoordinator {
         case let .rejected(reason):
             diagnostic = .calibrationRejected(reason)
             calibrationVisualState.currentIssue = .calibrationRejection(reason)
-            record("silent_search_calibration_rejected", fields: ["reason": String(describing: reason)])
+            if calibrationRejectionTelemetryState != reason {
+                record("silent_search_calibration_rejected", fields: [
+                    "reason": String(describing: reason),
+                ])
+                calibrationRejectionTelemetryState = reason
+            }
             return false
         case let .accepted(frame):
             guard frame.sessionGeneration == readiness.sessionGeneration else {
@@ -1034,6 +1040,7 @@ public final class SilentSearchCoordinator {
         calibrationVisualState = SilentSearchCalibrationVisualState()
         calibrationMarkerPresent = false
         calibrationTelemetryState = nil
+        calibrationRejectionTelemetryState = nil
     }
 
     private func startSafetyListener() {

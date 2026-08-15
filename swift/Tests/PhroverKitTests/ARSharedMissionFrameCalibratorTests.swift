@@ -444,6 +444,62 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         ])
     }
 
+    func testQRLossAllowsSameGroundingFailureAfterSnapshotsResume() async {
+        let manager = ARSessionManager()
+        let expiry = MarkerExpiryController()
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            markerExpirySleep: { await expiry.wait() }
+        ) { frame in
+            [OpticalObservation(
+                payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                corners: corners
+            )]
+        }
+        let collector = CalibrationEventCollector()
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream { collector.append(event) }
+        }
+        await Task.yield()
+
+        manager.ingestForTesting(
+            image: makeImage(), timestamp: 1, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+            trackingQuality: .normal
+        )
+        await eventually { collector.events.count == 2 && expiry.isWaiting }
+        expiry.expire()
+        await eventually { collector.events.count == 3 }
+
+        manager.ingestForTesting(
+            image: makeImage(), timestamp: 2, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+            trackingQuality: .normal
+        )
+        await eventually { collector.events.count == 5 }
+
+        XCTAssertEqual(collector.events.map { event in
+            switch event {
+            case .feedback(.expectedMarkerDetected): "detected"
+            case .feedback(.groundingFailed(_, .missingDepthMap)): "missing_depth"
+            case .feedback(.qrLost): "lost"
+            default: "unexpected"
+            }
+        }, ["detected", "missing_depth", "lost", "detected", "missing_depth"])
+        await eventually { expiry.isWaiting }
+        calibrator.cancel()
+        expiry.expire()
+        consumer.cancel()
+    }
+
     func testCancellingCalibrationCancelsPendingQRExpiry() async {
         let manager = ARSessionManager()
         let corners = OrientedMarkerCorners(
@@ -543,5 +599,20 @@ private final class CalibrationEventCollector {
 
     func append(_ event: SilentSearchCalibrationEvent) {
         events.append(event)
+    }
+}
+
+@MainActor
+private final class MarkerExpiryController {
+    private var continuation: CheckedContinuation<Void, Never>?
+    var isWaiting: Bool { continuation != nil }
+
+    func wait() async {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func expire() {
+        continuation?.resume()
+        continuation = nil
     }
 }

@@ -810,6 +810,39 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         })
     }
 
+    func testCalibrationRejectionTelemetryRecordsTransitionsOnly() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 4)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+
+        harness.calibration.send(.rejected(.headingDeviationExceeded))
+        harness.calibration.send(.feedback(.allCornersGrounded(context: .init(
+            frameID: ARFrameID(generation: 4, sequence: 12), monotonicTimestamp: 1
+        ))))
+        harness.calibration.send(.rejected(.headingDeviationExceeded))
+        harness.calibration.send(.feedback(.allCornersGrounded(context: .init(
+            frameID: ARFrameID(generation: 4, sequence: 13), monotonicTimestamp: 2
+        ))))
+        harness.calibration.send(.rejected(.originDeviationExceeded))
+        await eventually {
+            coordinator.diagnostic == .calibrationRejected(.originDeviationExceeded)
+        }
+
+        let entries = harness.events.entries.filter {
+            $0.event == "silent_search_calibration_rejected"
+        }
+        XCTAssertEqual(entries.map { $0.fields["reason"] }, [
+            "headingDeviationExceeded",
+            "originDeviationExceeded",
+        ])
+        XCTAssertEqual(
+            coordinator.calibrationVisualState.currentIssue,
+            .calibrationRejection(.originDeviationExceeded)
+        )
+    }
+
     func testCalibrationFailuresDoNotLatchExpectedMarkerSuccess() async throws {
         let harness = SilentSearchTestHarness()
         harness.readiness.snapshot = .ready(sessionGeneration: 4)
