@@ -30,7 +30,7 @@ This addresses a device-observed failure where calibration remained at `0 of 3`.
 
 The preview pipeline will:
 
-- render at approximately 10 FPS;
+- render at no more than 10 FPS, with at least 100 milliseconds between preview conversions;
 - reuse one `CIContext`;
 - buffer only the newest frame;
 - cancel its task and release the latest image when calibration ends.
@@ -90,7 +90,7 @@ Each stage uses a stable state:
 - yellow: the previous stage succeeded and this stage is pending;
 - green: succeeded during this calibration attempt.
 
-Successful stages remain latched until the attempt ends. The polygon itself is live rather than latched: it updates with current detections and disappears after a short absence so it does not remain over an obsolete camera position.
+Successful stages remain latched until the attempt ends. The polygon itself is live rather than latched: it updates with current detections and disappears after 500 milliseconds without a detection so it does not remain over an obsolete camera position.
 
 Expected guidance includes:
 
@@ -101,10 +101,10 @@ Expected guidance includes:
 
 ## Failure handling
 
-Failures that currently result in `continue` become explicit typed feedback where useful:
+The calibrator classifies every non-success path needed by the UI or telemetry as one of:
 
 - scanner error;
-- no expected QR payload;
+- no expected QR payload (normal waiting state);
 - wrong marker ID;
 - stale frame identity or timestamp;
 - tracking not normal;
