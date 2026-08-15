@@ -200,6 +200,55 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         ])
     }
 
+    func testExpectedMarkerDetectionIsObservedBeforeGroundingStarts() async {
+        let manager = ARSessionManager()
+        let collector = CalibrationEventCollector()
+        let probe = GroundingOrderProbe()
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let context = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 2
+        )
+        let detection = SilentSearchCalibrationEvent.feedback(.expectedMarkerDetected(
+            context: context, markerID: "SILENT_SEARCH_01", corners: corners
+        ))
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            grounder: { _, _, _, _ in
+                probe.record(eventsObserved: collector.events, expectedDetection: detection)
+                return .failure(.missingDepthMap)
+            }
+        ) { frame in
+            [OpticalObservation(
+                payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                corners: corners
+            )]
+        }
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream { collector.append(event) }
+        }
+        await Task.yield()
+
+        manager.ingestForTesting(
+            image: makeImage(), timestamp: 2, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 100, height: 100),
+            depthMap: nil, trackingQuality: .normal
+        )
+        await eventually { probe.wasInvoked }
+        await eventually { collector.events.count == 2 }
+
+        XCTAssertTrue(probe.detectionWasObserved)
+        XCTAssertEqual(Array(collector.events.prefix(2)), [
+            detection,
+            .feedback(.groundingFailed(context: context, reason: .missingDepthMap)),
+        ])
+        consumer.cancel()
+    }
+
     func testAllCornersGroundedFeedbackPrecedesCalibrationProgress() async {
         let manager = ARSessionManager()
         let snapshot = makeSnapshot(generation: 0, sequence: 1)
@@ -249,6 +298,57 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
             ),
             acceptedFrameCount: 1
         ))
+    }
+
+    func testThirdAcceptedSampleEmitsContextualProgressBeforeAcceptance() async {
+        let manager = ARSessionManager()
+        let snapshot = makeSnapshot(generation: 0, sequence: 1)
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { frame in
+            [OpticalObservation(
+                payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                corners: corners
+            )]
+        }
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let received = Task { () -> [SilentSearchCalibrationEvent] in
+            var events: [SilentSearchCalibrationEvent] = []
+            for await event in stream {
+                events.append(event)
+            }
+            return events
+        }
+        await Task.yield()
+
+        for timestamp in [1.0, 1.1, 1.2] {
+            manager.ingestForTesting(
+                image: snapshot.image, timestamp: timestamp,
+                cameraTransform: snapshot.cameraTransform,
+                intrinsics: snapshot.cameraIntrinsics, imageResolution: snapshot.imageResolution,
+                depthMap: snapshot.depthMap, trackingQuality: .normal
+            )
+            await Task.yield()
+        }
+
+        let events = await received.value
+        let context = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 0, sequence: 3), monotonicTimestamp: 1.2
+        )
+        guard case let .accepted(frame) = events.last else {
+            return XCTFail("Expected acceptance after third-sample progress, got \(events)")
+        }
+        XCTAssertEqual(Array(events.suffix(4)), [
+            .feedback(.expectedMarkerDetected(
+                context: context, markerID: "SILENT_SEARCH_01", corners: corners
+            )),
+            .feedback(.allCornersGrounded(context: context)),
+            .progress(context: context, acceptedFrameCount: 3),
+            .accepted(frame),
+        ])
     }
 
     func testScannerFailuresAreExplicitAndConsecutiveFailuresAreDeduplicated() async {
@@ -599,6 +699,20 @@ private final class CalibrationEventCollector {
 
     func append(_ event: SilentSearchCalibrationEvent) {
         events.append(event)
+    }
+}
+
+@MainActor
+private final class GroundingOrderProbe {
+    private(set) var wasInvoked = false
+    private(set) var detectionWasObserved = false
+
+    func record(
+        eventsObserved: [SilentSearchCalibrationEvent],
+        expectedDetection: SilentSearchCalibrationEvent
+    ) {
+        wasInvoked = true
+        detectionWasObserved = eventsObserved.last == expectedDetection
     }
 }
 

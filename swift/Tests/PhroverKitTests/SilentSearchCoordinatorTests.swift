@@ -618,6 +618,37 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(calibrationEvents.first?.fields["monotonic_timestamp"], "1.25")
     }
 
+    func testAcceptedCalibrationTelemetryPreservesThirdSampleContext() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 4)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+
+        let context = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 4, sequence: 14), monotonicTimestamp: 1.75
+        )
+        harness.calibration.send(.progress(context: context, acceptedFrameCount: 3))
+        let frame = try XCTUnwrap(SharedMissionFrame(
+            localOrigin: Vec2(1, 2), localNorthHeading: 0.3, sessionGeneration: 4
+        ))
+        harness.calibration.send(.accepted(frame))
+        await eventually { coordinator.phase == .handshake(.ready) }
+
+        XCTAssertEqual(coordinator.calibrationProgress, 3)
+        let entries = harness.events.entries.filter { $0.event.hasPrefix("silent_search_calibration_") }
+        XCTAssertEqual(entries.map(\.event), [
+            "silent_search_calibration_progress",
+            "silent_search_calibration_accepted",
+        ])
+        for entry in entries {
+            XCTAssertEqual(entry.fields["generation"], "4")
+            XCTAssertEqual(entry.fields["frame_sequence"], "14")
+            XCTAssertEqual(entry.fields["monotonic_timestamp"], "1.75")
+            XCTAssertEqual(entry.fields["sample_count"], "3")
+        }
+    }
+
     func testCalibrationVisualStagesLatchWhileQRPresentationCanExpire() async throws {
         let harness = SilentSearchTestHarness()
         harness.readiness.snapshot = .ready(sessionGeneration: 4)

@@ -37,6 +37,7 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var calibrationMarkerPresent = false
     @ObservationIgnored private var calibrationTelemetryState: CalibrationTelemetryState?
     @ObservationIgnored private var calibrationRejectionTelemetryState: SharedMissionCalibrationDiagnostic?
+    @ObservationIgnored private var calibrationProgressContext: SilentSearchCalibrationFrameContext?
 
     private enum OpticalAction {
         case present(Data)
@@ -105,6 +106,7 @@ public final class SilentSearchCoordinator {
         do { try transition(to: .calibrating) }
         catch { return false }
         calibrationProgress = 0
+        calibrationProgressContext = nil
         resetCalibrationVisualState()
         sharedFrame = nil
         diagnostic = nil
@@ -186,6 +188,7 @@ public final class SilentSearchCoordinator {
         partnerDeadlineTask?.cancel()
         partnerDeadlineTask = nil
         calibrationProgress = 0
+        calibrationProgressContext = nil
         resetCalibrationVisualState()
         diagnostic = nil
         readiness = dependencies.readiness.snapshot
@@ -294,6 +297,7 @@ public final class SilentSearchCoordinator {
             return false
         case let .progress(context, count):
             calibrationProgress = count
+            calibrationProgressContext = context
             calibrationVisualState.sampleAccepted = calibrationVisualState.sampleAccepted || count > 0
             diagnostic = nil
             record("silent_search_calibration_progress", fields: [
@@ -320,14 +324,20 @@ public final class SilentSearchCoordinator {
                 record("silent_search_calibration_rejected", fields: ["reason": "generationMismatch"])
                 return false
             }
+            let acceptedContext = calibrationProgress == 3 ? calibrationProgressContext : nil
             sharedFrame = frame
             calibrationProgress = 3
             resetCalibrationVisualState()
             diagnostic = nil
-            record("silent_search_calibration_accepted", fields: [
+            var fields = [
                 "generation": "\(frame.sessionGeneration)",
                 "sample_count": "\(calibrationProgress)",
-            ])
+            ]
+            if let context = acceptedContext {
+                fields["frame_sequence"] = "\(context.frameID.sequence)"
+                fields["monotonic_timestamp"] = "\(context.monotonicTimestamp)"
+            }
+            record("silent_search_calibration_accepted", fields: fields)
             try? transition(to: .handshake(.ready))
             return true
         }

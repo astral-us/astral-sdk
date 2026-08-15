@@ -4,6 +4,9 @@ import RoverNav
 @MainActor
 public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     public typealias Scanner = @Sendable (OpticalFrame) throws -> [OpticalObservation]
+    typealias Grounder = @MainActor @Sendable (
+        OpticalObservation, ARFrameSnapshot, String, UInt64
+    ) -> Result<SharedMissionCalibrationObservation, SilentSearchCalibrationGroundingFailure>
 
     @MainActor
     private final class CalibrationAttemptState {
@@ -19,6 +22,7 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
 
     private let sessionManager: ARSessionManager
     private let scanner: Scanner
+    private let grounder: Grounder
     private let eventSink: (any SilentSearchEventSink)?
     private let markerExpirySleep: @MainActor @Sendable () async throws -> Void
     private var task: Task<Void, Never>?
@@ -30,6 +34,7 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                 events: (any SilentSearchEventSink)? = nil) {
         self.sessionManager = sessionManager
         self.scanner = { try scanner.scan($0) }
+        grounder = Self.groundValidated
         self.eventSink = events
         markerExpirySleep = { try await Task.sleep(for: .milliseconds(500)) }
     }
@@ -38,9 +43,11 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
          markerExpirySleep: @escaping @MainActor @Sendable () async throws -> Void = {
              try await Task.sleep(for: .milliseconds(500))
          },
+         grounder: @escaping Grounder = ARSharedMissionFrameCalibrator.groundValidated,
          scanner: @escaping Scanner) {
         self.sessionManager = sessionManager
         self.scanner = scanner
+        self.grounder = grounder
         self.eventSink = events
         self.markerExpirySleep = markerExpirySleep
     }
@@ -50,7 +57,7 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
         return AsyncStream { continuation in
             let attempt = CalibrationAttemptState()
             calibrationAttempt = attempt
-            task = Task { @MainActor [sessionManager, scanner, eventSink] in
+            task = Task { @MainActor [sessionManager, scanner, grounder, eventSink] in
                 guard let configuration = SharedMissionCalibrationConfiguration(markerID: markerID) else {
                     continuation.yield(.rejected(.invalidMarkerID))
                     continuation.finish()
@@ -98,30 +105,29 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                         scans = []
                     }
                     for scan in scans {
-                        let result = Self.ground(
+                        let preflight = Self.preflight(
                             observation: scan, in: snapshot, expectedMarkerID: markerID,
                             sessionGeneration: sessionGeneration
                         )
-                        let expectedMarkerWasValidated: Bool
-                        switch result {
-                        case .success:
-                            expectedMarkerWasValidated = true
-                        case let .failure(reason):
-                            switch reason {
-                            case .missingDepthMap, .cornerUnavailable:
-                                expectedMarkerWasValidated = true
-                            default:
-                                expectedMarkerWasValidated = false
+                        guard case .success = preflight else {
+                            guard case let .failure(reason) = preflight else { continue }
+                            let issue = SilentSearchCalibrationIssue.groundingFailure(reason)
+                            if issue != attempt.lastFailure {
+                                continuation.yield(.feedback(.groundingFailed(
+                                    context: context, reason: reason
+                                )))
+                                attempt.lastFailure = issue
                             }
+                            continue
                         }
-                        if expectedMarkerWasValidated {
-                            scheduleMarkerExpiry(
-                                context: context, attempt: attempt, continuation: continuation
-                            )
-                            continuation.yield(.feedback(.expectedMarkerDetected(
-                                context: context, markerID: markerID, corners: scan.corners
-                            )))
-                        }
+                        scheduleMarkerExpiry(
+                            context: context, attempt: attempt, continuation: continuation
+                        )
+                        continuation.yield(.feedback(.expectedMarkerDetected(
+                            context: context, markerID: markerID, corners: scan.corners
+                        )))
+                        await Task.yield()
+                        let result = grounder(scan, snapshot, markerID, sessionGeneration)
                         guard case let .success(observation) = result else {
                             guard case let .failure(reason) = result else { continue }
                             let issue = SilentSearchCalibrationIssue.groundingFailure(reason)
@@ -145,6 +151,9 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                         case let .rejected(diagnostic):
                             continuation.yield(.rejected(diagnostic))
                         case let .accepted(frame):
+                            continuation.yield(.progress(
+                                context: context, acceptedFrameCount: 3
+                            ))
                             continuation.yield(.accepted(frame))
                             continuation.finish()
                             return
@@ -194,6 +203,24 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
         expectedMarkerID: String,
         sessionGeneration: UInt64
     ) -> Result<SharedMissionCalibrationObservation, SilentSearchCalibrationGroundingFailure> {
+        switch preflight(
+            observation: observation, in: snapshot, expectedMarkerID: expectedMarkerID,
+            sessionGeneration: sessionGeneration
+        ) {
+        case let .failure(reason): return .failure(reason)
+        case .success:
+            return groundValidated(
+                observation, snapshot, expectedMarkerID, sessionGeneration
+            )
+        }
+    }
+
+    private nonisolated static func preflight(
+        observation: OpticalObservation,
+        in snapshot: ARFrameSnapshot,
+        expectedMarkerID: String,
+        sessionGeneration: UInt64
+    ) -> Result<Void, SilentSearchCalibrationGroundingFailure> {
         guard snapshot.trackingQuality == .normal else { return .failure(.trackingNotNormal) }
         guard snapshot.id.generation == sessionGeneration else { return .failure(.generationMismatch) }
         guard observation.frameID == snapshot.id.sequence else { return .failure(.frameMismatch) }
@@ -203,6 +230,15 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
             return .failure(.invalidPayload)
         }
         guard markerID == expectedMarkerID else { return .failure(.wrongMarkerID) }
+        return .success(())
+    }
+
+    private nonisolated static func groundValidated(
+        _ observation: OpticalObservation,
+        _ snapshot: ARFrameSnapshot,
+        _ expectedMarkerID: String,
+        _ sessionGeneration: UInt64
+    ) -> Result<SharedMissionCalibrationObservation, SilentSearchCalibrationGroundingFailure> {
         guard snapshot.depthMap != nil else { return .failure(.missingDepthMap) }
         func point(_ normalized: Vec2) -> Vec2? {
             ARSessionManager.unproject(
