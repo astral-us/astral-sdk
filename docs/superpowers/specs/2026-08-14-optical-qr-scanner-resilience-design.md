@@ -45,7 +45,7 @@ A diagnostic contains only:
 4. If Vision produces no observation, run Core Image fallback.
 5. Return Core Image observations plus accumulated diagnostics when it decodes a QR.
 6. If Core Image completes with no QR, return an empty observation list plus diagnostics. This is a normal waiting state, not a calibration failure.
-7. Only frame validation or a failure that prevents every backend from running may throw from the detailed API.
+7. Only an invalid frame timestamp throws from the detailed API. Backend setup and execution failures return sanitized diagnostics and never throw.
 
 `VNDetectBarcodesRequest.usesCPUOnly` is removed so Vision chooses a supported execution path.
 
@@ -58,7 +58,7 @@ A diagnostic contains only:
 - backend diagnostics are emitted independently and do not overwrite successful QR, grounding, or accepted-sample state;
 - fallback success is never reported as `scanner_failure`.
 
-Repeated identical backend diagnostics are deduplicated or rate-limited. A changed backend, orientation, domain, or code may emit a new transition.
+Consecutive identical backend diagnostics are deduplicated by backend, orientation, domain, and code. A scan cycle without that diagnostic resets deduplication so a later recurrence emits a new transition.
 
 ## Telemetry
 
