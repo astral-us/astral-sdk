@@ -3,9 +3,7 @@ import SwiftUI
 
 struct CalibrationCameraPreview: View {
     let image: UIImage?
-    let corners: OrientedMarkerCorners?
     let projection: CalibrationViewProjection
-    let guidance: String
     let progress: Int
 
     var body: some View {
@@ -19,7 +17,7 @@ struct CalibrationCameraPreview: View {
                             .scaledToFit()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .accessibilityHidden(true)
-                        if let corners {
+                        if let corners = projection.visibleCorners {
                             markerPolygon(corners, imageSize: image.size, bounds: geometry.frame(in: .local))
                         }
                     } else {
@@ -40,16 +38,16 @@ struct CalibrationCameraPreview: View {
             }
 
             VStack(spacing: 8) {
-                stageRow("QR decoded", state: projection.stages[0], id: "silent_search_calibration_qr_stage")
-                stageRow("LiDAR corners grounded", state: projection.stages[1], id: "silent_search_calibration_grounding_stage")
-                stageRow("Sample accepted", state: projection.stages[2], id: "silent_search_calibration_sample_stage")
+                stageRow("QR decoded", state: projection.stages.qrDecoded, id: "silent_search_calibration_qr_stage")
+                stageRow("LiDAR corners grounded", state: projection.stages.cornersGrounded, id: "silent_search_calibration_grounding_stage")
+                stageRow("Sample accepted", state: projection.stages.sampleAccepted, id: "silent_search_calibration_sample_stage")
             }
 
             ProgressView(value: Double(progress), total: 3)
             Text("\(progress) of 3")
                 .font(.subheadline.monospacedDigit())
                 .accessibilityIdentifier("silent_search_calibration_progress")
-            Text(guidance)
+            Text(projection.guidance)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

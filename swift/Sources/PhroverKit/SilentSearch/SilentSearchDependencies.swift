@@ -77,7 +77,7 @@ public protocol SilentSearchReadinessChecking: AnyObject {
 
 public enum SilentSearchCalibrationEvent: Equatable, Sendable {
     case feedback(SilentSearchCalibrationFeedback)
-    case progress(acceptedFrameCount: Int)
+    case progress(context: SilentSearchCalibrationFrameContext, acceptedFrameCount: Int)
     case rejected(SharedMissionCalibrationDiagnostic)
     case accepted(SharedMissionFrame)
 }

@@ -113,9 +113,7 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
     private var calibration: some View {
         CalibrationCameraPreview(
             image: viewModel.calibrationPreviewImage,
-            corners: viewModel.calibrationVisualState.currentCorners,
             projection: viewModel.calibrationProjection,
-            guidance: viewModel.calibrationGuidance,
             progress: viewModel.calibrationProgress
         )
         .padding()

@@ -35,7 +35,6 @@ protocol SilentSearchViewModel: AnyObject, Observable {
     var calibrationPreviewImage: UIImage? { get }
     var calibrationVisualState: SilentSearchCalibrationVisualState { get }
     var calibrationProjection: CalibrationViewProjection { get }
-    var calibrationGuidance: String { get }
     var qrImage: CGImage? { get }
     var opticalTimedOut: Bool { get }
     var failureReason: String? { get }
@@ -56,6 +55,8 @@ enum SilentSearchLaunchScenario: String, CaseIterable {
     case setupNotReady = "setup-not-ready"
     case calibrating
     case calibrationQRDetected = "calibration-qr-detected"
+    case calibrationContextMismatch = "calibration-context-mismatch"
+    case calibrationQRLost = "calibration-qr-lost"
     case calibrationGroundingFailed = "calibration-grounding-failed"
     case calibrationSampleAccepted = "calibration-sample-accepted"
     case displayOffer = "display-offer"
@@ -93,11 +94,26 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
             calibrationVisualState.qrDecoded = true
             calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
             calibrationVisualState.currentCorners = Self.previewCorners
+            calibrationVisualState.currentFrameContext = Self.previewFrameContext
+        case .calibrationContextMismatch:
+            phase = .calibrating
+            calibrationVisualState.qrDecoded = true
+            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
+            calibrationVisualState.currentCorners = Self.previewCorners
+            calibrationVisualState.currentFrameContext = SilentSearchCalibrationFrameContext(
+                frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
+            )
+        case .calibrationQRLost:
+            phase = .calibrating
+            calibrationVisualState.qrDecoded = true
+            calibrationVisualState.cornersGrounded = true
+            calibrationVisualState.sampleAccepted = true
         case .calibrationGroundingFailed:
             phase = .calibrating
             calibrationVisualState.qrDecoded = true
             calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
             calibrationVisualState.currentCorners = Self.previewCorners
+            calibrationVisualState.currentFrameContext = Self.previewFrameContext
             calibrationVisualState.currentIssue = .groundingFailure(.cornerUnavailable(.topLeft))
         case .calibrationSampleAccepted:
             phase = .calibrating
@@ -106,6 +122,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
             calibrationVisualState.sampleAccepted = true
             calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
             calibrationVisualState.currentCorners = Self.previewCorners
+            calibrationVisualState.currentFrameContext = Self.previewFrameContext
         case .displayOffer: phase = .displayingQR
         case .displayTimeout:
             phase = .displayingQR
@@ -172,9 +189,11 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         return UIImage(systemName: "camera.metering.center.weighted")
     }
     var calibrationProjection: CalibrationViewProjection {
-        CalibrationViewProjection(state: calibrationVisualState)
+        CalibrationViewProjection(
+            state: calibrationVisualState,
+            latestRenderedFrameContext: Self.previewFrameContext
+        )
     }
-    var calibrationGuidance: String { calibrationProjection.guidance }
 
     var qrImage: CGImage? {
         guard phase == .displayingQR else { return nil }
@@ -205,6 +224,9 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     private static let previewCorners = OrientedMarkerCorners(
         topLeft: Vec2(0.2, 0.8), topRight: Vec2(0.8, 0.8),
         bottomLeft: Vec2(0.2, 0.2), bottomRight: Vec2(0.8, 0.2)
+    )
+    private static let previewFrameContext = SilentSearchCalibrationFrameContext(
+        frameID: ARFrameID(generation: 1, sequence: 2), monotonicTimestamp: 2
     )
 }
 
@@ -366,10 +388,10 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     var calibrationProjection: CalibrationViewProjection {
         CalibrationViewProjection(
             state: calibrationVisualState,
-            expectedMarkerID: coordinator.mission?.markerID ?? "SILENT_SEARCH_01"
+            expectedMarkerID: coordinator.mission?.markerID ?? "SILENT_SEARCH_01",
+            latestRenderedFrameContext: calibrationPreview.latestRenderedFrameContext
         )
     }
-    var calibrationGuidance: String { calibrationProjection.guidance }
     var supportedTargetLabels: [String] { environment.supportedTargetLabels }
     var qrImage: CGImage? {
         guard phase == .displayingQR, let payload = presentation.payload else { return nil }

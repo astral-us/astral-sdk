@@ -18,26 +18,37 @@ public enum SilentSearchCalibrationGroundingFailure: Error, Equatable, Sendable 
     case cornerUnavailable(SilentSearchCalibrationCorner)
 }
 
+public struct SilentSearchCalibrationFrameContext: Equatable, Sendable {
+    public let frameID: ARFrameID
+    public let monotonicTimestamp: TimeInterval
+
+    public init(frameID: ARFrameID, monotonicTimestamp: TimeInterval) {
+        self.frameID = frameID
+        self.monotonicTimestamp = monotonicTimestamp
+    }
+}
+
 public enum SilentSearchCalibrationFeedback: Equatable, Sendable {
+    case trackingNotNormal(context: SilentSearchCalibrationFrameContext)
     case expectedMarkerDetected(
-        frameID: ARFrameID,
-        monotonicTimestamp: TimeInterval,
+        context: SilentSearchCalibrationFrameContext,
         markerID: String,
         corners: OrientedMarkerCorners
     )
-    case qrLost(frameID: ARFrameID, monotonicTimestamp: TimeInterval)
-    case scannerFailed(frameID: ARFrameID, monotonicTimestamp: TimeInterval)
+    case qrLost(context: SilentSearchCalibrationFrameContext)
+    case scannerFailed(context: SilentSearchCalibrationFrameContext)
     case groundingFailed(
-        frameID: ARFrameID,
-        monotonicTimestamp: TimeInterval,
+        context: SilentSearchCalibrationFrameContext,
         reason: SilentSearchCalibrationGroundingFailure
     )
-    case allCornersGrounded(frameID: ARFrameID, monotonicTimestamp: TimeInterval)
+    case allCornersGrounded(context: SilentSearchCalibrationFrameContext)
 }
 
 public enum SilentSearchCalibrationIssue: Equatable, Sendable {
+    case trackingNotNormal
     case scannerFailure
     case groundingFailure(SilentSearchCalibrationGroundingFailure)
+    case calibrationRejection(SharedMissionCalibrationDiagnostic)
 }
 
 public struct SilentSearchCalibrationVisualState: Equatable, Sendable {
@@ -46,6 +57,7 @@ public struct SilentSearchCalibrationVisualState: Equatable, Sendable {
     public var sampleAccepted = false
     public var currentMarkerID: String?
     public var currentCorners: OrientedMarkerCorners?
+    public var currentFrameContext: SilentSearchCalibrationFrameContext?
     public var lastDetectionTimestamp: TimeInterval?
     public var currentIssue: SilentSearchCalibrationIssue?
 

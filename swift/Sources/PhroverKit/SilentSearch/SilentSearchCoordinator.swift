@@ -43,6 +43,7 @@ public final class SilentSearchCoordinator {
     }
 
     private enum CalibrationTelemetryState: Equatable {
+        case trackingNotNormal
         case scannerFailure
         case groundingFailure(SilentSearchCalibrationGroundingFailure)
         case cornersGrounded
@@ -103,9 +104,7 @@ public final class SilentSearchCoordinator {
         do { try transition(to: .calibrating) }
         catch { return false }
         calibrationProgress = 0
-        calibrationVisualState = SilentSearchCalibrationVisualState()
-        calibrationMarkerPresent = false
-        calibrationTelemetryState = nil
+        resetCalibrationVisualState()
         sharedFrame = nil
         diagnostic = nil
         let events = dependencies.calibration.events(
@@ -186,9 +185,7 @@ public final class SilentSearchCoordinator {
         partnerDeadlineTask?.cancel()
         partnerDeadlineTask = nil
         calibrationProgress = 0
-        calibrationVisualState = SilentSearchCalibrationVisualState()
-        calibrationMarkerPresent = false
-        calibrationTelemetryState = nil
+        resetCalibrationVisualState()
         diagnostic = nil
         readiness = dependencies.readiness.snapshot
         try? transition(to: .setup)
@@ -212,48 +209,61 @@ public final class SilentSearchCoordinator {
         switch event {
         case let .feedback(feedback):
             switch feedback {
-            case let .expectedMarkerDetected(frameID, timestamp, markerID, corners):
+            case let .trackingNotNormal(context):
+                calibrationVisualState.currentIssue = .trackingNotNormal
+                let state = CalibrationTelemetryState.trackingNotNormal
+                if calibrationTelemetryState != state {
+                    record("silent_search_grounding_failed", fields: [
+                        "generation": "\(context.frameID.generation)",
+                        "frame_sequence": "\(context.frameID.sequence)",
+                        "reason": "tracking_not_normal",
+                    ])
+                    calibrationTelemetryState = state
+                }
+            case let .expectedMarkerDetected(context, markerID, corners):
                 calibrationVisualState.qrDecoded = true
                 calibrationVisualState.currentMarkerID = markerID
                 calibrationVisualState.currentCorners = corners
-                calibrationVisualState.lastDetectionTimestamp = timestamp
+                calibrationVisualState.currentFrameContext = context
+                calibrationVisualState.lastDetectionTimestamp = context.monotonicTimestamp
                 if !calibrationMarkerPresent {
                     record("silent_search_qr_detected", fields: [
                         "marker": markerID,
-                        "generation": "\(frameID.generation)",
-                        "frame_sequence": "\(frameID.sequence)",
+                        "generation": "\(context.frameID.generation)",
+                        "frame_sequence": "\(context.frameID.sequence)",
                     ])
                     calibrationMarkerPresent = true
                 }
-            case let .qrLost(frameID, _):
+            case let .qrLost(context):
                 calibrationVisualState.currentMarkerID = nil
                 calibrationVisualState.currentCorners = nil
+                calibrationVisualState.currentFrameContext = nil
                 calibrationVisualState.lastDetectionTimestamp = nil
                 if calibrationMarkerPresent {
                     record("silent_search_qr_lost", fields: [
-                        "generation": "\(frameID.generation)",
-                        "frame_sequence": "\(frameID.sequence)",
+                        "generation": "\(context.frameID.generation)",
+                        "frame_sequence": "\(context.frameID.sequence)",
                     ])
                     calibrationMarkerPresent = false
                 }
-            case let .scannerFailed(frameID, _):
+            case let .scannerFailed(context):
                 calibrationVisualState.currentIssue = .scannerFailure
                 let state = CalibrationTelemetryState.scannerFailure
                 if calibrationTelemetryState != state {
                     record("silent_search_grounding_failed", fields: [
-                        "generation": "\(frameID.generation)",
-                        "frame_sequence": "\(frameID.sequence)",
+                        "generation": "\(context.frameID.generation)",
+                        "frame_sequence": "\(context.frameID.sequence)",
                         "reason": "scanner_failure",
                     ])
                     calibrationTelemetryState = state
                 }
-            case let .groundingFailed(frameID, _, reason):
+            case let .groundingFailed(context, reason):
                 calibrationVisualState.currentIssue = .groundingFailure(reason)
                 let state = CalibrationTelemetryState.groundingFailure(reason)
                 if calibrationTelemetryState != state {
                     var fields = [
-                        "generation": "\(frameID.generation)",
-                        "frame_sequence": "\(frameID.sequence)",
+                        "generation": "\(context.frameID.generation)",
+                        "frame_sequence": "\(context.frameID.sequence)",
                         "reason": Self.groundingReasonName(reason),
                     ]
                     if case let .cornerUnavailable(corner) = reason {
@@ -262,40 +272,45 @@ public final class SilentSearchCoordinator {
                     record("silent_search_grounding_failed", fields: fields)
                     calibrationTelemetryState = state
                 }
-            case let .allCornersGrounded(frameID, _):
+            case let .allCornersGrounded(context):
                 calibrationVisualState.cornersGrounded = true
                 calibrationVisualState.currentIssue = nil
                 let state = CalibrationTelemetryState.cornersGrounded
                 if calibrationTelemetryState != state {
                     record("silent_search_corners_grounded", fields: [
-                        "generation": "\(frameID.generation)",
-                        "frame_sequence": "\(frameID.sequence)",
+                        "generation": "\(context.frameID.generation)",
+                        "frame_sequence": "\(context.frameID.sequence)",
                     ])
                     calibrationTelemetryState = state
                 }
             }
             return false
-        case let .progress(count):
+        case let .progress(context, count):
             calibrationProgress = count
             calibrationVisualState.sampleAccepted = calibrationVisualState.sampleAccepted || count > 0
             diagnostic = nil
-            record("silent_search_calibration_progress", fields: ["sample_count": "\(count)"])
+            record("silent_search_calibration_progress", fields: [
+                "generation": "\(context.frameID.generation)",
+                "frame_sequence": "\(context.frameID.sequence)",
+                "monotonic_timestamp": "\(context.monotonicTimestamp)",
+                "sample_count": "\(count)",
+            ])
             return false
         case let .rejected(reason):
             diagnostic = .calibrationRejected(reason)
+            calibrationVisualState.currentIssue = .calibrationRejection(reason)
             record("silent_search_calibration_rejected", fields: ["reason": String(describing: reason)])
             return false
         case let .accepted(frame):
             guard frame.sessionGeneration == readiness.sessionGeneration else {
                 diagnostic = .calibrationRejected(.generationMismatch)
+                calibrationVisualState.currentIssue = .calibrationRejection(.generationMismatch)
                 record("silent_search_calibration_rejected", fields: ["reason": "generationMismatch"])
                 return false
             }
             sharedFrame = frame
             calibrationProgress = 3
-            calibrationVisualState = SilentSearchCalibrationVisualState()
-            calibrationMarkerPresent = false
-            calibrationTelemetryState = nil
+            resetCalibrationVisualState()
             diagnostic = nil
             record("silent_search_calibration_accepted", fields: [
                 "generation": "\(frame.sessionGeneration)",
@@ -998,9 +1013,7 @@ public final class SilentSearchCoordinator {
             partnerDeadlineTask?.cancel()
             partnerDeadlineTask = nil
             dependencies.calibration.cancel()
-            calibrationVisualState = SilentSearchCalibrationVisualState()
-            calibrationMarkerPresent = false
-            calibrationTelemetryState = nil
+            resetCalibrationVisualState()
             dependencies.opticalExchange.cancel()
             await dependencies.motion.stop()
             safetyListenerTask?.cancel()
@@ -1009,6 +1022,12 @@ public final class SilentSearchCoordinator {
             try? transition(to: .terminal(result))
             return
         }
+    }
+
+    private func resetCalibrationVisualState() {
+        calibrationVisualState = SilentSearchCalibrationVisualState()
+        calibrationMarkerPresent = false
+        calibrationTelemetryState = nil
     }
 
     private func startSafetyListener() {

@@ -55,6 +55,23 @@ final class SilentSearchUITests: XCTestCase {
         XCTAssertEqual(app.otherElements["silent_search_calibration_grounding_stage"].value as? String, "Pending")
     }
 
+    func testNewerPreviewDoesNotShowOlderMarkerPolygon() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "calibration-context-mismatch")
+
+        XCTAssertTrue(app.otherElements["silent_search_calibration_preview"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.otherElements["silent_search_calibration_polygon"].exists)
+    }
+
+    func testLostMarkerClearsLabelButPreservesCompletedStages() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "calibration-qr-lost")
+
+        XCTAssertTrue(app.otherElements["silent_search_calibration_preview"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["silent_search_calibration_marker"].exists)
+        XCTAssertEqual(app.otherElements["silent_search_calibration_qr_stage"].value as? String, "Succeeded")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_grounding_stage"].value as? String, "Succeeded")
+        XCTAssertEqual(app.otherElements["silent_search_calibration_sample_stage"].value as? String, "Succeeded")
+    }
+
     func testGroundingFailureShowsActionableGuidance() {
         let app = XCUIApplication.launchingSilentSearch(scenario: "calibration-grounding-failed")
 

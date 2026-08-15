@@ -40,6 +40,7 @@ final class CalibrationPreviewModel {
     typealias Renderer = @MainActor (ARFrameSnapshot) -> UIImage?
 
     private(set) var image: UIImage?
+    private(set) var latestRenderedFrameContext: SilentSearchCalibrationFrameContext?
     @ObservationIgnored private let frames: @MainActor () -> AsyncStream<ARFrameSnapshot>
     @ObservationIgnored private let render: Renderer
     @ObservationIgnored private let minimumInterval: TimeInterval
@@ -72,6 +73,9 @@ final class CalibrationPreviewModel {
                     continue
                 }
                 lastRenderedTimestamp = snapshot.timestamp
+                latestRenderedFrameContext = SilentSearchCalibrationFrameContext(
+                    frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp
+                )
                 image = render(snapshot)
             }
         }
@@ -82,6 +86,7 @@ final class CalibrationPreviewModel {
         task = nil
         lastRenderedTimestamp = nil
         image = nil
+        latestRenderedFrameContext = nil
     }
 }
 
@@ -102,18 +107,35 @@ enum CalibrationStageState: Equatable {
     case succeeded
 }
 
+struct CalibrationStages: Equatable {
+    let qrDecoded: CalibrationStageState
+    let cornersGrounded: CalibrationStageState
+    let sampleAccepted: CalibrationStageState
+}
+
 struct CalibrationViewProjection: Equatable {
     let markerText: String?
-    let stages: [CalibrationStageState]
+    let visibleCorners: OrientedMarkerCorners?
+    let stages: CalibrationStages
     let guidance: String
 
-    init(state: SilentSearchCalibrationVisualState, expectedMarkerID: String = "SILENT_SEARCH_01") {
-        markerText = state.qrDecoded ? "Marker \(state.currentMarkerID ?? expectedMarkerID)" : nil
-        stages = [
-            state.qrDecoded ? .succeeded : .pending,
-            state.cornersGrounded ? .succeeded : (state.qrDecoded ? .pending : .waiting),
-            state.sampleAccepted ? .succeeded : (state.cornersGrounded ? .pending : .waiting),
-        ]
+    init(
+        state: SilentSearchCalibrationVisualState,
+        expectedMarkerID: String = "SILENT_SEARCH_01",
+        latestRenderedFrameContext: SilentSearchCalibrationFrameContext? = nil
+    ) {
+        markerText = state.currentMarkerID.map { "Marker \($0)" }
+        if let currentFrameContext = state.currentFrameContext,
+           currentFrameContext == latestRenderedFrameContext {
+            visibleCorners = state.currentCorners
+        } else {
+            visibleCorners = nil
+        }
+        stages = CalibrationStages(
+            qrDecoded: state.qrDecoded ? .succeeded : .pending,
+            cornersGrounded: state.cornersGrounded ? .succeeded : (state.qrDecoded ? .pending : .waiting),
+            sampleAccepted: state.sampleAccepted ? .succeeded : (state.cornersGrounded ? .pending : .waiting)
+        )
         guidance = Self.guidance(for: state, expectedMarkerID: expectedMarkerID)
     }
 
@@ -121,7 +143,7 @@ struct CalibrationViewProjection: Equatable {
         for state: SilentSearchCalibrationVisualState, expectedMarkerID: String
     ) -> String {
         switch state.currentIssue {
-        case .groundingFailure(.trackingNotNormal), .groundingFailure(.generationMismatch),
+        case .trackingNotNormal, .groundingFailure(.trackingNotNormal), .groundingFailure(.generationMismatch),
              .groundingFailure(.frameMismatch), .groundingFailure(.timestampMismatch):
             "Restore normal AR tracking before calibrating."
         case .scannerFailure:
@@ -130,10 +152,35 @@ struct CalibrationViewProjection: Equatable {
             "Show marker \(expectedMarkerID)."
         case .groundingFailure:
             "Move the marker toward center or adjust the camera angle."
+        case let .calibrationRejection(reason):
+            rejectionGuidance(reason, expectedMarkerID: expectedMarkerID)
         case nil where state.cornersGrounded:
             "Hold steady while samples are collected."
         case nil:
             "Center the complete marker with its white border visible."
+        }
+    }
+
+    private static func rejectionGuidance(
+        _ reason: SharedMissionCalibrationDiagnostic, expectedMarkerID: String
+    ) -> String {
+        switch reason {
+        case .invalidMarkerID:
+            "Use a marker with a valid identifier."
+        case .unexpectedMarkerID:
+            "Show marker \(expectedMarkerID)."
+        case .generationMismatch:
+            "AR session changed. Restart calibration."
+        case .duplicateFrame:
+            "Keep the marker visible while waiting for a new camera frame."
+        case .nonFiniteObservation:
+            "Reframe the complete marker and try again."
+        case .degenerateCorners:
+            "Flatten the marker and keep its complete border visible."
+        case .timeWindowExceeded:
+            "Calibration took too long. Hold the marker steady and try again."
+        case .originDeviationExceeded, .headingDeviationExceeded, .widthDeviationExceeded:
+            "Marker samples disagree. Hold the marker still and try again."
         }
     }
 }

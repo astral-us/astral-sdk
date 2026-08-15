@@ -9,6 +9,8 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     private let scanner: Scanner
     private let eventSink: (any SilentSearchEventSink)?
     private var task: Task<Void, Never>?
+    private var markerExpiryTask: Task<Void, Never>?
+    private var visibleMarkerContext: SilentSearchCalibrationFrameContext?
 
     public init(sessionManager: ARSessionManager, scanner: OpticalQRCodeScanner = OpticalQRCodeScanner(),
                 events: (any SilentSearchEventSink)? = nil) {
@@ -37,15 +39,22 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                     configuration: configuration, sessionGeneration: sessionGeneration, events: eventSink
                 )
                 var lastFailure: SilentSearchCalibrationIssue?
-                var lastExpectedDetectionTimestamp: TimeInterval?
-                var markerVisible = false
                 for await snapshot in sessionManager.snapshots() {
                     guard !Task.isCancelled else { break }
-                    guard snapshot.trackingQuality == .normal else { continue }
+                    let context = SilentSearchCalibrationFrameContext(
+                        frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp
+                    )
+                    guard snapshot.trackingQuality == .normal else {
+                        let issue = SilentSearchCalibrationIssue.trackingNotNormal
+                        if issue != lastFailure {
+                            continuation.yield(.feedback(.trackingNotNormal(context: context)))
+                            lastFailure = issue
+                        }
+                        continue
+                    }
                     guard snapshot.id.generation == sessionGeneration else {
                         continuation.yield(.feedback(.groundingFailed(
-                            frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
-                            reason: .generationMismatch
+                            context: context, reason: .generationMismatch
                         )))
                         continuation.yield(.rejected(.generationMismatch))
                         break
@@ -58,13 +67,12 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                     } catch {
                         if lastFailure != .scannerFailure {
                             continuation.yield(.feedback(.scannerFailed(
-                                frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp
+                                context: context
                             )))
                             lastFailure = .scannerFailure
                         }
                         scans = []
                     }
-                    var detectedExpectedMarker = false
                     for scan in scans {
                         let result = Self.ground(
                             observation: scan, in: snapshot, expectedMarkerID: markerID,
@@ -83,12 +91,9 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                             }
                         }
                         if expectedMarkerWasValidated {
-                            detectedExpectedMarker = true
-                            markerVisible = true
-                            lastExpectedDetectionTimestamp = snapshot.timestamp
+                            scheduleMarkerExpiry(context: context, continuation: continuation)
                             continuation.yield(.feedback(.expectedMarkerDetected(
-                                frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
-                                markerID: markerID, corners: scan.corners
+                                context: context, markerID: markerID, corners: scan.corners
                             )))
                         }
                         guard case let .success(observation) = result else {
@@ -96,20 +101,21 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                             let issue = SilentSearchCalibrationIssue.groundingFailure(reason)
                             if issue != lastFailure {
                                 continuation.yield(.feedback(.groundingFailed(
-                                    frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
-                                    reason: reason
+                                    context: context, reason: reason
                                 )))
                                 lastFailure = issue
                             }
                             continue
                         }
                         continuation.yield(.feedback(.allCornersGrounded(
-                            frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp
+                            context: context
                         )))
                         lastFailure = nil
                         switch calibrator.observe(observation) {
                         case let .collecting(frameCount):
-                            continuation.yield(.progress(acceptedFrameCount: frameCount))
+                            continuation.yield(.progress(
+                                context: context, acceptedFrameCount: frameCount
+                            ))
                         case let .rejected(diagnostic):
                             continuation.yield(.rejected(diagnostic))
                         case let .accepted(frame):
@@ -117,14 +123,6 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                             continuation.finish()
                             return
                         }
-                    }
-                    if !detectedExpectedMarker, markerVisible,
-                       let lastExpectedDetectionTimestamp,
-                       snapshot.timestamp - lastExpectedDetectionTimestamp >= 0.5 {
-                        continuation.yield(.feedback(.qrLost(
-                            frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp
-                        )))
-                        markerVisible = false
                     }
                 }
                 continuation.finish()
@@ -138,6 +136,25 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     public func cancel() {
         task?.cancel()
         task = nil
+        markerExpiryTask?.cancel()
+        markerExpiryTask = nil
+        visibleMarkerContext = nil
+    }
+
+    private func scheduleMarkerExpiry(
+        context: SilentSearchCalibrationFrameContext,
+        continuation: AsyncStream<SilentSearchCalibrationEvent>.Continuation
+    ) {
+        visibleMarkerContext = context
+        markerExpiryTask?.cancel()
+        markerExpiryTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(500)) }
+            catch { return }
+            guard let self, self.visibleMarkerContext == context else { return }
+            self.visibleMarkerContext = nil
+            self.markerExpiryTask = nil
+            continuation.yield(.feedback(.qrLost(context: context)))
+        }
     }
 
     nonisolated static func ground(

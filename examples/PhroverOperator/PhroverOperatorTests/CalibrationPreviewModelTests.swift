@@ -26,6 +26,12 @@ final class CalibrationPreviewModelTests: XCTestCase {
 
         XCTAssertEqual(renderedSequences, [1, 3])
         XCTAssertTrue(model.image === secondImage)
+        XCTAssertEqual(
+            model.latestRenderedFrameContext,
+            SilentSearchCalibrationFrameContext(
+                frameID: ARFrameID(generation: 1, sequence: 3), monotonicTimestamp: 10.101
+            )
+        )
     }
 
     func testStopCancelsConsumptionAndReleasesImage() async throws {
@@ -44,6 +50,7 @@ final class CalibrationPreviewModelTests: XCTestCase {
         await Task.yield()
 
         XCTAssertNil(model.image)
+        XCTAssertNil(model.latestRenderedFrameContext)
         XCTAssertEqual(renderCount, 1)
     }
 
@@ -94,7 +101,9 @@ final class CalibrationPreviewModelTests: XCTestCase {
 
     func testProjectionMapsLatchedStagesAndGuidance() {
         var state = SilentSearchCalibrationVisualState()
-        XCTAssertEqual(CalibrationViewProjection(state: state).stages, [.pending, .waiting, .waiting])
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.qrDecoded, .pending)
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.cornersGrounded, .waiting)
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.sampleAccepted, .waiting)
         XCTAssertEqual(
             CalibrationViewProjection(state: state).guidance,
             "Center the complete marker with its white border visible."
@@ -103,20 +112,56 @@ final class CalibrationPreviewModelTests: XCTestCase {
         state.qrDecoded = true
         state.currentMarkerID = "SILENT_SEARCH_01"
         state.currentCorners = markerCorners
-        XCTAssertEqual(CalibrationViewProjection(state: state).stages, [.succeeded, .pending, .waiting])
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.qrDecoded, .succeeded)
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.cornersGrounded, .pending)
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.sampleAccepted, .waiting)
         XCTAssertEqual(CalibrationViewProjection(state: state).markerText, "Marker SILENT_SEARCH_01")
 
         state.currentCorners = nil
         state.currentMarkerID = nil
-        XCTAssertEqual(CalibrationViewProjection(state: state).stages, [.succeeded, .pending, .waiting])
-        XCTAssertEqual(CalibrationViewProjection(state: state).markerText, "Marker SILENT_SEARCH_01")
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.qrDecoded, .succeeded)
+        XCTAssertNil(CalibrationViewProjection(state: state).markerText)
 
         state.cornersGrounded = true
-        XCTAssertEqual(CalibrationViewProjection(state: state).stages, [.succeeded, .succeeded, .pending])
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.cornersGrounded, .succeeded)
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.sampleAccepted, .pending)
         XCTAssertEqual(CalibrationViewProjection(state: state).guidance, "Hold steady while samples are collected.")
 
         state.sampleAccepted = true
-        XCTAssertEqual(CalibrationViewProjection(state: state).stages, [.succeeded, .succeeded, .succeeded])
+        XCTAssertEqual(CalibrationViewProjection(state: state).stages.sampleAccepted, .succeeded)
+    }
+
+    func testProjectionShowsCornersOnlyForTheRenderedFrameContext() {
+        let renderedContext = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 1, sequence: 2), monotonicTimestamp: 2
+        )
+        var state = SilentSearchCalibrationVisualState()
+        state.currentCorners = markerCorners
+        state.currentFrameContext = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
+        )
+
+        state.currentFrameContext = nil
+        XCTAssertNil(
+            CalibrationViewProjection(state: state).visibleCorners,
+            "Two missing contexts must not count as a context match"
+        )
+        state.currentFrameContext = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
+        )
+        XCTAssertNil(
+            CalibrationViewProjection(
+                state: state, latestRenderedFrameContext: renderedContext
+            ).visibleCorners
+        )
+
+        state.currentFrameContext = renderedContext
+        XCTAssertEqual(
+            CalibrationViewProjection(
+                state: state, latestRenderedFrameContext: renderedContext
+            ).visibleCorners,
+            markerCorners
+        )
     }
 
     func testProjectionUsesExactIssueGuidancePrecedence() {
@@ -134,6 +179,31 @@ final class CalibrationPreviewModelTests: XCTestCase {
         XCTAssertEqual(CalibrationViewProjection(state: state).guidance, "QR scanner unavailable. Reframe and try again.")
         state.currentIssue = .groundingFailure(.trackingNotNormal)
         XCTAssertEqual(CalibrationViewProjection(state: state).guidance, "Restore normal AR tracking before calibrating.")
+    }
+
+    func testProjectionMapsTypedCalibrationRejectionsToActionableGuidance() {
+        let expectedGuidance: [(SharedMissionCalibrationDiagnostic, String)] = [
+            (.invalidMarkerID, "Use a marker with a valid identifier."),
+            (.unexpectedMarkerID, "Show marker EXPECTED."),
+            (.generationMismatch, "AR session changed. Restart calibration."),
+            (.duplicateFrame, "Keep the marker visible while waiting for a new camera frame."),
+            (.nonFiniteObservation, "Reframe the complete marker and try again."),
+            (.degenerateCorners, "Flatten the marker and keep its complete border visible."),
+            (.timeWindowExceeded, "Calibration took too long. Hold the marker steady and try again."),
+            (.originDeviationExceeded, "Marker samples disagree. Hold the marker still and try again."),
+            (.headingDeviationExceeded, "Marker samples disagree. Hold the marker still and try again."),
+            (.widthDeviationExceeded, "Marker samples disagree. Hold the marker still and try again."),
+        ]
+
+        for (rejection, guidance) in expectedGuidance {
+            var state = SilentSearchCalibrationVisualState()
+            state.currentIssue = .calibrationRejection(rejection)
+            XCTAssertEqual(
+                CalibrationViewProjection(state: state, expectedMarkerID: "EXPECTED").guidance,
+                guidance,
+                "Unexpected guidance for \(rejection)"
+            )
+        }
     }
 
     private var markerCorners: OrientedMarkerCorners {
