@@ -92,17 +92,19 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .calibrationQRDetected:
             phase = .calibrating
             calibrationVisualState.qrDecoded = true
-            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
-            calibrationVisualState.currentCorners = Self.previewCorners
-            calibrationVisualState.currentFrameContext = Self.previewFrameContext
+            calibrationVisualState.recordDetection(.init(
+                context: Self.previewFrameContext,
+                markerID: "SILENT_SEARCH_01", corners: Self.previewCorners
+            ))
         case .calibrationContextMismatch:
             phase = .calibrating
             calibrationVisualState.qrDecoded = true
-            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
-            calibrationVisualState.currentCorners = Self.previewCorners
-            calibrationVisualState.currentFrameContext = SilentSearchCalibrationFrameContext(
-                frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
-            )
+            calibrationVisualState.recordDetection(.init(
+                context: SilentSearchCalibrationFrameContext(
+                    frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
+                ),
+                markerID: "SILENT_SEARCH_01", corners: Self.previewCorners
+            ))
         case .calibrationQRLost:
             phase = .calibrating
             calibrationVisualState.qrDecoded = true
@@ -111,18 +113,20 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .calibrationGroundingFailed:
             phase = .calibrating
             calibrationVisualState.qrDecoded = true
-            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
-            calibrationVisualState.currentCorners = Self.previewCorners
-            calibrationVisualState.currentFrameContext = Self.previewFrameContext
+            calibrationVisualState.recordDetection(.init(
+                context: Self.previewFrameContext,
+                markerID: "SILENT_SEARCH_01", corners: Self.previewCorners
+            ))
             calibrationVisualState.currentIssue = .groundingFailure(.cornerUnavailable(.topLeft))
         case .calibrationSampleAccepted:
             phase = .calibrating
             calibrationVisualState.qrDecoded = true
             calibrationVisualState.cornersGrounded = true
             calibrationVisualState.sampleAccepted = true
-            calibrationVisualState.currentMarkerID = "SILENT_SEARCH_01"
-            calibrationVisualState.currentCorners = Self.previewCorners
-            calibrationVisualState.currentFrameContext = Self.previewFrameContext
+            calibrationVisualState.recordDetection(.init(
+                context: Self.previewFrameContext,
+                markerID: "SILENT_SEARCH_01", corners: Self.previewCorners
+            ))
         case .displayOffer: phase = .displayingQR
         case .displayTimeout:
             phase = .displayingQR

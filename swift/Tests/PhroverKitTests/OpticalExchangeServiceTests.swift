@@ -1,6 +1,7 @@
 import CoreGraphics
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import RoverNav
 import XCTest
 @testable import PhroverKit
 
@@ -54,6 +55,36 @@ final class OpticalExchangeServiceTests: XCTestCase {
         })
         XCTAssertGreaterThan(first.corners.topLeft.y, first.corners.bottomLeft.y)
         XCTAssertEqual(try scanner.scan(frame), [])
+    }
+
+    func testScannerCanonicalizesCornersFromEveryFallbackOrientation() {
+        let expected = OrientedMarkerCorners(
+            topLeft: Vec2(0.1, 0.9), topRight: Vec2(0.7, 0.8),
+            bottomLeft: Vec2(0.2, 0.3), bottomRight: Vec2(0.8, 0.2)
+        )
+        let workedExamples: [(CGImagePropertyOrientation, OrientedMarkerCorners)] = [
+            (.right, expected),
+            (.up, OrientedMarkerCorners(
+                topLeft: Vec2(0.2, 0.7), topRight: Vec2(0.8, 0.8),
+                bottomLeft: Vec2(0.1, 0.1), bottomRight: Vec2(0.7, 0.2)
+            )),
+            (.left, OrientedMarkerCorners(
+                topLeft: Vec2(0.2, 0.8), topRight: Vec2(0.8, 0.7),
+                bottomLeft: Vec2(0.3, 0.2), bottomRight: Vec2(0.9, 0.1)
+            )),
+            (.down, OrientedMarkerCorners(
+                topLeft: Vec2(0.3, 0.8), topRight: Vec2(0.9, 0.9),
+                bottomLeft: Vec2(0.2, 0.2), bottomRight: Vec2(0.8, 0.3)
+            )),
+        ]
+
+        for (orientation, corners) in workedExamples {
+            assertCorners(
+                OpticalObservation.canonicalizedCorners(corners, from: orientation),
+                equalTo: expected,
+                orientation: orientation
+            )
+        }
     }
 
     func testScannerIgnoresBlankAndNonQRImages() throws {
@@ -147,5 +178,23 @@ final class OpticalExchangeServiceTests: XCTestCase {
     private func pixel(_ pixels: [UInt8], width: Int, x: Int, y: Int) -> [UInt8] {
         let offset = (y * width + x) * 4
         return Array(pixels[offset..<(offset + 4)])
+    }
+
+    private func assertCorners(
+        _ actual: OrientedMarkerCorners,
+        equalTo expected: OrientedMarkerCorners,
+        orientation: CGImagePropertyOrientation,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        for (actualPoint, expectedPoint) in [
+            (actual.topLeft, expected.topLeft), (actual.topRight, expected.topRight),
+            (actual.bottomLeft, expected.bottomLeft), (actual.bottomRight, expected.bottomRight),
+        ] {
+            XCTAssertEqual(actualPoint.x, expectedPoint.x, accuracy: 0.000_001,
+                           "Unexpected x coordinate for \(orientation)", file: file, line: line)
+            XCTAssertEqual(actualPoint.y, expectedPoint.y, accuracy: 0.000_001,
+                           "Unexpected y coordinate for \(orientation)", file: file, line: line)
+        }
     }
 }

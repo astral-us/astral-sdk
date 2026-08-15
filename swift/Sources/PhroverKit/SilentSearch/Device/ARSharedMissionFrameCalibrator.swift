@@ -64,6 +64,10 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                     let scans: [OpticalObservation]
                     do {
                         scans = try scanner(opticalFrame)
+                        if scans.isEmpty, lastFailure != nil {
+                            continuation.yield(.feedback(.waitingForMarker(context: context)))
+                            lastFailure = nil
+                        }
                     } catch {
                         if lastFailure != .scannerFailure {
                             continuation.yield(.feedback(.scannerFailed(

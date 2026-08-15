@@ -635,10 +635,9 @@ final class SilentSearchCoordinatorTests: XCTestCase {
             markerID: "SILENT_SEARCH_01", corners: corners
         )))
         await eventually { coordinator.calibrationVisualState.qrDecoded }
-        XCTAssertEqual(
-            coordinator.calibrationVisualState.currentFrameContext,
-            SilentSearchCalibrationFrameContext(frameID: frameID, monotonicTimestamp: 1)
-        )
+        XCTAssertEqual(coordinator.calibrationVisualState.recentDetections.map(\.context), [
+            SilentSearchCalibrationFrameContext(frameID: frameID, monotonicTimestamp: 1),
+        ])
         harness.calibration.send(.progress(
             context: .init(frameID: frameID, monotonicTimestamp: 1), acceptedFrameCount: 1
         ))
@@ -648,13 +647,68 @@ final class SilentSearchCoordinatorTests: XCTestCase {
                 frameID: ARFrameID(generation: 4, sequence: 13), monotonicTimestamp: 1.6
             )
         )))
-        await eventually { coordinator.calibrationVisualState.currentMarkerID == nil }
+        await eventually { coordinator.calibrationVisualState.recentDetections.isEmpty }
 
         XCTAssertTrue(coordinator.calibrationVisualState.qrDecoded)
         XCTAssertTrue(coordinator.calibrationVisualState.sampleAccepted)
-        XCTAssertEqual(coordinator.calibrationVisualState.currentCorners, nil)
-        XCTAssertNil(coordinator.calibrationVisualState.currentMarkerID)
-        XCTAssertNil(coordinator.calibrationVisualState.currentFrameContext)
+        XCTAssertNil(coordinator.calibrationVisualState.currentIssue)
+    }
+
+    func testCalibrationKeepsRecentTypedDetectionsAndClearsThemOnAttemptReset() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 4)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+
+        for sequence in 1...40 {
+            harness.calibration.send(.feedback(.expectedMarkerDetected(
+                context: .init(
+                    frameID: ARFrameID(generation: 4, sequence: UInt64(sequence)),
+                    monotonicTimestamp: Double(sequence) / 60
+                ),
+                markerID: "SILENT_SEARCH_01",
+                corners: OrientedMarkerCorners(
+                    topLeft: Vec2(0.2, 0.8), topRight: Vec2(0.8, 0.8),
+                    bottomLeft: Vec2(0.2, 0.2), bottomRight: Vec2(0.8, 0.2)
+                )
+            )))
+        }
+        await eventually { coordinator.calibrationVisualState.recentDetections.last?.context.frameID.sequence == 40 }
+
+        XCTAssertEqual(coordinator.calibrationVisualState.recentDetections.count, 31)
+        XCTAssertEqual(coordinator.calibrationVisualState.recentDetections.first?.context.frameID.sequence, 10)
+
+        await coordinator.stop()
+        await coordinator.reset()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        XCTAssertTrue(coordinator.calibrationVisualState.recentDetections.isEmpty)
+    }
+
+    func testWaitingForMarkerAndQRLossClearObsoleteIssues() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 4)
+        let coordinator = harness.coordinator()
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        let context = SilentSearchCalibrationFrameContext(
+            frameID: ARFrameID(generation: 4, sequence: 1), monotonicTimestamp: 1
+        )
+
+        harness.calibration.send(.feedback(.scannerFailed(context: context)))
+        await eventually { coordinator.calibrationVisualState.currentIssue == .scannerFailure }
+        harness.calibration.send(.feedback(.waitingForMarker(context: context)))
+        await eventually { coordinator.calibrationVisualState.currentIssue == nil }
+
+        harness.calibration.send(.feedback(.groundingFailed(
+            context: context, reason: .wrongMarkerID
+        )))
+        await eventually {
+            coordinator.calibrationVisualState.currentIssue == .groundingFailure(.wrongMarkerID)
+        }
+        harness.calibration.send(.feedback(.qrLost(context: context)))
+        await eventually { coordinator.calibrationVisualState.currentIssue == nil }
     }
 
     func testCalibrationFeedbackTelemetryRecordsTransitionsOnly() async throws {

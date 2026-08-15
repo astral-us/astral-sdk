@@ -222,10 +222,9 @@ public final class SilentSearchCoordinator {
                 }
             case let .expectedMarkerDetected(context, markerID, corners):
                 calibrationVisualState.qrDecoded = true
-                calibrationVisualState.currentMarkerID = markerID
-                calibrationVisualState.currentCorners = corners
-                calibrationVisualState.currentFrameContext = context
-                calibrationVisualState.lastDetectionTimestamp = context.monotonicTimestamp
+                calibrationVisualState.recordDetection(.init(
+                    context: context, markerID: markerID, corners: corners
+                ))
                 if !calibrationMarkerPresent {
                     record("silent_search_qr_detected", fields: [
                         "marker": markerID,
@@ -234,11 +233,13 @@ public final class SilentSearchCoordinator {
                     ])
                     calibrationMarkerPresent = true
                 }
+            case .waitingForMarker:
+                calibrationVisualState.currentIssue = nil
+                calibrationTelemetryState = nil
             case let .qrLost(context):
-                calibrationVisualState.currentMarkerID = nil
-                calibrationVisualState.currentCorners = nil
-                calibrationVisualState.currentFrameContext = nil
-                calibrationVisualState.lastDetectionTimestamp = nil
+                calibrationVisualState.clearDetections()
+                calibrationVisualState.currentIssue = nil
+                calibrationTelemetryState = nil
                 if calibrationMarkerPresent {
                     record("silent_search_qr_lost", fields: [
                         "generation": "\(context.frameID.generation)",

@@ -295,6 +295,45 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         consumer.cancel()
     }
 
+    func testSuccessfulEmptyScanClearsScannerFailureOnce() async {
+        enum ScannerFailure: Error { case failed }
+        let manager = ARSessionManager()
+        let scans = ScanCounter()
+        let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { _ in
+            scans.increment()
+            if scans.value == 1 { throw ScannerFailure.failed }
+            return []
+        }
+        let collector = CalibrationEventCollector()
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream { collector.append(event) }
+        }
+        await Task.yield()
+
+        for timestamp in [1.0, 2.0, 3.0] {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: timestamp,
+                cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+                trackingQuality: .normal
+            )
+            await Task.yield()
+        }
+
+        await eventually { scans.value == 3 }
+        XCTAssertEqual(collector.events, [
+            .feedback(.scannerFailed(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
+            ))),
+            .feedback(.waitingForMarker(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
+            ))),
+        ])
+        consumer.cancel()
+    }
+
     func testQRLossEmitsAfterHalfASecondWithoutAnotherSnapshotAndDetectionCanResume() async {
         let manager = ARSessionManager()
         let corners = OrientedMarkerCorners(

@@ -68,6 +68,43 @@ public struct OpticalObservation: Equatable, Sendable {
         self.monotonicTimestamp = monotonicTimestamp
         self.corners = corners
     }
+
+    static func canonicalizedCorners(
+        _ corners: OrientedMarkerCorners,
+        from orientation: CGImagePropertyOrientation
+    ) -> OrientedMarkerCorners {
+        func point(_ value: Vec2) -> Vec2 {
+            switch orientation {
+            case .right: value
+            case .up: Vec2(value.y, 1 - value.x)
+            case .left: Vec2(1 - value.x, 1 - value.y)
+            case .down: Vec2(1 - value.y, value.x)
+            default: value
+            }
+        }
+
+        switch orientation {
+        case .right:
+            return corners
+        case .up:
+            return OrientedMarkerCorners(
+                topLeft: point(corners.bottomLeft), topRight: point(corners.topLeft),
+                bottomLeft: point(corners.bottomRight), bottomRight: point(corners.topRight)
+            )
+        case .left:
+            return OrientedMarkerCorners(
+                topLeft: point(corners.bottomRight), topRight: point(corners.bottomLeft),
+                bottomLeft: point(corners.topRight), bottomRight: point(corners.topLeft)
+            )
+        case .down:
+            return OrientedMarkerCorners(
+                topLeft: point(corners.topRight), topRight: point(corners.bottomRight),
+                bottomLeft: point(corners.topLeft), bottomRight: point(corners.bottomLeft)
+            )
+        default:
+            return corners
+        }
+    }
 }
 
 public struct OpticalQRCodeRenderer: Sendable {
@@ -120,7 +157,7 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
 
         for orientation in [CGImagePropertyOrientation.right, .up, .left, .down] {
             let results = try detect(in: frame.image, orientation: orientation)
-            let mapped = observations(from: results, frame: frame)
+            let mapped = observations(from: results, frame: frame, orientation: orientation)
             if !mapped.isEmpty { return mapped }
         }
         return detectQRWithCoreImage(in: frame)
@@ -140,8 +177,11 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
         return request.results ?? []
     }
 
-    private func observations(from results: [VNBarcodeObservation],
-                              frame: OpticalFrame) -> [OpticalObservation] {
+    private func observations(
+        from results: [VNBarcodeObservation],
+        frame: OpticalFrame,
+        orientation: CGImagePropertyOrientation
+    ) -> [OpticalObservation] {
         results.compactMap { observation in
             guard observation.symbology == .qr,
                   let payload = observation.payloadData ?? observation.payloadStringValue.map({ Data($0.utf8) }) else {
@@ -151,12 +191,12 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
                 payload: payload,
                 frameID: frame.frameID,
                 monotonicTimestamp: frame.monotonicTimestamp,
-                corners: OrientedMarkerCorners(
+                corners: OpticalObservation.canonicalizedCorners(OrientedMarkerCorners(
                     topLeft: Vec2(Double(observation.topLeft.x), Double(observation.topLeft.y)),
                     topRight: Vec2(Double(observation.topRight.x), Double(observation.topRight.y)),
                     bottomLeft: Vec2(Double(observation.bottomLeft.x), Double(observation.bottomLeft.y)),
                     bottomRight: Vec2(Double(observation.bottomRight.x), Double(observation.bottomRight.y))
-                )
+                ), from: orientation)
             )
         }
     }
@@ -182,9 +222,9 @@ public final class OpticalQRCodeScanner: @unchecked Sendable {
                 }
                 return OpticalObservation(payload: Data(string.utf8), frameID: frame.frameID,
                     monotonicTimestamp: frame.monotonicTimestamp,
-                    corners: OrientedMarkerCorners(topLeft: normalized(qr.topLeft),
+                    corners: OpticalObservation.canonicalizedCorners(OrientedMarkerCorners(topLeft: normalized(qr.topLeft),
                         topRight: normalized(qr.topRight), bottomLeft: normalized(qr.bottomLeft),
-                        bottomRight: normalized(qr.bottomRight)))
+                        bottomRight: normalized(qr.bottomRight)), from: orientation))
             }
             if !observations.isEmpty { return observations }
         }

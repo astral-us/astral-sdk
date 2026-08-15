@@ -110,15 +110,18 @@ final class CalibrationPreviewModelTests: XCTestCase {
         )
 
         state.qrDecoded = true
-        state.currentMarkerID = "SILENT_SEARCH_01"
-        state.currentCorners = markerCorners
+        state.recordDetection(.init(
+            context: .init(
+                frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
+            ),
+            markerID: "SILENT_SEARCH_01", corners: markerCorners
+        ))
         XCTAssertEqual(CalibrationViewProjection(state: state).stages.qrDecoded, .succeeded)
         XCTAssertEqual(CalibrationViewProjection(state: state).stages.cornersGrounded, .pending)
         XCTAssertEqual(CalibrationViewProjection(state: state).stages.sampleAccepted, .waiting)
         XCTAssertEqual(CalibrationViewProjection(state: state).markerText, "Marker SILENT_SEARCH_01")
 
-        state.currentCorners = nil
-        state.currentMarkerID = nil
+        state.clearDetections()
         XCTAssertEqual(CalibrationViewProjection(state: state).stages.qrDecoded, .succeeded)
         XCTAssertNil(CalibrationViewProjection(state: state).markerText)
 
@@ -136,31 +139,42 @@ final class CalibrationPreviewModelTests: XCTestCase {
             frameID: ARFrameID(generation: 1, sequence: 2), monotonicTimestamp: 2
         )
         var state = SilentSearchCalibrationVisualState()
-        state.currentCorners = markerCorners
-        state.currentFrameContext = SilentSearchCalibrationFrameContext(
-            frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
-        )
-
-        state.currentFrameContext = nil
         XCTAssertNil(
             CalibrationViewProjection(state: state).visibleCorners,
             "Two missing contexts must not count as a context match"
         )
-        state.currentFrameContext = SilentSearchCalibrationFrameContext(
-            frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
-        )
+        state.recordDetection(.init(
+            context: .init(
+                frameID: ARFrameID(generation: 1, sequence: 1), monotonicTimestamp: 1
+            ),
+            markerID: "SILENT_SEARCH_01", corners: markerCorners
+        ))
         XCTAssertNil(
             CalibrationViewProjection(
                 state: state, latestRenderedFrameContext: renderedContext
             ).visibleCorners
         )
 
-        state.currentFrameContext = renderedContext
+        state.recordDetection(.init(
+            context: renderedContext,
+            markerID: "SILENT_SEARCH_01", corners: markerCorners
+        ))
+        state.recordDetection(.init(
+            context: .init(
+                frameID: ARFrameID(generation: 1, sequence: 3), monotonicTimestamp: 2.01
+            ),
+            markerID: "SILENT_SEARCH_01",
+            corners: OrientedMarkerCorners(
+                topLeft: Vec2(0.3, 0.7), topRight: Vec2(0.7, 0.7),
+                bottomLeft: Vec2(0.3, 0.3), bottomRight: Vec2(0.7, 0.3)
+            )
+        ))
         XCTAssertEqual(
             CalibrationViewProjection(
                 state: state, latestRenderedFrameContext: renderedContext
             ).visibleCorners,
-            markerCorners
+            markerCorners,
+            "A newer detection must not hide the exact detection for the rendered preview frame"
         )
     }
 

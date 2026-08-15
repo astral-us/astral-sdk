@@ -124,13 +124,8 @@ struct CalibrationViewProjection: Equatable {
         expectedMarkerID: String = "SILENT_SEARCH_01",
         latestRenderedFrameContext: SilentSearchCalibrationFrameContext? = nil
     ) {
-        markerText = state.currentMarkerID.map { "Marker \($0)" }
-        if let currentFrameContext = state.currentFrameContext,
-           currentFrameContext == latestRenderedFrameContext {
-            visibleCorners = state.currentCorners
-        } else {
-            visibleCorners = nil
-        }
+        markerText = state.recentDetections.last.map { "Marker \($0.markerID)" }
+        visibleCorners = state.detection(matching: latestRenderedFrameContext)?.corners
         stages = CalibrationStages(
             qrDecoded: state.qrDecoded ? .succeeded : .pending,
             cornersGrounded: state.cornersGrounded ? .succeeded : (state.qrDecoded ? .pending : .waiting),
