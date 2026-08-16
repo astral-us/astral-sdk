@@ -21,9 +21,11 @@ This runbook is the Task 18 physical-device release gate. Task 17 provides the p
 6. Complete every handshake and rendezvous exchange using only the currently visible **Generate QR** or **Scan QR** action.
 7. Confirm each generated QR begins at 10 seconds, can finish early with **Partner scanned it**, and hides the map.
 8. Confirm active scanning shows the live rear-camera preview and targeting frame; cancellation returns to **Scan QR** without advancing the protocol.
-9. Confirm each rover displays `FOUND` only after its own position and heading tolerances pass.
-10. Exercise Stop where applicable and confirm motion stops before a stable terminal result appears.
-11. Pull both logs and run `scripts/verify-silent-search-logs.sh ROVER_A_LOG ROVER_B_LOG` for successful convergence runs. Confirm payloads and images are absent.
+9. Scan a malformed or mismatched external QR and confirm concise guidance returns to the same **Scan QR** action without advancing the protocol.
+10. Limit tracking during an active scan and confirm the preview stops, restore-tracking guidance appears, and the same pending scan returns after normal tracking recovers.
+11. Confirm each rover displays `FOUND` only after its own position and heading tolerances pass.
+12. Exercise Stop where applicable and confirm motion stops before a stable terminal result appears.
+13. Pull both logs and run `scripts/verify-silent-search-logs.sh ROVER_A_LOG ROVER_B_LOG` for successful convergence runs. Confirm payloads and images are absent.
 
 ## Acceptance Matrix
 
@@ -40,6 +42,8 @@ This runbook is the Task 18 physical-device release gate. Task 17 provides the p
 | Repeat latest partner QR | Receiver offers **Generate QR** and reproduces the cached response bytes and sequence | Not run | |
 | Present older or out-of-order QR | Receiver rejects it and does not advance protocol state | Not run | |
 | Cancel active scan | Receiver returns to the same expected-message **Scan QR** action | Not run | |
+| Invalid external QR | Receiver shows sanitized guidance and returns to the same expected-message **Scan QR** action | Not run | |
+| Tracking limited while scanning | Camera preview stops and the same pending action returns after normal tracking recovers | Not run | |
 | Missing partner | Waiting rover remains stopped and fails 60 seconds after the search deadline | Not run | |
 | Tracking recovers within 5 seconds | Motion stops immediately, then replans from current pose under the same policy | Not run | |
 | Tracking does not recover | Shared frame invalidates and mission terminates with motion stopped | Not run | |

@@ -22,7 +22,7 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         XCTAssertEqual(simulation.b.mission?.id, missionID)
     }
 
-    func testRoverBRejectsWrongMissionAfterBindingToOffer() async throws {
+    func testRoverBRejectsWrongMissionWithoutAdvancingAfterBindingToOffer() async throws {
         let simulation = try await simulation(aTarget: nil, bTarget: nil, independentMissionIDs: true)
         simulation.aHarness.optical.shouldRelay = { payload in
             (try? OpticalMessageCodec().decode(payload).kind) != .searchCommit
@@ -51,7 +51,18 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         ))
 
         simulation.bHarness.optical.sendToScanner(wrongPayload)
-        await eventually { simulation.b.phase == .terminal(.protocolFailure(.wrongMission)) }
+        await eventually {
+            simulation.b.opticalValidationDiagnostic == .wrongMission &&
+                simulation.b.pendingOpticalAction == .scan(expectedMessageKind: .searchCommit)
+        }
+        XCTAssertFalse(simulation.b.isTerminal)
+
+        simulation.bHarness.optical.sendToScanner(commitPayload)
+        XCTAssertTrue(simulation.b.beginPendingQRScan())
+        await simulation.driveOptical {
+            simulation.a.phase == .waitingForSearch && simulation.b.phase == .waitingForSearch
+        }
+        XCTAssertEqual(simulation.b.phase, .waitingForSearch)
     }
 
     func testRendezvousScanTimeoutReturnsToPendingScanAndSupportsAbort() async throws {
@@ -288,7 +299,68 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         XCTAssertEqual(simulation.bHarness.optical.presentedPayloads.count, 1)
     }
 
-    func testRepeatedLatestRendezvousMessageIsRecoveredButOlderMessageIsRejected() async throws {
+    func testDroppedSearchCommitRecoversWhenSamePayloadIsScannedOnRetry() async throws {
+        let simulation = try await simulation(aTarget: nil, bTarget: nil)
+        var droppedCommit: Data?
+        simulation.aHarness.optical.shouldRelay = { payload in
+            guard (try? OpticalMessageCodec().decode(payload).kind) == .searchCommit,
+                  droppedCommit == nil else { return true }
+            droppedCommit = payload
+            return false
+        }
+        XCTAssertTrue(simulation.a.startHandshake())
+        XCTAssertTrue(simulation.b.startHandshake())
+        await simulation.driveOptical {
+            droppedCommit != nil && simulation.b.phase == .handshake(.scanning)
+        }
+
+        XCTAssertTrue(simulation.b.cancelQRScan())
+        await eventually {
+            simulation.b.pendingOpticalAction == .scan(expectedMessageKind: .searchCommit)
+        }
+        simulation.bHarness.optical.sendToScanner(try XCTUnwrap(droppedCommit))
+        XCTAssertTrue(simulation.b.beginPendingQRScan())
+        await simulation.driveOptical {
+            simulation.a.phase == .waitingForSearch && simulation.b.phase == .waitingForSearch
+        }
+
+        XCTAssertEqual(simulation.a.phase, .waitingForSearch)
+        XCTAssertEqual(simulation.b.phase, .waitingForSearch)
+    }
+
+    func testRepeatedAcceptanceOffersCachedSearchCommitWithoutAllocatingSequence() async throws {
+        let simulation = try await simulation(aTarget: nil, bTarget: nil)
+        XCTAssertTrue(simulation.a.startHandshake())
+        XCTAssertTrue(simulation.b.startHandshake())
+        await eventually { simulation.a.pendingOpticalAction != nil && simulation.b.pendingOpticalAction != nil }
+        XCTAssertTrue(simulation.a.generatePendingQR())
+        XCTAssertTrue(simulation.b.beginPendingQRScan())
+        await eventually { simulation.b.pendingOpticalAction == .generate(messageKind: .accept, isRetransmission: false) }
+        XCTAssertTrue(simulation.b.generatePendingQR())
+        await eventually { simulation.bHarness.optical.presentedPayloads.count == 1 }
+        let acceptance = try XCTUnwrap(simulation.bHarness.optical.presentedPayloads.first)
+        await eventually { simulation.a.pendingOpticalAction == .scan(expectedMessageKind: .accept) }
+        XCTAssertTrue(simulation.a.beginPendingQRScan())
+        await eventually { simulation.a.pendingOpticalAction == .generate(messageKind: .searchCommit, isRetransmission: false) }
+        XCTAssertTrue(simulation.a.generatePendingQR())
+        await eventually { simulation.a.pendingOpticalAction == .scan(expectedMessageKind: .searchAck) }
+        let commit = try XCTUnwrap(simulation.aHarness.optical.presentedPayloads.last)
+
+        simulation.aHarness.optical.sendToScanner(acceptance)
+        XCTAssertTrue(simulation.a.beginPendingQRScan())
+        await eventually {
+            simulation.a.pendingOpticalAction == .generate(messageKind: .searchCommit, isRetransmission: true)
+        }
+        let countBeforeGeneration = simulation.aHarness.optical.presentedPayloads.count
+        XCTAssertTrue(simulation.a.generatePendingQR())
+        await eventually { simulation.aHarness.optical.presentedPayloads.count == countBeforeGeneration + 1 }
+
+        let replay = try XCTUnwrap(simulation.aHarness.optical.presentedPayloads.last)
+        XCTAssertEqual(replay, commit)
+        XCTAssertEqual(try OpticalMessageCodec().decode(replay).sequence, 2)
+    }
+
+    func testRepeatedLatestRendezvousMessageIsRecoveredAndOlderMessageDoesNotAdvance() async throws {
         let duplicate = try await simulation(aTarget: point(-1, 2), bTarget: nil)
         var duplicated = false
         duplicate.aHarness.optical.shouldRelay = { payload in
@@ -317,9 +389,16 @@ final class TwoRoverSilentSearchSimulationTests: XCTestCase {
         await eventually { outOfOrder.a.phase == .searching && outOfOrder.b.phase == .searching }
         await eventually { outOfOrder.aHarness.motion.stopCount > 0 && outOfOrder.bHarness.motion.stopCount > 0 }
         outOfOrder.clock.advance(nanoseconds: 750_000_000)
-        await outOfOrder.driveOptical { outOfOrder.b.isTerminal }
-        await eventually { outOfOrder.b.isTerminal }
-        XCTAssertTrue(outOfOrder.b.hasProtocolFailure)
+        await eventually { outOfOrder.b.pendingOpticalAction == .scan(expectedMessageKind: .status) }
+        XCTAssertTrue(outOfOrder.b.beginPendingQRScan())
+        await eventually {
+            outOfOrder.b.opticalValidationDiagnostic == .unexpectedMessage &&
+                outOfOrder.b.pendingOpticalAction == .scan(expectedMessageKind: .status)
+        }
+        XCTAssertFalse(outOfOrder.b.isTerminal)
+        XCTAssertTrue(outOfOrder.bHarness.optical.presentedPayloads.filter {
+            (try? OpticalMessageCodec().decode($0).kind) == .status
+        }.isEmpty)
     }
 
     func testDeadlineCompletesNotFoundAndSafetyStopCanResetRendezvous() async throws {

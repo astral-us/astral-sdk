@@ -56,6 +56,11 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
             qrPresentation
         case .scanning:
             scanner
+        case .trackingSuspended:
+            Label("Waiting for normal tracking", systemImage: "viewfinder.circle")
+                .font(.headline)
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier("silent_search_tracking_suspended")
         case .searching:
             metrics([("Sector", viewModel.role.searchSector.rawValue.capitalized),
                      ("Policy", "Sector constrained"), ("Target", viewModel.targetLabel)])
@@ -257,7 +262,8 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
     }
     private var isFailure: Bool { viewModel.phase == .terminalFailure }
     private var isOpticalExchange: Bool {
-        [.pendingGenerateQR, .displayingQR, .pendingScanQR, .scanning].contains(viewModel.phase)
+        [.pendingGenerateQR, .displayingQR, .pendingScanQR, .scanning, .trackingSuspended]
+            .contains(viewModel.phase)
     }
     private var terminalIdentifier: String {
         switch viewModel.phase {

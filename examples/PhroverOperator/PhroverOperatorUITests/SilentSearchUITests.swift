@@ -135,6 +135,32 @@ final class SilentSearchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["silent_search_abort"].isEnabled)
     }
 
+    func testRecoverableValidationShowsScanAgainGuidance() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "scan-invalid-payload")
+
+        XCTAssertTrue(app.buttons["silent_search_scan_qr"].waitForExistence(timeout: 10))
+        XCTAssertEqual(
+            app.staticTexts["silent_search_phase_detail"].label,
+            "QR payload is invalid. Scan the expected QR."
+        )
+        XCTAssertFalse(app.otherElements["silent_search_scanner"].exists)
+    }
+
+    func testTrackingSuspensionStopsPreviewAndShowsRestoreGuidance() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "scan-tracking-suspended")
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)["silent_search_tracking_suspended"]
+                .waitForExistence(timeout: 10)
+        )
+        XCTAssertEqual(
+            app.staticTexts["silent_search_phase_detail"].label,
+            "Tracking is limited. Hold still until normal tracking returns."
+        )
+        XCTAssertFalse(app.otherElements["silent_search_scanner"].exists)
+        XCTAssertFalse(app.otherElements["silent_search_map"].exists)
+    }
+
     func testStopPersistsInEveryMovingPhase() {
         for scenario in ["searching", "returning", "rendezvous-rotating", "converging"] {
             let app = XCUIApplication.launchingSilentSearch(scenario: scenario)

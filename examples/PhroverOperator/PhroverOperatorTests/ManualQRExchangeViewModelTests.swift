@@ -29,4 +29,30 @@ final class ManualQRExchangeViewModelTests: XCTestCase {
         XCTAssertTrue(model.detail.contains("Try again"))
         XCTAssertNil(model.qrImage)
     }
+
+    func testValidationFailureAndTrackingSuspensionShowActionableGuidance() {
+        let invalid = ScriptedSilentSearchViewModel(scenario: .scanInvalidPayload)
+        XCTAssertEqual(invalid.phase, .pendingScanQR)
+        XCTAssertEqual(invalid.detail, "QR payload is invalid. Scan the expected QR.")
+
+        let suspended = ScriptedSilentSearchViewModel(scenario: .scanTrackingSuspended)
+        XCTAssertEqual(suspended.phase, .trackingSuspended)
+        XCTAssertEqual(suspended.detail, "Tracking is limited. Hold still until normal tracking returns.")
+        XCTAssertNil(suspended.scanPreviewImage)
+    }
+
+    func testLiveProjectionPrioritizesTrackingSuspensionAndMapsValidationGuidance() {
+        XCTAssertEqual(
+            LiveSilentSearchViewModel.operatorPhase(
+                coordinatorPhase: .handshake(.scanning),
+                pendingAction: nil,
+                trackingSuspended: true
+            ),
+            .trackingSuspended
+        )
+        XCTAssertEqual(
+            LiveSilentSearchViewModel.validationMessage(.wrongMarker),
+            "QR uses another marker. Scan the expected QR."
+        )
+    }
 }

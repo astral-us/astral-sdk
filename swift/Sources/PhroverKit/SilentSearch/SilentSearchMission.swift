@@ -97,6 +97,16 @@ public enum SilentSearchCoordinatorDiagnostic: Equatable, Sendable {
     case opticalTimedOut
 }
 
+public enum SilentSearchOpticalValidationDiagnostic: Equatable, Sendable {
+    case invalidPayload
+    case wrongMission
+    case wrongMarker
+    case wrongRole
+    case unexpectedMessage
+    case clockMismatch
+    case nonIncreasingSequence
+}
+
 public enum SilentSearchTransitionError: Error, Equatable, Sendable {
     case illegal(from: SilentSearchPhase, to: SilentSearchPhase)
 }

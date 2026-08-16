@@ -13,6 +13,7 @@ enum SilentSearchOperatorPhase: Equatable {
     case displayingQR
     case pendingScanQR
     case scanning
+    case trackingSuspended
     case searching
     case returning
     case rendezvousRotating
@@ -42,6 +43,7 @@ protocol SilentSearchViewModel: AnyObject, Observable {
     var opticalMessageLabel: String? { get }
     var presentationSecondsRemaining: Int? { get }
     var opticalTimedOut: Bool { get }
+    var opticalValidationMessage: String? { get }
     var failureReason: String? { get }
     var mapState: SilentSearchMapState { get }
     var canStart: Bool { get }
@@ -73,6 +75,8 @@ enum SilentSearchLaunchScenario: String, CaseIterable {
     case scanOffer = "scan-offer"
     case scanningOffer = "scanning-offer"
     case scanTimeout = "scan-timeout"
+    case scanInvalidPayload = "scan-invalid-payload"
+    case scanTrackingSuspended = "scan-tracking-suspended"
     case searching
     case returning
     case rendezvousRotating = "rendezvous-rotating"
@@ -95,6 +99,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     private(set) var failureReason: String?
     private(set) var calibrationVisualState = SilentSearchCalibrationVisualState()
     private var messageKind: OpticalMessageKind?
+    private(set) var opticalValidationMessage: String?
 
     init(scenario: SilentSearchLaunchScenario) {
         switch scenario {
@@ -155,6 +160,13 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
             phase = .pendingScanQR
             messageKind = .offer
             opticalTimedOut = true
+        case .scanInvalidPayload:
+            phase = .pendingScanQR
+            messageKind = .offer
+            opticalValidationMessage = "QR payload is invalid. Scan the expected QR."
+        case .scanTrackingSuspended:
+            phase = .trackingSuspended
+            messageKind = .offer
         case .searching: phase = .searching
         case .returning: phase = .returning
         case .rendezvousRotating: phase = .rendezvousRotating
@@ -177,6 +189,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .displayingQR: "Display mission offer"
         case .pendingScanQR: "Scan partner QR"
         case .scanning: "Scan partner QR"
+        case .trackingSuspended: "Tracking paused"
         case .searching: "Searching west sector"
         case .returning: "Returning to rendezvous"
         case .rendezvousRotating: "Aligning for optical exchange"
@@ -195,8 +208,9 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .readyForExchange: "Shared marker frame is valid."
         case .pendingGenerateQR: "Ready to generate the mission offer."
         case .displayingQR: "Position the other rover's rear camera over this code."
-        case .pendingScanQR: opticalTimedOut ? "No valid QR code received within 30 seconds. Try again." : "Ready to scan the partner mission offer."
+        case .pendingScanQR: opticalValidationMessage ?? (opticalTimedOut ? "No valid QR code received within 30 seconds. Try again." : "Ready to scan the partner mission offer.")
         case .scanning: opticalTimedOut ? "No valid QR code received within 30 seconds." : "Aim this rover's rear camera at the partner screen."
+        case .trackingSuspended: "Tracking is limited. Hold still until normal tracking returns."
         case .searching: "Frontier frontier_4 · 118 seconds remaining"
         case .returning: "Navigating to Rover A staging pose."
         case .rendezvousRotating: "Rotating rear camera toward the partner screen."
@@ -364,13 +378,26 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     }
 
     var phase: SilentSearchOperatorPhase {
-        if let action = coordinator.pendingOpticalAction {
+        Self.operatorPhase(
+            coordinatorPhase: coordinator.phase,
+            pendingAction: coordinator.pendingOpticalAction,
+            trackingSuspended: coordinator.isTrackingSuspended
+        )
+    }
+
+    static func operatorPhase(
+        coordinatorPhase: SilentSearchPhase,
+        pendingAction: SilentSearchOpticalOperatorAction?,
+        trackingSuspended: Bool
+    ) -> SilentSearchOperatorPhase {
+        if trackingSuspended { return .trackingSuspended }
+        if let action = pendingAction {
             return switch action {
             case .generate: .pendingGenerateQR
             case .scan: .pendingScanQR
             }
         }
-        return switch coordinator.phase {
+        return switch coordinatorPhase {
         case .setup: .setup
         case .calibrating: .calibrating
         case .handshake(.ready): .readyForExchange
@@ -397,6 +424,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .displayingQR: "Show QR to partner"
         case .pendingScanQR: "Scan partner QR"
         case .scanning: "Scan partner QR"
+        case .trackingSuspended: "Tracking paused"
         case .searching: "Searching \(role.searchSector.rawValue) sector"
         case .returning: "Returning to rendezvous"
         case .rendezvousRotating: "Aligning for optical exchange"
@@ -416,9 +444,10 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .pendingGenerateQR: "Generate the required \(opticalMessageLabel ?? "message") when the partner is ready."
         case .displayingQR: "Position the other rover's rear camera over this code."
         case .pendingScanQR:
-            opticalTimedOut ? "No valid QR code received within 30 seconds. Try again." : "Scan the partner's \(opticalMessageLabel ?? "message") when ready."
+            opticalValidationMessage ?? (opticalTimedOut ? "No valid QR code received within 30 seconds. Try again." : "Scan the partner's \(opticalMessageLabel ?? "message") when ready.")
         case .scanning:
             opticalTimedOut ? "No valid QR code received within 30 seconds." : "Aim this rover's rear camera at the partner screen."
+        case .trackingSuspended: "Tracking is limited. Hold still until normal tracking returns."
         case .searching: "Following eligible frontiers with sector policy enforced."
         case .returning: "Navigating to the fixed \(role.rawValue.uppercased()) rendezvous pose."
         case .rendezvousRotating: "Rotating rear camera toward the partner screen."
@@ -467,6 +496,22 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     }
     var presentationSecondsRemaining: Int? { coordinator.presentationSecondsRemaining }
     var opticalTimedOut: Bool { coordinator.diagnostic == .opticalTimedOut }
+    var opticalValidationMessage: String? {
+        guard let diagnostic = coordinator.opticalValidationDiagnostic else { return nil }
+        return Self.validationMessage(diagnostic)
+    }
+
+    static func validationMessage(_ diagnostic: SilentSearchOpticalValidationDiagnostic) -> String {
+        switch diagnostic {
+        case .invalidPayload: "QR payload is invalid. Scan the expected QR."
+        case .wrongMission: "QR belongs to another mission. Scan the expected QR."
+        case .wrongMarker: "QR uses another marker. Scan the expected QR."
+        case .wrongRole: "QR came from the wrong rover role. Scan the expected QR."
+        case .unexpectedMessage: "QR is not the expected message. Scan the expected QR."
+        case .clockMismatch: "QR timestamp is outside the allowed window. Generate a fresh QR."
+        case .nonIncreasingSequence: "QR is older than the latest accepted message. Scan the expected QR."
+        }
+    }
     var failureReason: String? {
         guard case let .terminal(result) = coordinator.phase else { return nil }
         return Self.failureMessage(result)

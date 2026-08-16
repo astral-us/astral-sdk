@@ -51,6 +51,126 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.diagnostic)
     }
 
+    func testRecoverableInvalidScanShowsGuidanceAndPreservesExpectedProtocolStep() async throws {
+        let harness = SilentSearchTestHarness()
+        let coordinator = try await calibratedCoordinator(harness, role: .b)
+        XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer) }
+
+        harness.optical.sendToScanner(Data("not a protocol payload".utf8))
+        XCTAssertTrue(coordinator.beginPendingQRScan())
+        await eventually {
+            coordinator.opticalValidationDiagnostic == .invalidPayload &&
+                coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer)
+        }
+
+        XCTAssertEqual(coordinator.phase, .handshake(.ready))
+        XCTAssertFalse(coordinator.generatePendingQR())
+        XCTAssertFalse(coordinator.isTrackingSuspended)
+    }
+
+    func testRecoverableEnvelopeRejectionsKeepOfferScanPending() async throws {
+        let mission = try mission(role: .a)
+        let body = OpticalMessageBody.offer(OfferBody(
+            searchDurationSeconds: 120,
+            centerHalfWidthMillimeters: 250,
+            targetLabel: "chair",
+            markerWidthMillimeters: 200,
+            roverARendezvous: OpticalPose(x: -1_000, y: 0, headingMillidegrees: 0),
+            roverBRendezvous: OpticalPose(x: 1_000, y: 0, headingMillidegrees: 0)
+        ))
+        let cases: [(OpticalMessage, SilentSearchOpticalValidationDiagnostic)] = [
+            (OpticalMessage(missionID: mission.id, kind: .offer, sequence: 1, role: .a,
+                            markerID: "OTHER_MARKER", timestampMilliseconds: wallNow, body: body), .wrongMarker),
+            (OpticalMessage(missionID: mission.id, kind: .offer, sequence: 1, role: .b,
+                            markerID: mission.markerID, timestampMilliseconds: wallNow, body: body), .wrongRole),
+            (OpticalMessage(missionID: mission.id, kind: .status, sequence: 1, role: .a,
+                            markerID: mission.markerID, timestampMilliseconds: wallNow,
+                            body: .status(StatusBody(found: false))), .unexpectedMessage),
+            (OpticalMessage(missionID: mission.id, kind: .offer, sequence: 1, role: .a,
+                            markerID: mission.markerID,
+                            timestampMilliseconds: wallNow - OpticalMessageCodec.maximumAgeMilliseconds - 1,
+                            body: body), .invalidPayload),
+            (OpticalMessage(missionID: mission.id, kind: .offer, sequence: 1, role: .a,
+                            markerID: mission.markerID,
+                            timestampMilliseconds: wallNow + OpticalMessageCodec.maximumFutureMilliseconds + 1,
+                            body: body), .invalidPayload),
+        ]
+
+        for (message, diagnostic) in cases {
+            let payload = try OpticalMessageCodec().encode(message)
+            try await assertRecoverableOfferRejection(payload, diagnostic: diagnostic)
+        }
+    }
+
+    func testNonIncreasingExpectedSequenceDoesNotAdvanceProtocol() async throws {
+        let opticalA = FakeSilentSearchOpticalExchange()
+        let opticalB = FakeSilentSearchOpticalExchange()
+        opticalA.peer = opticalB
+        opticalB.peer = opticalA
+        let a = SilentSearchTestHarness(optical: opticalA)
+        let b = SilentSearchTestHarness(optical: opticalB)
+        a.clock.advance(nanoseconds: wallNow * 1_000_000)
+        b.clock.advance(nanoseconds: wallNow * 1_000_000)
+        let coordinatorA = try await calibratedCoordinator(a, role: .a)
+        let coordinatorB = try await calibratedCoordinator(b, role: .b)
+        XCTAssertTrue(coordinatorA.startHandshake())
+        XCTAssertTrue(coordinatorB.startHandshake())
+        await eventually { coordinatorA.pendingOpticalAction != nil && coordinatorB.pendingOpticalAction != nil }
+        XCTAssertTrue(coordinatorA.generatePendingQR())
+        XCTAssertTrue(coordinatorB.beginPendingQRScan())
+        await eventually { coordinatorB.pendingOpticalAction == .generate(messageKind: .accept, isRetransmission: false) }
+        XCTAssertTrue(coordinatorB.generatePendingQR())
+        await eventually { coordinatorB.pendingOpticalAction == .scan(expectedMessageKind: .searchCommit) }
+
+        let acceptance = try XCTUnwrap(opticalB.presentedPayloads.first)
+        let commit = OpticalMessage(
+            missionID: try mission(role: .a).id,
+            kind: .searchCommit,
+            sequence: 1,
+            role: .a,
+            markerID: "SILENT_SEARCH_01",
+            timestampMilliseconds: wallNow,
+            body: .searchCommit(SearchCommitBody(
+                deadlineMilliseconds: wallNow + 155_000,
+                acceptanceHash: OpticalMessageCodec().messageLinkHash(for: acceptance),
+                startMilliseconds: wallNow + 35_000
+            ))
+        )
+        opticalB.sendToScanner(try OpticalMessageCodec().encode(commit))
+        XCTAssertTrue(coordinatorB.beginPendingQRScan())
+        await eventually {
+            coordinatorB.opticalValidationDiagnostic == .nonIncreasingSequence &&
+                coordinatorB.pendingOpticalAction == .scan(expectedMessageKind: .searchCommit)
+        }
+
+        XCTAssertEqual(opticalB.presentedPayloads.count, 1)
+        if case .terminal = coordinatorB.phase {
+            XCTFail("Recoverable sequence rejection terminated the mission")
+        }
+    }
+
+    func testTrackingLimitedStopsActiveScanAndRecoveryRestoresPendingScan() async throws {
+        let harness = SilentSearchTestHarness()
+        let coordinator = try await calibratedCoordinator(harness, role: .b)
+        XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer) }
+        XCTAssertTrue(coordinator.beginPendingQRScan())
+        await eventually { coordinator.phase == .handshake(.scanning) }
+
+        harness.safety.send(.trackingLimited(generation: 1))
+        await eventually { coordinator.isTrackingSuspended }
+        XCTAssertNil(coordinator.pendingOpticalAction)
+        XCTAssertNil(coordinator.activeOpticalMessageKind)
+
+        harness.safety.send(.trackingNormal(generation: 1))
+        await eventually {
+            !coordinator.isTrackingSuspended &&
+                coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer)
+        }
+        XCTAssertNil(coordinator.opticalValidationDiagnostic)
+    }
+
     func testRepeatedLatestOfferRequiresManualCachedAcceptanceGeneration() async throws {
         let opticalA = FakeSilentSearchOpticalExchange()
         let opticalB = FakeSilentSearchOpticalExchange()
@@ -208,7 +328,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertFalse(early.completeQRPresentation())
     }
 
-    func testClockMismatchAndLateAcknowledgementAreHandledByRealSession() async throws {
+    func testClockMismatchReturnsToPendingOfferScan() async throws {
         let opticalA = FakeSilentSearchOpticalExchange()
         let opticalB = FakeSilentSearchOpticalExchange()
         opticalA.peer = opticalB
@@ -222,13 +342,14 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinatorA.startHandshake())
         XCTAssertTrue(coordinatorB.startHandshake())
         await driveOpticalExchange([coordinatorA, coordinatorB]) {
-            coordinatorB.phase == .terminal(.protocolFailure(.clockDisagreement))
+            coordinatorB.opticalValidationDiagnostic == .clockMismatch
         }
         await eventually {
-            coordinatorB.phase == .terminal(.protocolFailure(.clockDisagreement))
+            coordinatorB.opticalValidationDiagnostic == .clockMismatch &&
+                coordinatorB.pendingOpticalAction == .scan(expectedMessageKind: .offer)
         }
 
-        XCTAssertEqual(coordinatorB.phase, .terminal(.protocolFailure(.clockDisagreement)))
+        XCTAssertEqual(coordinatorB.phase, .handshake(.ready))
     }
 
     func testLateAcknowledgementCausesANewSearchCommit() async throws {
@@ -1397,6 +1518,24 @@ final class SilentSearchCoordinatorTests: XCTestCase {
             }
             await Task.yield()
         }
+    }
+
+    private func assertRecoverableOfferRejection(
+        _ payload: Data,
+        diagnostic: SilentSearchOpticalValidationDiagnostic
+    ) async throws {
+        let harness = SilentSearchTestHarness()
+        harness.clock.advance(nanoseconds: wallNow * 1_000_000)
+        let coordinator = try await calibratedCoordinator(harness, role: .b)
+        XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer) }
+        harness.optical.sendToScanner(payload)
+        XCTAssertTrue(coordinator.beginPendingQRScan())
+        await eventually {
+            coordinator.opticalValidationDiagnostic == diagnostic &&
+                coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer)
+        }
+        XCTAssertTrue(harness.optical.presentedPayloads.isEmpty)
     }
 
     private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
