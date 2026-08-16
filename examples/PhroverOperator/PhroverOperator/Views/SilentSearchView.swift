@@ -165,6 +165,11 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
 
     private var scanner: some View {
         VStack(spacing: 12) {
+            if let label = viewModel.opticalMessageLabel {
+                Text("Expected: \(label.capitalized)")
+                    .font(.headline)
+                    .accessibilityIdentifier("silent_search_scan_expected_message")
+            }
             ZStack {
                 if let preview = viewModel.scanPreviewImage {
                     Image(uiImage: preview).resizable().scaledToFill().accessibilityHidden(true)

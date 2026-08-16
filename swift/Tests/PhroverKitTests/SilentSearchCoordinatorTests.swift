@@ -51,6 +51,33 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.diagnostic)
     }
 
+    func testScanTimeoutOffersCachedOutboundGenerationThenReturnsToScan() async throws {
+        let harness = SilentSearchTestHarness()
+        harness.clock.advance(nanoseconds: wallNow * 1_000_000)
+        let coordinator = try await calibratedCoordinator(harness, role: .a)
+        XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction == .generate(messageKind: .offer, isRetransmission: false) }
+        XCTAssertTrue(coordinator.generatePendingQR())
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .accept) }
+        let offer = try XCTUnwrap(harness.optical.presentedPayloads.first)
+        XCTAssertTrue(coordinator.beginPendingQRScan())
+        await eventually { coordinator.phase == .handshake(.scanning) }
+        await eventually { harness.clock.pendingDeadlines.contains(harness.clock.monotonicNow + 30_000_000_000) }
+
+        harness.clock.advance(nanoseconds: 30_000_000_000)
+        await eventually {
+            coordinator.pendingOpticalAction == .generate(messageKind: .offer, isRetransmission: true)
+        }
+        XCTAssertEqual(coordinator.pendingOpticalAction, .generate(messageKind: .offer, isRetransmission: true))
+        XCTAssertEqual(harness.optical.presentedPayloads.count, 1)
+
+        XCTAssertTrue(coordinator.generatePendingQR())
+        await eventually { harness.optical.presentedPayloads.count == 2 }
+        XCTAssertEqual(try XCTUnwrap(harness.optical.presentedPayloads.last), offer)
+        XCTAssertEqual(try OpticalMessageCodec().decode(offer).sequence, 1)
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .accept) }
+    }
+
     func testRecoverableInvalidScanShowsGuidanceAndPreservesExpectedProtocolStep() async throws {
         let harness = SilentSearchTestHarness()
         let coordinator = try await calibratedCoordinator(harness, role: .b)

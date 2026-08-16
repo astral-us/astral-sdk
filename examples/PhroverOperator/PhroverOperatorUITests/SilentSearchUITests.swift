@@ -128,6 +128,10 @@ final class SilentSearchUITests: XCTestCase {
 
         XCTAssertTrue(app.otherElements["silent_search_scanner"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.otherElements["silent_search_scan_target"].exists)
+        XCTAssertEqual(
+            app.staticTexts["silent_search_scan_expected_message"].label,
+            "Expected: Mission Offer"
+        )
         XCTAssertTrue(app.buttons["silent_search_scan_cancel"].isEnabled)
         XCTAssertFalse(app.buttons["silent_search_generate_qr"].exists)
         XCTAssertFalse(app.buttons["silent_search_scan_qr"].exists)

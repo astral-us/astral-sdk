@@ -129,6 +129,11 @@ final class FakeSilentSearchOpticalExchange: SilentSearchOpticalExchanging {
         deliver(payload)
     }
 
+    func relayLastPresentation() {
+        guard let payload = presentedPayloads.last, shouldRelay(payload) else { return }
+        peer?.deliver(payload)
+    }
+
     private func deliver(_ payload: Data) {
         if scanContinuations.isEmpty {
             incoming.append(payload)

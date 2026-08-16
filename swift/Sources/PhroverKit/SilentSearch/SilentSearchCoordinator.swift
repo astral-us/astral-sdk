@@ -18,6 +18,7 @@ public final class SilentSearchCoordinator {
     public private(set) var activeOpticalMessageKind: OpticalMessageKind?
     public private(set) var opticalValidationDiagnostic: SilentSearchOpticalValidationDiagnostic?
     public private(set) var isTrackingSuspended = false
+    public private(set) var isFinalResponseScanActive = false
     public var presentationSecondsRemaining: Int? {
         guard let deadline = activePresentationDeadline else { return nil }
         let remaining = max(0, deadline - dependencies.clock.monotonicNow)
@@ -31,6 +32,7 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var searchDeadlineTask: Task<Void, Never>?
     @ObservationIgnored private var partnerDeadlineTask: Task<Void, Never>?
     @ObservationIgnored private var presentationDeadlineTask: Task<Void, Never>?
+    @ObservationIgnored private var scheduledOpticalBoundaryTask: Task<Void, Never>?
     @ObservationIgnored private var protocolSession: OpticalProtocolSession?
     @ObservationIgnored private var lastIncomingPayload: Data?
     @ObservationIgnored private var lastResponseRequestPayload: Data?
@@ -58,6 +60,7 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var operatorActionID: UUID?
     @ObservationIgnored private var scanCancellationRequested = false
     @ObservationIgnored private var presentationCompletionRequested = false
+    @ObservationIgnored private var scheduledOpticalBoundaryReached = false
 
     private enum OpticalAction {
         case present(Data)
@@ -79,6 +82,7 @@ public final class SilentSearchCoordinator {
     }
 
     private struct OpticalTimeout: Error {}
+    private struct ScheduledOpticalBoundary: Error {}
     private struct PartnerTimeout: Error {}
     private struct RendezvousMotionError: Error {
         let failure: SilentSearchMotionFailure
@@ -96,6 +100,7 @@ public final class SilentSearchCoordinator {
         searchDeadlineTask?.cancel()
         partnerDeadlineTask?.cancel()
         presentationDeadlineTask?.cancel()
+        scheduledOpticalBoundaryTask?.cancel()
     }
 
     public func configure(_ mission: SilentSearchMission) {
@@ -224,6 +229,10 @@ public final class SilentSearchCoordinator {
         rendezvousPartnerDeadline = nil
         scheduledSearchStart = nil
         scheduledConvergenceRelease = nil
+        scheduledOpticalBoundaryTask?.cancel()
+        scheduledOpticalBoundaryTask = nil
+        scheduledOpticalBoundaryReached = false
+        isFinalResponseScanActive = false
         rendezvousTimedOut = false
         localStatus = nil
         rendezvousDecision = nil
@@ -232,10 +241,7 @@ public final class SilentSearchCoordinator {
         searchDeadlineTask = nil
         partnerDeadlineTask?.cancel()
         partnerDeadlineTask = nil
-        presentationDeadlineTask?.cancel()
-        presentationDeadlineTask = nil
-        activePresentationDeadline = nil
-        activeOpticalMessageKind = nil
+        clearPresentationState()
         opticalValidationDiagnostic = nil
         isTrackingSuspended = false
         scanCancellationRequested = false
@@ -623,6 +629,13 @@ public final class SilentSearchCoordinator {
                     let deadlineInstant = try monotonicInstant(forWallMilliseconds: deadline)
                     scheduledSearchStart = startInstant
                     searchDeadline = deadlineInstant
+                    if session.context.localRole == .b {
+                        try await recoverFinalResponse(
+                            until: startInstant,
+                            expectedKind: .searchCommit,
+                            response: session.retryOutgoing()
+                        )
+                    }
                     try await waitForSearchStart()
                     return
                 default:
@@ -713,8 +726,22 @@ public final class SilentSearchCoordinator {
                     try await self.dependencies.opticalExchange.scan(until: self.opticalDeadline())
                 }
             },
-            restore: { try self.transition(to: .handshake(.ready)) }
+            restore: { try self.transition(to: .handshake(.ready)) },
+            recoverTimeout: { try await self.recoverTimedOutHandshakeScan() }
         )
+    }
+
+    private func recoverTimedOutHandshakeScan() async throws {
+        guard let payload = cachedOutgoingPayload() else { return }
+        try await waitForOperatorAction(.generate(
+            messageKind: try messageKind(of: payload), isRetransmission: true
+        ))
+        try await presentHandshakePayload(payload)
+    }
+
+    private func cachedOutgoingPayload() -> Data? {
+        guard var session = protocolSession else { return nil }
+        return try? session.retryOutgoing()
     }
 
     private func presentHandshakePayload(_ payload: Data) async throws {
@@ -725,10 +752,15 @@ public final class SilentSearchCoordinator {
         expectedKind: OpticalMessageKind,
         begin: @escaping @MainActor () throws -> Void,
         operation: @escaping @MainActor () async throws -> Data,
-        restore: @escaping @MainActor () throws -> Void
+        restore: @escaping @MainActor () throws -> Void,
+        recoverTimeout: @escaping @MainActor () async throws -> Void,
+        stopsAtScheduledBoundary: Bool = false
     ) async throws -> Data {
         while true {
             try await waitForOperatorAction(.scan(expectedMessageKind: expectedKind))
+            if stopsAtScheduledBoundary, scheduledOpticalBoundaryReached {
+                throw ScheduledOpticalBoundary()
+            }
             scanCancellationRequested = false
             try begin()
             activeOpticalMessageKind = expectedKind
@@ -740,8 +772,12 @@ public final class SilentSearchCoordinator {
                 activeOpticalMessageKind = nil
                 diagnostic = .opticalTimedOut
                 try restore()
+                try await recoverTimeout()
             } catch {
                 activeOpticalMessageKind = nil
+                if stopsAtScheduledBoundary, scheduledOpticalBoundaryReached {
+                    throw ScheduledOpticalBoundary()
+                }
                 if Task.isCancelled { throw CancellationError() }
                 guard scanCancellationRequested else { throw error }
                 scanCancellationRequested = false
@@ -750,11 +786,80 @@ public final class SilentSearchCoordinator {
         }
     }
 
-    private func present(_ payload: Data, phase presentationPhase: SilentSearchPhase) async throws {
+    private func recoverFinalResponse(
+        until boundary: SilentSearchInstant,
+        expectedKind: OpticalMessageKind,
+        response: Data
+    ) async throws {
+        scheduledOpticalBoundaryReached = false
+        scheduledOpticalBoundaryTask?.cancel()
+        scheduledOpticalBoundaryTask = Task { [weak self] in
+            guard let self else { return }
+            do { try await self.dependencies.clock.sleep(until: boundary) }
+            catch { return }
+            self.scheduledOpticalBoundaryReached = true
+            self.isFinalResponseScanActive = false
+            self.clearPendingOperatorAction()
+            if self.activePresentationDeadline != nil {
+                self.dependencies.opticalExchange.completePresentation()
+            } else {
+                self.dependencies.opticalExchange.cancel()
+            }
+        }
+        defer {
+            scheduledOpticalBoundaryTask?.cancel()
+            scheduledOpticalBoundaryTask = nil
+            scheduledOpticalBoundaryReached = false
+            isFinalResponseScanActive = false
+            clearPendingOperatorAction()
+        }
+
+        while dependencies.clock.monotonicNow < boundary {
+            let payload: Data
+            do {
+                payload = try await runManualScan(
+                    expectedKind: expectedKind,
+                    begin: { self.isFinalResponseScanActive = true },
+                    operation: {
+                        try await self.timedHandshakeScan {
+                            try await self.dependencies.opticalExchange.scan(
+                                until: min(self.opticalDeadline(), boundary)
+                            )
+                        }
+                    },
+                    restore: { self.isFinalResponseScanActive = false },
+                    recoverTimeout: {
+                        guard self.dependencies.clock.monotonicNow < boundary else { return }
+                        try await self.waitForOperatorAction(.generate(
+                            messageKind: try self.messageKind(of: response), isRetransmission: true
+                        ))
+                        if !self.scheduledOpticalBoundaryReached {
+                            try await self.present(response, phase: nil)
+                        }
+                    },
+                    stopsAtScheduledBoundary: true
+                )
+            } catch is ScheduledOpticalBoundary {
+                return
+            }
+            isFinalResponseScanActive = false
+            guard payload == lastIncomingPayload, payload == lastResponseRequestPayload else {
+                opticalValidationDiagnostic = .unexpectedMessage
+                continue
+            }
+            try await waitForOperatorAction(.generate(
+                messageKind: try messageKind(of: response), isRetransmission: true
+            ))
+            guard !scheduledOpticalBoundaryReached else { return }
+            try await present(response, phase: nil)
+        }
+    }
+
+    private func present(_ payload: Data, phase presentationPhase: SilentSearchPhase?) async throws {
         retryAction = .present(payload)
         presentationCompletionRequested = false
         activeOpticalMessageKind = try messageKind(of: payload)
-        try? transition(to: presentationPhase)
+        if let presentationPhase { try? transition(to: presentationPhase) }
         let deadline = presentationDeadline()
         activePresentationDeadline = deadline
         presentationDeadlineTask?.cancel()
@@ -768,20 +873,20 @@ public final class SilentSearchCoordinator {
         }
         do {
             try await dependencies.opticalExchange.present(payload: payload)
-            presentationDeadlineTask?.cancel()
-            presentationDeadlineTask = nil
-            activePresentationDeadline = nil
-            activeOpticalMessageKind = nil
-            presentationCompletionRequested = false
+            clearPresentationState()
             retryAction = nil
         } catch {
-            presentationDeadlineTask?.cancel()
-            presentationDeadlineTask = nil
-            activePresentationDeadline = nil
-            activeOpticalMessageKind = nil
-            presentationCompletionRequested = false
+            clearPresentationState()
             throw error
         }
+    }
+
+    private func clearPresentationState() {
+        presentationDeadlineTask?.cancel()
+        presentationDeadlineTask = nil
+        activePresentationDeadline = nil
+        activeOpticalMessageKind = nil
+        presentationCompletionRequested = false
     }
 
     private func timedHandshakeScan<T: Sendable>(
@@ -1112,6 +1217,13 @@ public final class SilentSearchCoordinator {
                     try transition(to: .waitingForConvergence)
                     scheduledConvergenceRelease = try monotonicInstant(forWallMilliseconds: release)
                     convergenceTarget = MissionPoint(x: Double(x) / 1_000, y: Double(y) / 1_000)!
+                    if session.context.localRole == .b {
+                        try await recoverFinalResponse(
+                            until: scheduledConvergenceRelease!,
+                            expectedKind: .converge,
+                            response: session.retryOutgoing()
+                        )
+                    }
                     try await waitForConvergenceRelease()
                     return
                 default:
@@ -1196,7 +1308,11 @@ public final class SilentSearchCoordinator {
                     try await self.dependencies.opticalExchange.scan(until: self.rendezvousOpticalDeadline())
                 }
             },
-            restore: { try self.transition(to: .rendezvous(.ready)) }
+            restore: { try self.transition(to: .rendezvous(.ready)) },
+            recoverTimeout: {
+                guard let payload = self.cachedOutgoingPayload() else { return }
+                try await self.rendezvousRetransmit(payload, heading: heading)
+            }
         )
     }
 
@@ -1356,11 +1472,11 @@ public final class SilentSearchCoordinator {
             searchDeadlineTask = nil
             partnerDeadlineTask?.cancel()
             partnerDeadlineTask = nil
-            presentationDeadlineTask?.cancel()
-            presentationDeadlineTask = nil
-            activePresentationDeadline = nil
-            activeOpticalMessageKind = nil
-            presentationCompletionRequested = false
+            scheduledOpticalBoundaryTask?.cancel()
+            scheduledOpticalBoundaryTask = nil
+            scheduledOpticalBoundaryReached = false
+            isFinalResponseScanActive = false
+            clearPresentationState()
             scanCancellationRequested = false
             isTrackingSuspended = false
             clearPendingOperatorAction()

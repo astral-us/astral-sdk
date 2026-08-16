@@ -6,7 +6,7 @@ final class ManualQRExchangeViewModelTests: XCTestCase {
     func testScriptedManualExchangeProjectsOneActionAtATime() {
         let generate = ScriptedSilentSearchViewModel(scenario: .generateOffer)
         XCTAssertEqual(generate.phase, .pendingGenerateQR)
-        XCTAssertEqual(generate.opticalMessageLabel, "Offer")
+        XCTAssertEqual(generate.opticalMessageLabel, "mission offer")
         XCTAssertNil(generate.qrImage)
 
         generate.generateQR()

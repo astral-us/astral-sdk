@@ -246,7 +246,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         guard phase == .scanning else { return nil }
         return UIImage(systemName: "camera.fill")
     }
-    var opticalMessageLabel: String? { messageKind.map(Self.messageLabel) }
+    var opticalMessageLabel: String? { messageKind.map(\.operatorLabel) }
     var presentationSecondsRemaining: Int? { phase == .displayingQR ? 10 : nil }
 
     var mapState: SilentSearchMapState { .preview }
@@ -273,11 +273,6 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     func stopCalibrationPreview() {}
     func startScanPreview() {}
     func stopScanPreview() {}
-
-    private static func messageLabel(_ kind: OpticalMessageKind) -> String {
-        kind.rawValue.replacingOccurrences(of: "Commit", with: " commitment")
-            .replacingOccurrences(of: "Ack", with: " acknowledgment").capitalized
-    }
 
     private static let previewCorners = OrientedMarkerCorners(
         topLeft: Vec2(0.2, 0.8), topRight: Vec2(0.8, 0.8),
@@ -381,14 +376,18 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         Self.operatorPhase(
             coordinatorPhase: coordinator.phase,
             pendingAction: coordinator.pendingOpticalAction,
-            trackingSuspended: coordinator.isTrackingSuspended
+            trackingSuspended: coordinator.isTrackingSuspended,
+            activePresentation: coordinator.activePresentationDeadline != nil,
+            finalResponseScanActive: coordinator.isFinalResponseScanActive
         )
     }
 
     static func operatorPhase(
         coordinatorPhase: SilentSearchPhase,
         pendingAction: SilentSearchOpticalOperatorAction?,
-        trackingSuspended: Bool
+        trackingSuspended: Bool,
+        activePresentation: Bool = false,
+        finalResponseScanActive: Bool = false
     ) -> SilentSearchOperatorPhase {
         if trackingSuspended { return .trackingSuspended }
         if let action = pendingAction {
@@ -397,6 +396,8 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
             case .scan: .pendingScanQR
             }
         }
+        if activePresentation { return .displayingQR }
+        if finalResponseScanActive { return .scanning }
         return switch coordinatorPhase {
         case .setup: .setup
         case .calibrating: .calibrating
@@ -492,7 +493,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case let .scan(expectedMessageKind): expectedMessageKind
         case nil: coordinator.activeOpticalMessageKind
         }
-        return kind.map(Self.messageLabel)
+        return kind.map(\.operatorLabel)
     }
     var presentationSecondsRemaining: Int? { coordinator.presentationSecondsRemaining }
     var opticalTimedOut: Bool { coordinator.diagnostic == .opticalTimedOut }
@@ -646,8 +647,11 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         }
     }
 
-    private static func messageLabel(_ kind: OpticalMessageKind) -> String {
-        switch kind {
+}
+
+private extension OpticalMessageKind {
+    var operatorLabel: String {
+        switch self {
         case .offer: "mission offer"
         case .accept: "mission acceptance"
         case .searchCommit: "search commitment"
