@@ -92,6 +92,7 @@ public protocol SilentSearchCalibrating: AnyObject {
 public protocol SilentSearchOpticalExchanging: AnyObject {
     func present(payload: Data) async throws
     func scan(until deadline: SilentSearchInstant) async throws -> Data
+    func completePresentation()
     func cancel()
 }
 

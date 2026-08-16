@@ -10,7 +10,7 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
                 VStack(spacing: 18) {
                     phaseHeader
                     phaseContent
-                    if !isTerminal && viewModel.phase != .displayingQR {
+                    if !isTerminal && !isOpticalExchange {
                         SilentSearchMapView(state: viewModel.mapState)
                             .frame(minHeight: 260)
                     }
@@ -50,6 +50,8 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
         case .readyForExchange:
             Label("Marker SILENT_SEARCH_01 accepted", systemImage: "checkmark.seal.fill")
                 .foregroundStyle(.green)
+        case .pendingGenerateQR, .pendingScanQR:
+            opticalActionContext
         case .displayingQR:
             qrPresentation
         case .scanning:
@@ -123,33 +125,63 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
 
     @ViewBuilder
     private var qrPresentation: some View {
-        if let image = viewModel.qrImage {
-            Image(image, scale: 1, label: Text("Silent Search QR code"))
-                .interpolation(.none)
-                .resizable()
-                .scaledToFit()
-                .padding(18)
-                .background(.white, in: RoundedRectangle(cornerRadius: 12))
-                .accessibilityIdentifier("silent_search_qr")
-        } else {
-            ProgressView("Preparing QR code")
+        VStack(spacing: 16) {
+            if let image = viewModel.qrImage {
+                Image(image, scale: 1, label: Text("Silent Search QR code"))
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 520)
+                    .padding(18)
+                    .background(.white, in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityIdentifier("silent_search_qr")
+            } else {
+                ProgressView("Preparing QR code")
+            }
+            TimelineView(.periodic(from: .now, by: 0.2)) { _ in
+                Text("\(viewModel.presentationSecondsRemaining ?? 0) seconds remaining")
+                    .font(.title3.monospacedDigit().bold())
+                    .accessibilityIdentifier("silent_search_qr_countdown")
+            }
         }
+    }
+
+    private var opticalActionContext: some View {
+        VStack(spacing: 10) {
+            Image(systemName: viewModel.phase == .pendingGenerateQR ? "qrcode" : "qrcode.viewfinder")
+                .font(.system(size: 58, weight: .light))
+            if let label = viewModel.opticalMessageLabel {
+                Text(label.capitalized).font(.headline)
+                    .accessibilityIdentifier("silent_search_optical_message")
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 180)
     }
 
     private var scanner: some View {
         VStack(spacing: 12) {
             ZStack {
-                RoundedRectangle(cornerRadius: 22)
-                    .stroke(viewModel.opticalTimedOut ? .red : .blue,
-                            style: StrokeStyle(lineWidth: 4, dash: [18, 8]))
-                Image(systemName: viewModel.opticalTimedOut ? "qrcode.viewfinder" : "camera.viewfinder")
-                    .font(.system(size: 64, weight: .thin))
-                    .foregroundStyle(viewModel.opticalTimedOut ? .red : .blue)
+                if let preview = viewModel.scanPreviewImage {
+                    Image(uiImage: preview).resizable().scaledToFill().accessibilityHidden(true)
+                } else {
+                    Color.black
+                    ProgressView().tint(.white)
+                }
+                Color.clear
+                    .accessibilityElement()
+                    .accessibilityLabel("Live QR camera preview")
+                    .accessibilityIdentifier("silent_search_scanner")
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(.white, style: StrokeStyle(lineWidth: 4, dash: [18, 8]))
+                    .padding(42)
+                    .accessibilityElement()
+                    .accessibilityLabel("QR targeting frame")
+                    .accessibilityIdentifier("silent_search_scan_target")
             }
-            .frame(height: 210)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(viewModel.opticalTimedOut ? "QR scanner timed out" : "QR scanner active")
-            .accessibilityIdentifier("silent_search_scanner")
+            .frame(height: 360)
+            .clipShape(RoundedRectangle(cornerRadius: 22))
+            .onAppear { viewModel.startScanPreview() }
+            .onDisappear { viewModel.stopScanPreview() }
             Text("Only a valid message for this mission, marker, role, sequence, and phase is accepted.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -178,19 +210,31 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
             .disabled(!viewModel.canStart)
             .accessibilityIdentifier("silent_search_start")
         }
-        if viewModel.phase == .displayingQR || viewModel.phase == .scanning {
+        if viewModel.phase == .pendingGenerateQR {
+            Button("Generate QR") { viewModel.generateQR() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .accessibilityIdentifier("silent_search_generate_qr")
+        }
+        if viewModel.phase == .pendingScanQR {
+            Button("Scan QR") { viewModel.beginQRScan() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .accessibilityIdentifier("silent_search_scan_qr")
+        }
+        if isOpticalExchange {
             VStack {
                 if viewModel.phase == .displayingQR {
-                    Button("Partner scanned code") { viewModel.completeQRPresentation() }
+                    Button("Partner scanned it") { viewModel.completeQRPresentation() }
                         .buttonStyle(.borderedProminent)
                         .accessibilityIdentifier("silent_search_qr_complete")
                 }
-                HStack {
-                if viewModel.opticalTimedOut {
-                    Button("Retry") { viewModel.retry() }
-                        .buttonStyle(.borderedProminent)
-                        .accessibilityIdentifier("silent_search_retry")
+                if viewModel.phase == .scanning {
+                    Button("Cancel scan") { viewModel.cancelQRScan() }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("silent_search_scan_cancel")
                 }
+                HStack {
                 Button("Abort", role: .destructive) { viewModel.abort() }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("silent_search_abort")
@@ -212,6 +256,9 @@ struct SilentSearchView<Model: SilentSearchViewModel>: View {
         [.terminalFound, .terminalNotFound, .terminalFailure].contains(viewModel.phase)
     }
     private var isFailure: Bool { viewModel.phase == .terminalFailure }
+    private var isOpticalExchange: Bool {
+        [.pendingGenerateQR, .displayingQR, .pendingScanQR, .scanning].contains(viewModel.phase)
+    }
     private var terminalIdentifier: String {
         switch viewModel.phase {
         case .terminalFound: "silent_search_terminal_found"

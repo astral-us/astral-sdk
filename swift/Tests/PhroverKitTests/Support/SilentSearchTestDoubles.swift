@@ -113,6 +113,12 @@ final class FakeSilentSearchOpticalExchange: SilentSearchOpticalExchanging {
         presentations.forEach { $0.resume(throwing: Failure.cancelled) }
     }
 
+    func completePresentation() {
+        let presentations = presentContinuations
+        presentContinuations.removeAll()
+        presentations.forEach { $0.resume() }
+    }
+
     func resumePresentations() {
         let continuations = presentContinuations
         presentContinuations.removeAll()

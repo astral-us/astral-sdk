@@ -145,4 +145,9 @@ public final class AROpticalExchangeService: SilentSearchOpticalExchanging {
         presentationID = nil
         Task { @MainActor [presenter] in try? await presenter(nil) }
     }
+
+    public func completePresentation() {
+        guard presentation != nil else { return }
+        Task { @MainActor [presenter] in try? await presenter(nil) }
+    }
 }

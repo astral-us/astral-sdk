@@ -13,6 +13,14 @@ public final class SilentSearchCoordinator {
     public private(set) var calibrationVisualState = SilentSearchCalibrationVisualState()
     public private(set) var diagnostic: SilentSearchCoordinatorDiagnostic?
     public private(set) var targetConfirmation: TargetConfirmation?
+    public private(set) var pendingOpticalAction: SilentSearchOpticalOperatorAction?
+    public private(set) var activePresentationDeadline: SilentSearchInstant?
+    public private(set) var activeOpticalMessageKind: OpticalMessageKind?
+    public var presentationSecondsRemaining: Int? {
+        guard let deadline = activePresentationDeadline else { return nil }
+        let remaining = max(0, deadline - dependencies.clock.monotonicNow)
+        return Int((remaining + 999_999_999) / 1_000_000_000)
+    }
     @ObservationIgnored public var missionDidChange: ((SilentSearchMission) -> Void)?
 
     @ObservationIgnored private let dependencies: SilentSearchDependencies
@@ -20,8 +28,10 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var safetyListenerTask: Task<Void, Never>?
     @ObservationIgnored private var searchDeadlineTask: Task<Void, Never>?
     @ObservationIgnored private var partnerDeadlineTask: Task<Void, Never>?
+    @ObservationIgnored private var presentationDeadlineTask: Task<Void, Never>?
     @ObservationIgnored private var protocolSession: OpticalProtocolSession?
     @ObservationIgnored private var lastIncomingPayload: Data?
+    @ObservationIgnored private var lastResponseRequestPayload: Data?
     @ObservationIgnored private var retryAction: OpticalAction?
     @ObservationIgnored private var retryHeading: Double?
     @ObservationIgnored private var trackingRecovery: TrackingRecovery?
@@ -42,6 +52,10 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var scannerDiagnosticContext: SilentSearchCalibrationFrameContext?
     @ObservationIgnored private var scannerDiagnosticsCurrent: [OpticalScannerBackendDiagnostic] = []
     @ObservationIgnored private var scannerDiagnosticsPrevious: [OpticalScannerBackendDiagnostic] = []
+    @ObservationIgnored private var operatorActionContinuation: CheckedContinuation<Void, Never>?
+    @ObservationIgnored private var operatorActionID: UUID?
+    @ObservationIgnored private var scanCancellationRequested = false
+    @ObservationIgnored private var presentationCompletionRequested = false
 
     private enum OpticalAction {
         case present(Data)
@@ -79,6 +93,7 @@ public final class SilentSearchCoordinator {
         safetyListenerTask?.cancel()
         searchDeadlineTask?.cancel()
         partnerDeadlineTask?.cancel()
+        presentationDeadlineTask?.cancel()
     }
 
     public func configure(_ mission: SilentSearchMission) {
@@ -140,6 +155,7 @@ public final class SilentSearchCoordinator {
             localRole: mission.role
         ), events: dependencies.events)
         lastIncomingPayload = nil
+        lastResponseRequestPayload = nil
         retryAction = nil
         diagnostic = nil
         launchHandshake()
@@ -147,17 +163,37 @@ public final class SilentSearchCoordinator {
     }
 
     @discardableResult
-    public func retryOpticalExchange() -> Bool {
-        guard diagnostic == .opticalTimedOut, retryAction != nil else {
+    public func generatePendingQR() -> Bool {
+        guard case .generate = pendingOpticalAction else { return false }
+        return resumePendingOperatorAction()
+    }
+
+    @discardableResult
+    public func beginPendingQRScan() -> Bool {
+        guard case .scan = pendingOpticalAction else { return false }
+        diagnostic = nil
+        return resumePendingOperatorAction()
+    }
+
+    @discardableResult
+    public func completeQRPresentation() -> Bool {
+        guard activePresentationDeadline != nil, !presentationCompletionRequested else { return false }
+        presentationCompletionRequested = true
+        dependencies.opticalExchange.completePresentation()
+        return true
+    }
+
+    @discardableResult
+    public func cancelQRScan() -> Bool {
+        guard pendingOpticalAction == nil, !scanCancellationRequested else { return false }
+        switch phase {
+        case .handshake(.scanning), .rendezvous(.scanning):
+            scanCancellationRequested = true
+            dependencies.opticalExchange.cancel()
+            return true
+        default:
             return false
         }
-        diagnostic = nil
-        switch phase {
-        case .handshake: launchHandshake()
-        case .rendezvous: startRendezvous()
-        default: return false
-        }
-        return true
     }
 
     public func abort() async {
@@ -175,6 +211,8 @@ public final class SilentSearchCoordinator {
         mission = nil
         sharedFrame = nil
         protocolSession = nil
+        lastIncomingPayload = nil
+        lastResponseRequestPayload = nil
         retryAction = nil
         retryHeading = nil
         trackingRecovery = nil
@@ -191,6 +229,13 @@ public final class SilentSearchCoordinator {
         searchDeadlineTask = nil
         partnerDeadlineTask?.cancel()
         partnerDeadlineTask = nil
+        presentationDeadlineTask?.cancel()
+        presentationDeadlineTask = nil
+        activePresentationDeadline = nil
+        activeOpticalMessageKind = nil
+        scanCancellationRequested = false
+        presentationCompletionRequested = false
+        clearPendingOperatorAction()
         calibrationProgress = 0
         calibrationProgressContext = nil
         resetCalibrationVisualState()
@@ -386,18 +431,67 @@ public final class SilentSearchCoordinator {
         }
     }
 
+    private func waitForOperatorAction(_ action: SilentSearchOpticalOperatorAction) async throws {
+        try Task.checkCancellation()
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                pendingOpticalAction = action
+                operatorActionID = id
+                operatorActionContinuation = continuation
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.clearPendingOperatorAction(id: id) }
+        }
+        try Task.checkCancellation()
+    }
+
+    private func resumePendingOperatorAction() -> Bool {
+        guard let continuation = operatorActionContinuation else { return false }
+        pendingOpticalAction = nil
+        operatorActionContinuation = nil
+        operatorActionID = nil
+        continuation.resume()
+        return true
+    }
+
+    private func clearPendingOperatorAction(id: UUID? = nil) {
+        guard id == nil || operatorActionID == id else { return }
+        let continuation = operatorActionContinuation
+        pendingOpticalAction = nil
+        operatorActionContinuation = nil
+        operatorActionID = nil
+        continuation?.resume()
+    }
+
+    private func messageKind(of payload: Data) throws -> OpticalMessageKind {
+        do { return try OpticalMessageCodec().decode(payload).kind }
+        catch let error as OpticalMessageCodecError { throw OpticalProtocolRejection.codec(error) }
+    }
+
     private func runHandshake() async {
         guard var session = protocolSession else { return }
         do {
             if let retryAction {
                 switch retryAction {
-                case .present:
+                case let .present(payload):
+                    try await waitForOperatorAction(.generate(
+                        messageKind: try messageKind(of: payload), isRetransmission: true
+                    ))
                     try await perform(retryAction)
                 case .scan:
-                    let payload = try await scan()
-                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                    lastIncomingPayload = payload
-                    protocolSession = session
+                    let payload = try await scan(expectedMessageKind(for: session.phase))
+                    if let response = try retransmissionResponse(for: payload, session: &session) {
+                        protocolSession = session
+                        try await waitForOperatorAction(.generate(
+                            messageKind: try messageKind(of: response), isRetransmission: true
+                        ))
+                        try await perform(.present(response))
+                    } else {
+                        try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                        lastIncomingPayload = payload
+                        protocolSession = session
+                    }
                 }
                 self.retryAction = nil
             }
@@ -405,6 +499,7 @@ public final class SilentSearchCoordinator {
             while !Task.isCancelled {
                 switch session.phase {
                 case .readyToSendOffer:
+                    try await waitForOperatorAction(.generate(messageKind: .offer, isRetransmission: false))
                     guard let mission,
                           let duration = UInt16(exactly: mission.searchDurationSeconds) else {
                         throw OpticalProtocolRejection.codec(.invalidBody)
@@ -424,7 +519,15 @@ public final class SilentSearchCoordinator {
                     protocolSession = session
                     try await perform(.present(payload))
                 case .awaitingOffer, .awaitingAccept, .awaitingSearchCommit, .awaitingSearchAck:
-                    let payload = try await scan()
+                    let payload = try await scan(expectedMessageKind(for: session.phase))
+                    if let response = try retransmissionResponse(for: payload, session: &session) {
+                        protocolSession = session
+                        try await waitForOperatorAction(.generate(
+                            messageKind: try messageKind(of: response), isRetransmission: true
+                        ))
+                        try await perform(.present(response))
+                        continue
+                    }
                     do {
                         if session.phase == .awaitingOffer,
                            session.context.localRole == .b,
@@ -459,11 +562,16 @@ public final class SilentSearchCoordinator {
                         protocolSession = session
                     } catch OpticalProtocolRejection.invalidSchedule
                                 where session.context.localRole == .a && session.phase == .awaitingSearchAck {
+                        try await waitForOperatorAction(.generate(
+                            messageKind: .searchCommit, isRetransmission: false
+                        ))
                         let replacement = try makeSearchCommit(session: &session)
                         protocolSession = session
                         try await perform(.present(replacement))
                     }
                 case .readyToSendAccept:
+                    try await waitForOperatorAction(.generate(messageKind: .accept, isRetransmission: false))
+                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try session.prepareOutgoing(body: .accept(AcceptBody(
                         offerHash: linkHashOfLastIncoming(),
                         roverBWallTimeMilliseconds: dependencies.clock.wallNowMilliseconds
@@ -471,10 +579,16 @@ public final class SilentSearchCoordinator {
                     protocolSession = session
                     try await perform(.present(payload))
                 case .readyToSendSearchCommit:
+                    try await waitForOperatorAction(.generate(
+                        messageKind: .searchCommit, isRetransmission: false
+                    ))
+                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try makeSearchCommit(session: &session)
                     protocolSession = session
                     try await perform(.present(payload))
                 case .readyToSendSearchAck:
+                    try await waitForOperatorAction(.generate(messageKind: .searchAck, isRetransmission: false))
+                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try session.prepareOutgoing(body: .searchAck(HashAcknowledgementBody(
                         hash: linkHashOfLastIncoming()
                     )), at: dependencies.clock.wallNowMilliseconds)
@@ -529,23 +643,81 @@ public final class SilentSearchCoordinator {
         startSearch(until: deadline)
     }
 
+    private func retransmissionResponse(
+        for payload: Data,
+        session: inout OpticalProtocolSession
+    ) throws -> Data? {
+        guard payload == lastIncomingPayload, payload == lastResponseRequestPayload else { return nil }
+        return try session.retryOutgoing()
+    }
+
     private func linkHashOfLastIncoming() -> String {
         OpticalMessageCodec().messageLinkHash(for: lastIncomingPayload ?? Data())
     }
 
-    private func scan() async throws -> Data {
-        let action = OpticalAction.scan
-        return try await timed(action) {
-            try await self.dependencies.opticalExchange.scan(until: self.opticalDeadline())
+    private func scan(_ expectedKind: OpticalMessageKind) async throws -> Data {
+        while true {
+            try await waitForOperatorAction(.scan(expectedMessageKind: expectedKind))
+            scanCancellationRequested = false
+            do {
+                activeOpticalMessageKind = expectedKind
+                let payload = try await timed(.scan) {
+                    try await self.dependencies.opticalExchange.scan(until: self.opticalDeadline())
+                }
+                activeOpticalMessageKind = nil
+                return payload
+            } catch is OpticalTimeout {
+                activeOpticalMessageKind = nil
+                diagnostic = .opticalTimedOut
+            } catch {
+                activeOpticalMessageKind = nil
+                if Task.isCancelled { throw CancellationError() }
+                guard scanCancellationRequested else { throw error }
+                scanCancellationRequested = false
+            }
         }
     }
 
     private func perform(_ action: OpticalAction) async throws {
         switch action {
         case let .present(payload):
-            try await timed(action) { try await self.dependencies.opticalExchange.present(payload: payload) }
+            try await present(payload, phase: .handshake(.presenting))
         case .scan:
-            _ = try await scan()
+            throw OpticalProtocolRejection.unexpectedPhase
+        }
+    }
+
+    private func present(_ payload: Data, phase presentationPhase: SilentSearchPhase) async throws {
+        retryAction = .present(payload)
+        presentationCompletionRequested = false
+        activeOpticalMessageKind = try messageKind(of: payload)
+        try? transition(to: presentationPhase)
+        let deadline = presentationDeadline()
+        activePresentationDeadline = deadline
+        presentationDeadlineTask?.cancel()
+        presentationDeadlineTask = Task { [weak self] in
+            guard let self else { return }
+            do { try await self.dependencies.clock.sleep(until: deadline) }
+            catch { return }
+            guard self.activePresentationDeadline == deadline else { return }
+            self.presentationCompletionRequested = true
+            self.dependencies.opticalExchange.completePresentation()
+        }
+        do {
+            try await dependencies.opticalExchange.present(payload: payload)
+            presentationDeadlineTask?.cancel()
+            presentationDeadlineTask = nil
+            activePresentationDeadline = nil
+            activeOpticalMessageKind = nil
+            presentationCompletionRequested = false
+            retryAction = nil
+        } catch {
+            presentationDeadlineTask?.cancel()
+            presentationDeadlineTask = nil
+            activePresentationDeadline = nil
+            activeOpticalMessageKind = nil
+            presentationCompletionRequested = false
+            throw error
         }
     }
 
@@ -556,7 +728,7 @@ public final class SilentSearchCoordinator {
         retryAction = action
         switch action {
         case .present:
-            try? transition(to: .handshake(.presenting))
+            break
         case .scan:
             try? transition(to: .handshake(.scanning))
         }
@@ -584,6 +756,25 @@ public final class SilentSearchCoordinator {
     private func opticalDeadline() -> SilentSearchInstant {
         let result = dependencies.clock.monotonicNow.addingReportingOverflow(30_000_000_000)
         return result.overflow ? Int64.max : result.partialValue
+    }
+
+    private func presentationDeadline() -> SilentSearchInstant {
+        let result = dependencies.clock.monotonicNow.addingReportingOverflow(10_000_000_000)
+        return result.overflow ? Int64.max : result.partialValue
+    }
+
+    private func expectedMessageKind(for phase: OpticalProtocolPhase) throws -> OpticalMessageKind {
+        switch phase {
+        case .awaitingOffer: .offer
+        case .awaitingAccept: .accept
+        case .awaitingSearchCommit: .searchCommit
+        case .awaitingSearchAck: .searchAck
+        case .awaitingAStatus, .awaitingBStatus: .status
+        case .awaitingDecision: .decision
+        case .awaitingConverge: .converge
+        case .awaitingConvergeAck: .convergeAck
+        default: throw OpticalProtocolRejection.unexpectedPhase
+        }
     }
 
     func startSearch(until deadline: SilentSearchInstant) {
@@ -765,12 +956,9 @@ public final class SilentSearchCoordinator {
             if let retryAction, let retryHeading {
                 switch retryAction {
                 case let .present(payload):
-                    try await rendezvousPresent(payload, heading: retryHeading)
+                    try await rendezvousRetransmit(payload, heading: retryHeading)
                 case .scan:
-                    let payload = try await rendezvousScan(heading: retryHeading)
-                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                    lastIncomingPayload = payload
-                    protocolSession = session
+                    _ = try await receiveRendezvousPayload(heading: retryHeading, session: &session)
                 }
             }
             localStatus = try makeStatus()
@@ -779,16 +967,18 @@ public final class SilentSearchCoordinator {
                 switch session.phase {
                 case .readyToSendStatus:
                     guard let localStatus else { throw OpticalProtocolRejection.invalidDecision }
+                    try await prepareRendezvousExchange(heading: .pi / 2, phase: .ready)
+                    try await waitForOperatorAction(.generate(messageKind: .status, isRetransmission: false))
                     let payload = try session.prepareOutgoing(body: .status(localStatus),
                                                               at: dependencies.clock.wallNowMilliseconds)
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: .pi / 2)
                 case .awaitingAStatus:
-                    let payload = try await rendezvousScan(heading: .pi / 2)
-                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                    lastIncomingPayload = payload
-                    protocolSession = session
+                    _ = try await receiveRendezvousPayload(heading: .pi / 2, session: &session)
                 case .readyToSendBStatus:
+                    try await prepareRendezvousExchange(heading: -.pi / 2, phase: .ready)
+                    try await waitForOperatorAction(.generate(messageKind: .status, isRetransmission: false))
+                    lastResponseRequestPayload = lastIncomingPayload
                     let status = try status(linkedTo: linkHashOfLastIncoming())
                     localStatus = status
                     let payload = try session.prepareOutgoing(body: .status(status),
@@ -796,11 +986,11 @@ public final class SilentSearchCoordinator {
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: -.pi / 2)
                 case .awaitingBStatus:
-                    let payload = try await rendezvousScan(heading: -.pi / 2)
-                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                    lastIncomingPayload = payload
-                    protocolSession = session
+                    _ = try await receiveRendezvousPayload(heading: -.pi / 2, session: &session)
                 case .readyToSendDecision:
+                    try await prepareRendezvousExchange(heading: .pi / 2, phase: .ready)
+                    try await waitForOperatorAction(.generate(messageKind: .decision, isRetransmission: false))
+                    lastResponseRequestPayload = lastIncomingPayload
                     guard let aStatus = localStatus,
                           let bStatus = try decodedBody(lastIncomingPayload, as: StatusBody.self),
                           let aPayload = lastPresentedPayload else {
@@ -818,12 +1008,13 @@ public final class SilentSearchCoordinator {
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: .pi / 2)
                 case .awaitingDecision:
-                    let payload = try await rendezvousScan(heading: .pi / 2)
-                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                    rendezvousDecision = try decodedBody(payload, as: DecisionBody.self)
-                    lastIncomingPayload = payload
-                    protocolSession = session
+                    if let payload = try await receiveRendezvousPayload(heading: .pi / 2, session: &session) {
+                        rendezvousDecision = try decodedBody(payload, as: DecisionBody.self)
+                    }
                 case .readyToSendConverge:
+                    try await prepareRendezvousExchange(heading: .pi / 2, phase: .ready)
+                    try await waitForOperatorAction(.generate(messageKind: .converge, isRetransmission: false))
+                    lastResponseRequestPayload = lastIncomingPayload
                     guard let decision = rendezvousDecision,
                           let decisionPayload = lastPresentedPayload else {
                         throw OpticalProtocolRejection.invalidDecision
@@ -839,21 +1030,18 @@ public final class SilentSearchCoordinator {
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: .pi / 2)
                 case .awaitingConverge:
-                    let payload = try await rendezvousScan(heading: .pi / 2)
-                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                    lastIncomingPayload = payload
-                    protocolSession = session
+                    _ = try await receiveRendezvousPayload(heading: .pi / 2, session: &session)
                 case .readyToSendConvergeAck:
+                    try await prepareRendezvousExchange(heading: -.pi / 2, phase: .ready)
+                    try await waitForOperatorAction(.generate(messageKind: .convergeAck, isRetransmission: false))
+                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try session.prepareOutgoing(body: .convergeAck(HashAcknowledgementBody(
                         hash: linkHashOfLastIncoming()
                     )), at: dependencies.clock.wallNowMilliseconds)
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: -.pi / 2)
                 case .awaitingConvergeAck:
-                    let payload = try await rendezvousScan(heading: -.pi / 2)
-                    try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                    lastIncomingPayload = payload
-                    protocolSession = session
+                    _ = try await receiveRendezvousPayload(heading: -.pi / 2, session: &session)
                 case .terminalConflict:
                     await finish(with: .protocolFailure(.convergenceAfterConflict))
                     return
@@ -927,18 +1115,64 @@ public final class SilentSearchCoordinator {
     private func rendezvousPresent(_ payload: Data, heading: Double) async throws {
         retryAction = .present(payload)
         retryHeading = heading
-        try await prepareRendezvousExchange(heading: heading, phase: .presenting)
-        try await rendezvousTimed { try await self.dependencies.opticalExchange.present(payload: payload) }
+        try await present(payload, phase: .rendezvous(.presenting))
         lastPresentedPayload = payload
     }
 
-    private func rendezvousScan(heading: Double) async throws -> Data {
+    private func rendezvousRetransmit(_ payload: Data, heading: Double) async throws {
+        retryHeading = heading
+        try await prepareRendezvousExchange(heading: heading, phase: .ready)
+        try await waitForOperatorAction(.generate(
+            messageKind: try messageKind(of: payload), isRetransmission: true
+        ))
+        try await rendezvousPresent(payload, heading: heading)
+    }
+
+    private func rendezvousScan(heading: Double, expectedKind: OpticalMessageKind) async throws -> Data {
         retryAction = .scan
         retryHeading = heading
-        try await prepareRendezvousExchange(heading: heading, phase: .scanning)
-        return try await rendezvousTimed {
-            try await self.dependencies.opticalExchange.scan(until: self.rendezvousOpticalDeadline())
+        try await prepareRendezvousExchange(heading: heading, phase: .ready)
+        while true {
+            try await waitForOperatorAction(.scan(expectedMessageKind: expectedKind))
+            scanCancellationRequested = false
+            try transition(to: .rendezvous(.scanning))
+            do {
+                activeOpticalMessageKind = expectedKind
+                let payload = try await rendezvousTimed {
+                    try await self.dependencies.opticalExchange.scan(until: self.rendezvousOpticalDeadline())
+                }
+                activeOpticalMessageKind = nil
+                return payload
+            } catch is OpticalTimeout {
+                activeOpticalMessageKind = nil
+                diagnostic = .opticalTimedOut
+                try transition(to: .rendezvous(.ready))
+            } catch {
+                activeOpticalMessageKind = nil
+                if Task.isCancelled { throw CancellationError() }
+                guard scanCancellationRequested else { throw error }
+                scanCancellationRequested = false
+                try transition(to: .rendezvous(.ready))
+            }
         }
+    }
+
+    private func receiveRendezvousPayload(
+        heading: Double,
+        session: inout OpticalProtocolSession
+    ) async throws -> Data? {
+        let payload = try await rendezvousScan(
+            heading: heading, expectedKind: try expectedMessageKind(for: session.phase)
+        )
+        if let response = try retransmissionResponse(for: payload, session: &session) {
+            protocolSession = session
+            try await rendezvousRetransmit(response, heading: heading)
+            return nil
+        }
+        try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+        lastIncomingPayload = payload
+        protocolSession = session
+        return payload
     }
 
     private func prepareRendezvousExchange(heading: Double, phase step: SilentSearchRendezvousStep) async throws {
@@ -1070,6 +1304,13 @@ public final class SilentSearchCoordinator {
             searchDeadlineTask = nil
             partnerDeadlineTask?.cancel()
             partnerDeadlineTask = nil
+            presentationDeadlineTask?.cancel()
+            presentationDeadlineTask = nil
+            activePresentationDeadline = nil
+            activeOpticalMessageKind = nil
+            presentationCompletionRequested = false
+            scanCancellationRequested = false
+            clearPendingOperatorAction()
             dependencies.calibration.cancel()
             resetCalibrationVisualState()
             dependencies.opticalExchange.cancel()

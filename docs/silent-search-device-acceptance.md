@@ -18,9 +18,12 @@ This runbook is the Task 18 physical-device release gate. Task 17 provides the p
 3. Measure at least two known points. Both shared-frame coordinates must agree within the documented calibration tolerance and marker north must match the printed arrow.
 4. Confirm search and return paths remain strictly in the assigned sector. A center-band crossing is permitted only after the acknowledged convergence release.
 5. Confirm all coordination is optical and ordered. Neither rover moves before the acknowledged search start or convergence release.
-6. Confirm each rover displays `FOUND` only after its own position and heading tolerances pass.
-7. Exercise Stop where applicable and confirm motion stops before a stable terminal result appears.
-8. Pull both logs and run `scripts/verify-silent-search-logs.sh ROVER_A_LOG ROVER_B_LOG` for successful convergence runs.
+6. Complete every handshake and rendezvous exchange using only the currently visible **Generate QR** or **Scan QR** action.
+7. Confirm each generated QR begins at 10 seconds, can finish early with **Partner scanned it**, and hides the map.
+8. Confirm active scanning shows the live rear-camera preview and targeting frame; cancellation returns to **Scan QR** without advancing the protocol.
+9. Confirm each rover displays `FOUND` only after its own position and heading tolerances pass.
+10. Exercise Stop where applicable and confirm motion stops before a stable terminal result appears.
+11. Pull both logs and run `scripts/verify-silent-search-logs.sh ROVER_A_LOG ROVER_B_LOG` for successful convergence runs. Confirm payloads and images are absent.
 
 ## Acceptance Matrix
 
@@ -32,8 +35,11 @@ This runbook is the Task 18 physical-device release gate. Task 17 provides the p
 | Rover B sole finder | B reports three-sample target evidence; both reach role-specific stand-offs after acknowledgement | Not run | |
 | Matching dual reports | Reports within 0.50 m select the deterministic median and both converge | Not run | |
 | Conflicting dual reports | Reports beyond 0.50 m terminate as conflict with no convergence commit or movement | Not run | |
-| Withhold search acknowledgement | Both remain stopped; timeout exposes Retry/Abort; retry preserves bytes and sequence | Not run | |
+| Withhold search acknowledgement | Both remain stopped; scan timeout returns to **Scan QR** with retry guidance | Not run | |
 | Withhold convergence acknowledgement | Both remain stopped at rendezvous; no sector release or convergence movement | Not run | |
+| Repeat latest partner QR | Receiver offers **Generate QR** and reproduces the cached response bytes and sequence | Not run | |
+| Present older or out-of-order QR | Receiver rejects it and does not advance protocol state | Not run | |
+| Cancel active scan | Receiver returns to the same expected-message **Scan QR** action | Not run | |
 | Missing partner | Waiting rover remains stopped and fails 60 seconds after the search deadline | Not run | |
 | Tracking recovers within 5 seconds | Motion stops immediately, then replans from current pose under the same policy | Not run | |
 | Tracking does not recover | Shared frame invalidates and mission terminates with motion stopped | Not run | |

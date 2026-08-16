@@ -92,29 +92,46 @@ final class SilentSearchUITests: XCTestCase {
         XCTAssertEqual(app.staticTexts["silent_search_calibration_progress"].label, "1 of 3")
     }
 
-    func testOfferShowsFullQRCodeAndAbort() {
+    func testPendingGenerationShowsOnlyGenerateActionAndHidesMap() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "generate-offer")
+
+        XCTAssertTrue(app.buttons["silent_search_generate_qr"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["silent_search_scan_qr"].exists)
+        XCTAssertFalse(app.images["silent_search_qr"].exists)
+        XCTAssertFalse(app.otherElements["silent_search_map"].exists)
+    }
+
+    func testOfferShowsFullQRCodeCountdownAndEarlyCompletion() {
         let app = XCUIApplication.launchingSilentSearch(scenario: "display-offer")
 
         XCTAssertTrue(app.images["silent_search_qr"].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Position the other rover's rear camera over this code."].exists)
         XCTAssertTrue(app.buttons["silent_search_qr_complete"].isEnabled)
+        XCTAssertEqual(app.staticTexts["silent_search_qr_countdown"].label, "10 seconds remaining")
+        XCTAssertFalse(app.buttons["silent_search_generate_qr"].exists)
+        XCTAssertFalse(app.buttons["silent_search_scan_qr"].exists)
+        XCTAssertFalse(app.otherElements["silent_search_map"].exists)
         XCTAssertTrue(app.buttons["silent_search_abort"].exists)
     }
 
-    func testScannerTimeoutOffersRetryAndAbort() {
+    func testScannerTimeoutReturnsToScanAction() {
         let app = XCUIApplication.launchingSilentSearch(scenario: "scan-timeout")
 
-        XCTAssertTrue(app.otherElements["silent_search_scanner"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["No valid QR code received within 30 seconds."].exists)
-        XCTAssertTrue(app.buttons["silent_search_retry"].isEnabled)
+        XCTAssertTrue(app.buttons["silent_search_scan_qr"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["No valid QR code received within 30 seconds. Try again."].exists)
+        XCTAssertFalse(app.otherElements["silent_search_scanner"].exists)
         XCTAssertTrue(app.buttons["silent_search_abort"].isEnabled)
     }
 
-    func testPresentationTimeoutOffersRetryAndAbort() {
-        let app = XCUIApplication.launchingSilentSearch(scenario: "display-timeout")
+    func testActiveScannerShowsPreviewTargetAndCancelOnly() {
+        let app = XCUIApplication.launchingSilentSearch(scenario: "scanning-offer")
 
-        XCTAssertTrue(app.images["silent_search_qr"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.buttons["silent_search_retry"].isEnabled)
+        XCTAssertTrue(app.otherElements["silent_search_scanner"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.otherElements["silent_search_scan_target"].exists)
+        XCTAssertTrue(app.buttons["silent_search_scan_cancel"].isEnabled)
+        XCTAssertFalse(app.buttons["silent_search_generate_qr"].exists)
+        XCTAssertFalse(app.buttons["silent_search_scan_qr"].exists)
+        XCTAssertFalse(app.otherElements["silent_search_map"].exists)
         XCTAssertTrue(app.buttons["silent_search_abort"].isEnabled)
     }
 

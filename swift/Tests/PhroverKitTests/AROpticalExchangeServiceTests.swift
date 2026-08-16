@@ -76,6 +76,28 @@ final class AROpticalExchangeServiceTests: XCTestCase {
         XCTAssertTrue(cancelled)
     }
 
+    func testCompletePresentationFinishesInFlightPresentationCleanly() async throws {
+        var continuation: CheckedContinuation<Void, Never>?
+        let service = AROpticalExchangeService(sessionManager: ARSessionManager(),
+            clock: RuntimeSilentSearchClock(), scanner: { _ in [] }, presenter: { payload in
+                guard payload != nil else {
+                    continuation?.resume()
+                    continuation = nil
+                    return
+                }
+                await withCheckedContinuation { continuation = $0 }
+            })
+        let presentation = Task { @MainActor in
+            try await service.present(payload: Data("payload".utf8))
+        }
+        while continuation == nil { await Task.yield() }
+
+        service.completePresentation()
+        try await presentation.value
+
+        XCTAssertNil(continuation)
+    }
+
     private static let corners = OrientedMarkerCorners(
         topLeft: Vec2(0, 1), topRight: Vec2(1, 1), bottomLeft: Vec2(0, 0), bottomRight: Vec2(1, 0)
     )

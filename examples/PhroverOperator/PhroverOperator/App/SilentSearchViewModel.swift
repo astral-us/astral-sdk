@@ -9,7 +9,9 @@ enum SilentSearchOperatorPhase: Equatable {
     case setup
     case calibrating
     case readyForExchange
+    case pendingGenerateQR
     case displayingQR
+    case pendingScanQR
     case scanning
     case searching
     case returning
@@ -36,6 +38,9 @@ protocol SilentSearchViewModel: AnyObject, Observable {
     var calibrationVisualState: SilentSearchCalibrationVisualState { get }
     var calibrationProjection: CalibrationViewProjection { get }
     var qrImage: CGImage? { get }
+    var scanPreviewImage: UIImage? { get }
+    var opticalMessageLabel: String? { get }
+    var presentationSecondsRemaining: Int? { get }
     var opticalTimedOut: Bool { get }
     var failureReason: String? { get }
     var mapState: SilentSearchMapState { get }
@@ -43,12 +48,16 @@ protocol SilentSearchViewModel: AnyObject, Observable {
     var showsStop: Bool { get }
     func refreshReadiness()
     func start()
+    func generateQR()
+    func beginQRScan()
     func completeQRPresentation()
-    func retry()
+    func cancelQRScan()
     func abort()
     func stop()
     func startCalibrationPreview()
     func stopCalibrationPreview()
+    func startScanPreview()
+    func stopScanPreview()
 }
 
 enum SilentSearchLaunchScenario: String, CaseIterable {
@@ -59,8 +68,10 @@ enum SilentSearchLaunchScenario: String, CaseIterable {
     case calibrationQRLost = "calibration-qr-lost"
     case calibrationGroundingFailed = "calibration-grounding-failed"
     case calibrationSampleAccepted = "calibration-sample-accepted"
+    case generateOffer = "generate-offer"
     case displayOffer = "display-offer"
-    case displayTimeout = "display-timeout"
+    case scanOffer = "scan-offer"
+    case scanningOffer = "scanning-offer"
     case scanTimeout = "scan-timeout"
     case searching
     case returning
@@ -83,6 +94,7 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     private(set) var opticalTimedOut = false
     private(set) var failureReason: String?
     private(set) var calibrationVisualState = SilentSearchCalibrationVisualState()
+    private var messageKind: OpticalMessageKind?
 
     init(scenario: SilentSearchLaunchScenario) {
         switch scenario {
@@ -127,12 +139,21 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
                 context: Self.previewFrameContext,
                 markerID: "SILENT_SEARCH_01", corners: Self.previewCorners
             ))
-        case .displayOffer: phase = .displayingQR
-        case .displayTimeout:
+        case .generateOffer:
+            phase = .pendingGenerateQR
+            messageKind = .offer
+        case .displayOffer:
             phase = .displayingQR
-            opticalTimedOut = true
-        case .scanTimeout:
+            messageKind = .offer
+        case .scanOffer:
+            phase = .pendingScanQR
+            messageKind = .offer
+        case .scanningOffer:
             phase = .scanning
+            messageKind = .offer
+        case .scanTimeout:
+            phase = .pendingScanQR
+            messageKind = .offer
             opticalTimedOut = true
         case .searching: phase = .searching
         case .returning: phase = .returning
@@ -152,7 +173,9 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .setup: "Silent Search"
         case .calibrating: "Calibrate shared frame"
         case .readyForExchange: "Calibration accepted"
+        case .pendingGenerateQR: "Generate QR"
         case .displayingQR: "Display mission offer"
+        case .pendingScanQR: "Scan partner QR"
         case .scanning: "Scan partner QR"
         case .searching: "Searching west sector"
         case .returning: "Returning to rendezvous"
@@ -170,7 +193,9 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         case .setup: "Not ready"
         case .calibrating: "Calibration 1 of 3"
         case .readyForExchange: "Shared marker frame is valid."
+        case .pendingGenerateQR: "Ready to generate the mission offer."
         case .displayingQR: "Position the other rover's rear camera over this code."
+        case .pendingScanQR: opticalTimedOut ? "No valid QR code received within 30 seconds. Try again." : "Ready to scan the partner mission offer."
         case .scanning: opticalTimedOut ? "No valid QR code received within 30 seconds." : "Aim this rover's rear camera at the partner screen."
         case .searching: "Frontier frontier_4 · 118 seconds remaining"
         case .returning: "Navigating to Rover A staging pose."
@@ -203,6 +228,12 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
         guard phase == .displayingQR else { return nil }
         return try? OpticalQRCodeRenderer().render(payload: Data("PHROVER-UI-TEST-OFFER".utf8), moduleScale: 7)
     }
+    var scanPreviewImage: UIImage? {
+        guard phase == .scanning else { return nil }
+        return UIImage(systemName: "camera.fill")
+    }
+    var opticalMessageLabel: String? { messageKind.map(Self.messageLabel) }
+    var presentationSecondsRemaining: Int? { phase == .displayingQR ? 10 : nil }
 
     var mapState: SilentSearchMapState { .preview }
     var canStart: Bool { phase == .readyForExchange }
@@ -210,8 +241,10 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
 
     func refreshReadiness() {}
     func start() {}
-    func completeQRPresentation() { phase = .scanning }
-    func retry() { opticalTimedOut = false }
+    func generateQR() { phase = .displayingQR }
+    func beginQRScan() { opticalTimedOut = false; phase = .scanning }
+    func completeQRPresentation() { phase = .pendingScanQR }
+    func cancelQRScan() { phase = .pendingScanQR }
     func abort() {
         calibrationVisualState = SilentSearchCalibrationVisualState()
         phase = .terminalFailure
@@ -224,6 +257,13 @@ final class ScriptedSilentSearchViewModel: SilentSearchViewModel {
     }
     func startCalibrationPreview() {}
     func stopCalibrationPreview() {}
+    func startScanPreview() {}
+    func stopScanPreview() {}
+
+    private static func messageLabel(_ kind: OpticalMessageKind) -> String {
+        kind.rawValue.replacingOccurrences(of: "Commit", with: " commitment")
+            .replacingOccurrences(of: "Ack", with: " acknowledgment").capitalized
+    }
 
     private static let previewCorners = OrientedMarkerCorners(
         topLeft: Vec2(0.2, 0.8), topRight: Vec2(0.8, 0.8),
@@ -254,12 +294,14 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
     private let motion: LiveSilentSearchMotion
     private let targetObserver: LiveTargetObserver
     private let calibrationPreview: CalibrationPreviewModel
+    private let scanPreview: OpticalScanPreviewModel
 
     init(coordinator: SilentSearchCoordinator, environment: SilentSearchDeviceEnvironment,
          presentation: LiveOpticalPresentation, explorer: LiveSectorExplorer,
-         motion: LiveSilentSearchMotion, targetObserver: LiveTargetObserver,
-         calibrationPreview: CalibrationPreviewModel,
-         targetLabel: String) {
+          motion: LiveSilentSearchMotion, targetObserver: LiveTargetObserver,
+          calibrationPreview: CalibrationPreviewModel,
+          scanPreview: OpticalScanPreviewModel,
+          targetLabel: String) {
         self.targetLabel = targetLabel
         self.coordinator = coordinator
         self.environment = environment
@@ -268,6 +310,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         self.motion = motion
         self.targetObserver = targetObserver
         self.calibrationPreview = calibrationPreview
+        self.scanPreview = scanPreview
         coordinator.missionDidChange = { [weak self] mission in
             guard let self else { return }
             self.role = mission.role
@@ -288,7 +331,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
             if let payload {
                 try await presentation.present(payload)
             } else {
-                presentation.cancel()
+                presentation.complete()
             }
         }
         let frameProvider = LiveSharedFrameProvider()
@@ -315,12 +358,19 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
             coordinator: coordinator, environment: environment, presentation: presentation,
             explorer: explorer, motion: motion, targetObserver: target,
             calibrationPreview: CalibrationPreviewModel(frames: { ar.snapshots() }),
+            scanPreview: OpticalScanPreviewModel(frames: { ar.snapshots() }),
             targetLabel: targetLabel
         )
     }
 
     var phase: SilentSearchOperatorPhase {
-        switch coordinator.phase {
+        if let action = coordinator.pendingOpticalAction {
+            return switch action {
+            case .generate: .pendingGenerateQR
+            case .scan: .pendingScanQR
+            }
+        }
+        return switch coordinator.phase {
         case .setup: .setup
         case .calibrating: .calibrating
         case .handshake(.ready): .readyForExchange
@@ -343,7 +393,9 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .setup: "Silent Search"
         case .calibrating: "Calibrate shared frame"
         case .readyForExchange: "Calibration accepted"
+        case .pendingGenerateQR: "Generate QR"
         case .displayingQR: "Show QR to partner"
+        case .pendingScanQR: "Scan partner QR"
         case .scanning: "Scan partner QR"
         case .searching: "Searching \(role.searchSector.rawValue) sector"
         case .returning: "Returning to rendezvous"
@@ -361,7 +413,10 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .setup: readinessItems.allSatisfy(\.1) ? "Ready" : "Not ready"
         case .calibrating: "Calibration \(calibrationProgress) of 3"
         case .readyForExchange: "Shared marker frame is valid."
+        case .pendingGenerateQR: "Generate the required \(opticalMessageLabel ?? "message") when the partner is ready."
         case .displayingQR: "Position the other rover's rear camera over this code."
+        case .pendingScanQR:
+            opticalTimedOut ? "No valid QR code received within 30 seconds. Try again." : "Scan the partner's \(opticalMessageLabel ?? "message") when ready."
         case .scanning:
             opticalTimedOut ? "No valid QR code received within 30 seconds." : "Aim this rover's rear camera at the partner screen."
         case .searching: "Following eligible frontiers with sector policy enforced."
@@ -401,6 +456,16 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         guard phase == .displayingQR, let payload = presentation.payload else { return nil }
         return try? OpticalQRCodeRenderer().render(payload: payload, moduleScale: 7)
     }
+    var scanPreviewImage: UIImage? { scanPreview.image }
+    var opticalMessageLabel: String? {
+        let kind: OpticalMessageKind? = switch coordinator.pendingOpticalAction {
+        case let .generate(messageKind, _): messageKind
+        case let .scan(expectedMessageKind): expectedMessageKind
+        case nil: coordinator.activeOpticalMessageKind
+        }
+        return kind.map(Self.messageLabel)
+    }
+    var presentationSecondsRemaining: Int? { coordinator.presentationSecondsRemaining }
     var opticalTimedOut: Bool { coordinator.diagnostic == .opticalTimedOut }
     var failureReason: String? {
         guard case let .terminal(result) = coordinator.phase else { return nil }
@@ -467,8 +532,10 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         }
     }
 
-    func completeQRPresentation() { presentation.complete() }
-    func retry() { _ = coordinator.retryOpticalExchange() }
+    func generateQR() { _ = coordinator.generatePendingQR() }
+    func beginQRScan() { _ = coordinator.beginPendingQRScan() }
+    func completeQRPresentation() { _ = coordinator.completeQRPresentation() }
+    func cancelQRScan() { _ = coordinator.cancelQRScan() }
     func abort() {
         calibrationPreview.stop()
         Task { await coordinator.abort() }
@@ -482,6 +549,11 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         calibrationPreview.start()
     }
     func stopCalibrationPreview() { calibrationPreview.stop() }
+    func startScanPreview() {
+        guard phase == .scanning else { return }
+        scanPreview.start()
+    }
+    func stopScanPreview() { scanPreview.stop() }
 
     private static func failureMessage(_ result: SilentSearchTerminalResult) -> String? {
         switch result {
@@ -526,6 +598,19 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .invalidDecision: "invalid rendezvous decision"
         case .convergenceAfterConflict: "convergence forbidden after conflicting reports"
         case .noOutgoingMessage: "no QR message available to retry"
+        }
+    }
+
+    private static func messageLabel(_ kind: OpticalMessageKind) -> String {
+        switch kind {
+        case .offer: "mission offer"
+        case .accept: "mission acceptance"
+        case .searchCommit: "search commitment"
+        case .searchAck: "search acknowledgment"
+        case .status: "rendezvous status"
+        case .decision: "rendezvous decision"
+        case .converge: "convergence"
+        case .convergeAck: "convergence acknowledgment"
         }
     }
 }

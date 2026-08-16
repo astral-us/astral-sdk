@@ -8,6 +8,86 @@ import RoverNav
 final class SilentSearchCoordinatorTests: XCTestCase {
     private let wallNow: Int64 = 1_786_406_400_000
 
+    func testHandshakePublishesOneManualActionAndCreatesOfferAtGenerateTime() async throws {
+        let a = SilentSearchTestHarness()
+        let b = SilentSearchTestHarness()
+        a.clock.advance(nanoseconds: wallNow * 1_000_000)
+        b.clock.advance(nanoseconds: wallNow * 1_000_000)
+        let coordinatorA = try await calibratedCoordinator(a, role: .a)
+        let coordinatorB = try await calibratedCoordinator(b, role: .b)
+
+        XCTAssertTrue(coordinatorA.startHandshake())
+        XCTAssertTrue(coordinatorB.startHandshake())
+        await eventually {
+            coordinatorA.pendingOpticalAction == .generate(messageKind: .offer, isRetransmission: false) &&
+                coordinatorB.pendingOpticalAction == .scan(expectedMessageKind: .offer)
+        }
+
+        XCTAssertTrue(a.optical.presentedPayloads.isEmpty)
+        XCTAssertFalse(coordinatorA.beginPendingQRScan())
+        XCTAssertFalse(coordinatorB.generatePendingQR())
+        a.clock.advance(nanoseconds: 2_000_000_000)
+        XCTAssertTrue(coordinatorA.generatePendingQR())
+        await eventually { a.optical.presentedPayloads.count == 1 }
+        XCTAssertEqual(
+            try OpticalMessageCodec().decode(a.optical.presentedPayloads[0]).timestampMilliseconds,
+            wallNow + 2_000
+        )
+    }
+
+    func testScanCancellationReturnsToSamePendingActionWithoutProtocolMutation() async throws {
+        let harness = SilentSearchTestHarness()
+        let coordinator = try await calibratedCoordinator(harness, role: .b)
+        XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer) }
+
+        XCTAssertTrue(coordinator.beginPendingQRScan())
+        await eventually { coordinator.phase == .handshake(.scanning) }
+        XCTAssertTrue(coordinator.cancelQRScan())
+        XCTAssertFalse(coordinator.cancelQRScan())
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .offer) }
+
+        XCTAssertTrue(harness.optical.presentedPayloads.isEmpty)
+        XCTAssertNil(coordinator.diagnostic)
+    }
+
+    func testRepeatedLatestOfferRequiresManualCachedAcceptanceGeneration() async throws {
+        let opticalA = FakeSilentSearchOpticalExchange()
+        let opticalB = FakeSilentSearchOpticalExchange()
+        opticalA.peer = opticalB
+        opticalB.peer = opticalA
+        let a = SilentSearchTestHarness(optical: opticalA)
+        let b = SilentSearchTestHarness(optical: opticalB)
+        a.clock.advance(nanoseconds: wallNow * 1_000_000)
+        b.clock.advance(nanoseconds: wallNow * 1_000_000)
+        let coordinatorA = try await calibratedCoordinator(a, role: .a)
+        let coordinatorB = try await calibratedCoordinator(b, role: .b)
+        XCTAssertTrue(coordinatorA.startHandshake())
+        XCTAssertTrue(coordinatorB.startHandshake())
+
+        await eventually { coordinatorA.pendingOpticalAction != nil && coordinatorB.pendingOpticalAction != nil }
+        XCTAssertTrue(coordinatorA.generatePendingQR())
+        XCTAssertTrue(coordinatorB.beginPendingQRScan())
+        await eventually { coordinatorB.pendingOpticalAction == .generate(messageKind: .accept, isRetransmission: false) }
+        XCTAssertTrue(coordinatorB.generatePendingQR())
+        await eventually { opticalB.presentedPayloads.count == 1 }
+        let acceptance = opticalB.presentedPayloads[0]
+        let offer = opticalA.presentedPayloads[0]
+
+        await eventually { coordinatorB.pendingOpticalAction == .scan(expectedMessageKind: .searchCommit) }
+        opticalB.sendToScanner(offer)
+        XCTAssertTrue(coordinatorB.beginPendingQRScan())
+        await eventually {
+            coordinatorB.pendingOpticalAction == .generate(messageKind: .accept, isRetransmission: true)
+        }
+        XCTAssertEqual(opticalB.presentedPayloads.count, 1)
+
+        XCTAssertTrue(coordinatorB.generatePendingQR())
+        await eventually { opticalB.presentedPayloads.count == 2 }
+        XCTAssertEqual(opticalB.presentedPayloads[1], acceptance)
+        XCTAssertEqual(try OpticalMessageCodec().decode(opticalB.presentedPayloads[1]).sequence, 1)
+    }
+
     func testBothRolesCompleteRealProtocolHandshakeAndWaitForAcknowledgedStart() async throws {
         let opticalA = FakeSilentSearchOpticalExchange()
         let opticalB = FakeSilentSearchOpticalExchange()
@@ -22,6 +102,9 @@ final class SilentSearchCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(coordinatorA.startHandshake())
         XCTAssertTrue(coordinatorB.startHandshake())
+        await driveOpticalExchange([coordinatorA, coordinatorB]) {
+            coordinatorA.phase == .waitingForSearch && coordinatorB.phase == .waitingForSearch
+        }
         await eventually { coordinatorA.phase == .waitingForSearch && coordinatorB.phase == .waitingForSearch }
 
         XCTAssertEqual(opticalA.presentedPayloads.count, 2)
@@ -53,6 +136,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(coordinatorA.startHandshake())
         XCTAssertTrue(coordinatorB.startHandshake())
+        await driveOpticalExchange([coordinatorA, coordinatorB]) { adopted != nil }
         await eventually { adopted != nil }
 
         XCTAssertEqual(coordinatorB.mission?.id, coordinatorA.mission?.id)
@@ -60,6 +144,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinatorB.mission?.searchDurationSeconds, 240)
         XCTAssertEqual(adopted, coordinatorB.mission)
 
+        await driveOpticalExchange([coordinatorA, coordinatorB]) { coordinatorB.phase == .waitingForSearch }
         await eventually { coordinatorB.phase == .waitingForSearch }
     }
 
@@ -76,6 +161,9 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         let coordinatorB = try await calibratedCoordinator(b, role: .b)
         XCTAssertTrue(coordinatorA.startHandshake())
         XCTAssertTrue(coordinatorB.startHandshake())
+        await driveOpticalExchange([coordinatorA, coordinatorB]) {
+            coordinatorA.phase == .waitingForSearch && coordinatorB.phase == .waitingForSearch
+        }
         await eventually { coordinatorA.phase == .waitingForSearch }
 
         a.safety.send(.trackingLimited(generation: 1))
@@ -85,24 +173,39 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         await eventually { coordinatorA.phase == .searching }
     }
 
-    func testOpticalTimeoutRetryReusesIdenticalPayloadAndAbortStops() async throws {
+    func testPresentationCompletesAtTenSecondsAndCanCompleteEarly() async throws {
         let harness = SilentSearchTestHarness()
         harness.clock.advance(nanoseconds: wallNow * 1_000_000)
         harness.optical.suspendPresent = true
         let coordinator = try await calibratedCoordinator(harness, role: .a)
 
         XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction == .generate(messageKind: .offer, isRetransmission: false) }
+        XCTAssertTrue(harness.optical.presentedPayloads.isEmpty)
+        XCTAssertTrue(coordinator.generatePendingQR())
         await eventually { harness.optical.presentedPayloads.count == 1 }
-        harness.clock.advance(nanoseconds: 30_000_000_000)
-        await eventually { coordinator.diagnostic == .opticalTimedOut }
-        let first = try XCTUnwrap(harness.optical.presentedPayloads.first)
+        XCTAssertEqual(coordinator.activePresentationDeadline, harness.clock.monotonicNow + 10_000_000_000)
 
-        XCTAssertTrue(coordinator.retryOpticalExchange())
-        await eventually { harness.optical.presentedPayloads.count == 2 }
-        XCTAssertEqual(harness.optical.presentedPayloads[1], first)
+        harness.clock.advance(nanoseconds: 9_999_000_000)
+        await taskTurn()
+        XCTAssertEqual(harness.optical.suspendedPresentationCount, 1)
+        harness.clock.advance(nanoseconds: 1_000_000)
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .accept) }
+
         await coordinator.abort()
-        XCTAssertEqual(coordinator.phase, .terminal(.operatorAborted))
-        XCTAssertEqual(harness.motion.stopCount, 1)
+
+        let earlyHarness = SilentSearchTestHarness()
+        earlyHarness.clock.advance(nanoseconds: wallNow * 1_000_000)
+        earlyHarness.optical.suspendPresent = true
+        let early = try await calibratedCoordinator(earlyHarness, role: .a)
+        XCTAssertTrue(early.startHandshake())
+        await eventually { early.pendingOpticalAction != nil }
+        XCTAssertTrue(early.generatePendingQR())
+        await eventually { early.activePresentationDeadline != nil }
+        XCTAssertTrue(early.completeQRPresentation())
+        XCTAssertFalse(early.completeQRPresentation())
+        await eventually { early.pendingOpticalAction == .scan(expectedMessageKind: .accept) }
+        XCTAssertFalse(early.completeQRPresentation())
     }
 
     func testClockMismatchAndLateAcknowledgementAreHandledByRealSession() async throws {
@@ -113,11 +216,14 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         let a = SilentSearchTestHarness(optical: opticalA)
         let b = SilentSearchTestHarness(optical: opticalB)
         a.clock.advance(nanoseconds: wallNow * 1_000_000)
-        b.clock.advance(nanoseconds: (wallNow + 2_001) * 1_000_000)
+        b.clock.advance(nanoseconds: (wallNow + 15_001) * 1_000_000)
         let coordinatorA = try await calibratedCoordinator(a, role: .a)
         let coordinatorB = try await calibratedCoordinator(b, role: .b)
         XCTAssertTrue(coordinatorA.startHandshake())
         XCTAssertTrue(coordinatorB.startHandshake())
+        await driveOpticalExchange([coordinatorA, coordinatorB]) {
+            coordinatorB.phase == .terminal(.protocolFailure(.clockDisagreement))
+        }
         await eventually {
             coordinatorB.phase == .terminal(.protocolFailure(.clockDisagreement))
         }
@@ -130,6 +236,8 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         harness.clock.advance(nanoseconds: wallNow * 1_000_000)
         let coordinator = try await calibratedCoordinator(harness, role: .a)
         XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction != nil }
+        XCTAssertTrue(coordinator.generatePendingQR())
         await eventually { harness.optical.presentedPayloads.count == 1 }
 
         var roverB = OpticalProtocolSession(context: OpticalProtocolContext(
@@ -144,6 +252,10 @@ final class SilentSearchCoordinatorTests: XCTestCase {
             roverBWallTimeMilliseconds: wallNow
         )), at: wallNow)
         harness.optical.sendToScanner(accept)
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .accept) }
+        XCTAssertTrue(coordinator.beginPendingQRScan())
+        await eventually { coordinator.pendingOpticalAction == .generate(messageKind: .searchCommit, isRetransmission: false) }
+        XCTAssertTrue(coordinator.generatePendingQR())
         await eventually { harness.optical.presentedPayloads.count == 2 }
 
         let firstCommit = harness.optical.presentedPayloads[1]
@@ -153,12 +265,16 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         )), at: wallNow)
         harness.clock.advance(nanoseconds: 30_001_000_000)
         harness.optical.sendToScanner(acknowledgement)
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .searchAck) }
+        XCTAssertTrue(coordinator.beginPendingQRScan())
+        await eventually { coordinator.pendingOpticalAction == .generate(messageKind: .searchCommit, isRetransmission: false) }
+        XCTAssertTrue(coordinator.generatePendingQR())
         await eventually { harness.optical.presentedPayloads.count == 3 }
 
         let replacement = harness.optical.presentedPayloads[2]
         XCTAssertNotEqual(replacement, firstCommit)
         XCTAssertEqual(try OpticalMessageCodec().decode(replacement).sequence, 3)
-        XCTAssertEqual(coordinator.phase, .handshake(.scanning))
+        await eventually { coordinator.pendingOpticalAction == .scan(expectedMessageKind: .searchAck) }
     }
 
     func testLimitedTrackingStopsBeforeRecoveryReplanAndInvalidatesAfterFiveSeconds() async throws {
@@ -1057,6 +1173,8 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         harness.calibration.send(.accepted(try frame(generation: 7)))
         await eventually { coordinator.phase == .handshake(.ready) }
         XCTAssertTrue(coordinator.startHandshake())
+        await eventually { coordinator.pendingOpticalAction != nil }
+        XCTAssertTrue(coordinator.generatePendingQR())
         await eventually { coordinator.phase == .handshake(.presenting) }
 
         harness.safety.send(.transportFailed)
@@ -1263,6 +1381,22 @@ final class SilentSearchCoordinatorTests: XCTestCase {
     private func taskTurn() async {
         await Task.yield()
         await Task.yield()
+    }
+
+    private func driveOpticalExchange(
+        _ coordinators: [SilentSearchCoordinator],
+        until complete: @escaping @MainActor () -> Bool
+    ) async {
+        for _ in 0..<1_000 where !complete() {
+            for coordinator in coordinators {
+                switch coordinator.pendingOpticalAction {
+                case .generate: _ = coordinator.generatePendingQR()
+                case .scan: _ = coordinator.beginPendingQRScan()
+                case nil: break
+                }
+            }
+            await Task.yield()
+        }
     }
 
     private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
