@@ -54,5 +54,9 @@ final class ManualQRExchangeViewModelTests: XCTestCase {
             LiveSilentSearchViewModel.validationMessage(.wrongMarker),
             "QR uses another marker. Scan the expected QR."
         )
+        XCTAssertEqual(
+            LiveSilentSearchViewModel.validationMessage(.clockMismatch),
+            "QR timestamp is outside the allowed window. Ask the partner to generate a fresh QR, then scan it."
+        )
     }
 }

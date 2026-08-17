@@ -15,10 +15,16 @@ public enum AROpticalExchangeError: Error, Equatable, Sendable {
     case cancelled
 }
 
+public enum AROpticalPresentationCommand: Equatable, Sendable {
+    case show(Data)
+    case complete
+    case cancel
+}
+
 @MainActor
 public final class AROpticalExchangeService: SilentSearchOpticalExchanging {
     public typealias Scanner = (OpticalFrame) throws -> [OpticalObservation]
-    public typealias Presenter = (Data?) async throws -> Void
+    public typealias Presenter = (AROpticalPresentationCommand) async throws -> Void
 
     private let sessionManager: ARSessionManager
     private let clock: any SilentSearchClock
@@ -59,7 +65,7 @@ public final class AROpticalExchangeService: SilentSearchOpticalExchanging {
     public func present(payload: Data) async throws {
         try Task.checkCancellation()
         presentation?.cancel()
-        let presentation = Task { @MainActor [presenter] in try await presenter(payload) }
+        let presentation = Task { @MainActor [presenter] in try await presenter(.show(payload)) }
         let presentationID = UUID()
         self.presentation = presentation
         self.presentationID = presentationID
@@ -143,11 +149,11 @@ public final class AROpticalExchangeService: SilentSearchOpticalExchanging {
         presentation?.cancel()
         presentation = nil
         presentationID = nil
-        Task { @MainActor [presenter] in try? await presenter(nil) }
+        Task { @MainActor [presenter] in try? await presenter(.cancel) }
     }
 
     public func completePresentation() {
         guard presentation != nil else { return }
-        Task { @MainActor [presenter] in try? await presenter(nil) }
+        Task { @MainActor [presenter] in try? await presenter(.complete) }
     }
 }

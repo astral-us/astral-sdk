@@ -336,11 +336,14 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
             ar: ar, detector: detector, control: control, targetLabel: targetLabel
         )
         let presentation = LiveOpticalPresentation()
-        let optical = AROpticalExchangeService(sessionManager: ar, clock: clock) { payload in
-            if let payload {
+        let optical = AROpticalExchangeService(sessionManager: ar, clock: clock) { command in
+            switch command {
+            case let .show(payload):
                 try await presentation.present(payload)
-            } else {
+            case .complete:
                 presentation.complete()
+            case .cancel:
+                presentation.cancel()
             }
         }
         let frameProvider = LiveSharedFrameProvider()
@@ -509,7 +512,7 @@ final class LiveSilentSearchViewModel: SilentSearchViewModel {
         case .wrongMarker: "QR uses another marker. Scan the expected QR."
         case .wrongRole: "QR came from the wrong rover role. Scan the expected QR."
         case .unexpectedMessage: "QR is not the expected message. Scan the expected QR."
-        case .clockMismatch: "QR timestamp is outside the allowed window. Generate a fresh QR."
+        case .clockMismatch: "QR timestamp is outside the allowed window. Ask the partner to generate a fresh QR, then scan it."
         case .nonIncreasingSequence: "QR is older than the latest accepted message. Scan the expected QR."
         }
     }

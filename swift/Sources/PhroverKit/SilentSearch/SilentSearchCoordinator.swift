@@ -36,6 +36,7 @@ public final class SilentSearchCoordinator {
     @ObservationIgnored private var protocolSession: OpticalProtocolSession?
     @ObservationIgnored private var lastIncomingPayload: Data?
     @ObservationIgnored private var lastResponseRequestPayload: Data?
+    @ObservationIgnored private var lastResponsePayload: Data?
     @ObservationIgnored private var retryAction: OpticalAction?
     @ObservationIgnored private var retryHeading: Double?
     @ObservationIgnored private var trackingRecovery: TrackingRecovery?
@@ -163,6 +164,7 @@ public final class SilentSearchCoordinator {
         ), events: dependencies.events)
         lastIncomingPayload = nil
         lastResponseRequestPayload = nil
+        lastResponsePayload = nil
         retryAction = nil
         diagnostic = nil
         launchHandshake()
@@ -195,13 +197,15 @@ public final class SilentSearchCoordinator {
     public func cancelQRScan() -> Bool {
         guard pendingOpticalAction == nil, !scanCancellationRequested else { return false }
         switch phase {
-        case .handshake(.scanning), .rendezvous(.scanning):
-            scanCancellationRequested = true
-            dependencies.opticalExchange.cancel()
-            return true
+        case .handshake(.scanning), .rendezvous(.scanning): break
+        case .waitingForSearch, .waitingForConvergence:
+            guard isFinalResponseScanActive else { return false }
         default:
             return false
         }
+        scanCancellationRequested = true
+        dependencies.opticalExchange.cancel()
+        return true
     }
 
     public func abort() async {
@@ -221,6 +225,7 @@ public final class SilentSearchCoordinator {
         protocolSession = nil
         lastIncomingPayload = nil
         lastResponseRequestPayload = nil
+        lastResponsePayload = nil
         retryAction = nil
         retryHeading = nil
         trackingRecovery = nil
@@ -496,23 +501,18 @@ public final class SilentSearchCoordinator {
                     try await presentHandshakePayload(payload)
                 case .scan:
                     let payload = try await scan(expectedMessageKind(for: session.phase))
-                    if let response = try retransmissionResponse(for: payload, session: &session) {
-                        protocolSession = session
-                        try await waitForOperatorAction(.generate(
-                            messageKind: try messageKind(of: response), isRetransmission: true
-                        ))
-                        try await presentHandshakePayload(response)
-                    } else {
-                        do {
-                            try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                            lastIncomingPayload = payload
-                            protocolSession = session
-                        } catch let rejection as OpticalProtocolRejection {
-                            guard recoverFromExternalScan(rejection, phase: .handshake(.ready)) else {
-                                throw rejection
-                            }
-                            protocolSession = session
+                    do {
+                        if let response = try receiveHandshakePayload(payload, session: &session) {
+                            try await waitForOperatorAction(.generate(
+                                messageKind: try messageKind(of: response), isRetransmission: true
+                            ))
+                            try await presentHandshakePayload(response)
                         }
+                    } catch let rejection as OpticalProtocolRejection {
+                        guard recoverFromExternalScan(rejection, phase: .handshake(.ready)) else {
+                            throw rejection
+                        }
+                        protocolSession = session
                     }
                 }
                 self.retryAction = nil
@@ -542,52 +542,21 @@ public final class SilentSearchCoordinator {
                     try await presentHandshakePayload(payload)
                 case .awaitingOffer, .awaitingAccept, .awaitingSearchCommit, .awaitingSearchAck:
                     let payload = try await scan(expectedMessageKind(for: session.phase))
-                    if let response = try retransmissionResponse(for: payload, session: &session) {
-                        protocolSession = session
-                        try await waitForOperatorAction(.generate(
-                            messageKind: try messageKind(of: response), isRetransmission: true
-                        ))
-                        try await presentHandshakePayload(response)
-                        continue
-                    }
                     do {
-                        if session.phase == .awaitingOffer,
-                           session.context.localRole == .b,
-                           let localMission = mission {
-                            let incoming = try decodeMessage(payload)
-                            guard case let .offer(offer) = incoming.body else {
-                                throw OpticalProtocolRejection.unexpectedPhase
-                            }
-                            if incoming.missionID != session.context.missionID {
-                                var bound = OpticalProtocolSession(context: OpticalProtocolContext(
-                                    missionID: incoming.missionID,
-                                    markerID: session.context.markerID,
-                                    localRole: session.context.localRole
-                                ), events: dependencies.events)
-                                try bound.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                                session = bound
-                            } else {
-                                try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
-                            }
-                            guard let adoptedMission = SilentSearchMission(
-                                id: incoming.missionID, role: localMission.role,
-                                targetLabel: offer.targetLabel,
-                                searchDurationSeconds: UInt32(offer.searchDurationSeconds),
-                                markerID: localMission.markerID
-                            ) else { throw OpticalProtocolRejection.codec(.invalidBody) }
-                            mission = adoptedMission
-                            missionDidChange?(adoptedMission)
-                        } else {
-                            try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                        if let response = try receiveHandshakePayload(payload, session: &session) {
+                            try await waitForOperatorAction(.generate(
+                                messageKind: try messageKind(of: response), isRetransmission: true
+                            ))
+                            try await presentHandshakePayload(response)
+                            continue
                         }
-                        lastIncomingPayload = payload
-                        protocolSession = session
                     } catch OpticalProtocolRejection.invalidSchedule
                                 where session.context.localRole == .a && session.phase == .awaitingSearchAck {
                         try await waitForOperatorAction(.generate(
                             messageKind: .searchCommit, isRetransmission: false
                         ))
                         let replacement = try makeSearchCommit(session: &session)
+                        cacheResponse(replacement)
                         protocolSession = session
                         try await presentHandshakePayload(replacement)
                     } catch let rejection as OpticalProtocolRejection {
@@ -599,27 +568,27 @@ public final class SilentSearchCoordinator {
                     }
                 case .readyToSendAccept:
                     try await waitForOperatorAction(.generate(messageKind: .accept, isRetransmission: false))
-                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try session.prepareOutgoing(body: .accept(AcceptBody(
                         offerHash: linkHashOfLastIncoming(),
                         roverBWallTimeMilliseconds: dependencies.clock.wallNowMilliseconds
                     )), at: dependencies.clock.wallNowMilliseconds)
+                    cacheResponse(payload)
                     protocolSession = session
                     try await presentHandshakePayload(payload)
                 case .readyToSendSearchCommit:
                     try await waitForOperatorAction(.generate(
                         messageKind: .searchCommit, isRetransmission: false
                     ))
-                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try makeSearchCommit(session: &session)
+                    cacheResponse(payload)
                     protocolSession = session
                     try await presentHandshakePayload(payload)
                 case .readyToSendSearchAck:
                     try await waitForOperatorAction(.generate(messageKind: .searchAck, isRetransmission: false))
-                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try session.prepareOutgoing(body: .searchAck(HashAcknowledgementBody(
                         hash: linkHashOfLastIncoming()
                     )), at: dependencies.clock.wallNowMilliseconds)
+                    cacheResponse(payload)
                     protocolSession = session
                     try await presentHandshakePayload(payload)
                 case let .searchScheduled(start, deadline):
@@ -655,10 +624,53 @@ public final class SilentSearchCoordinator {
         }
     }
 
+    private func receiveHandshakePayload(
+        _ payload: Data,
+        session: inout OpticalProtocolSession
+    ) throws -> Data? {
+        if let response = retransmissionResponse(for: payload) {
+            protocolSession = session
+            return response
+        }
+        if session.phase == .awaitingOffer,
+           session.context.localRole == .b,
+           let localMission = mission {
+            let incoming = try decodeMessage(payload)
+            guard case let .offer(offer) = incoming.body else {
+                throw OpticalProtocolRejection.unexpectedPhase
+            }
+            if incoming.missionID != session.context.missionID {
+                var bound = OpticalProtocolSession(context: OpticalProtocolContext(
+                    missionID: incoming.missionID,
+                    markerID: session.context.markerID,
+                    localRole: session.context.localRole
+                ), events: dependencies.events)
+                try bound.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+                session = bound
+            } else {
+                try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+            }
+            guard let adoptedMission = SilentSearchMission(
+                id: incoming.missionID, role: localMission.role,
+                targetLabel: offer.targetLabel,
+                searchDurationSeconds: UInt32(offer.searchDurationSeconds),
+                markerID: localMission.markerID
+            ) else { throw OpticalProtocolRejection.codec(.invalidBody) }
+            mission = adoptedMission
+            missionDidChange?(adoptedMission)
+        } else {
+            try session.receive(payload, at: dependencies.clock.wallNowMilliseconds)
+        }
+        lastIncomingPayload = payload
+        protocolSession = session
+        return nil
+    }
+
     private func makeSearchCommit(session: inout OpticalProtocolSession) throws -> Data {
         guard let mission else { throw OpticalProtocolRejection.unexpectedPhase }
         let now = dependencies.clock.wallNowMilliseconds
-        let start = now.addingReportingOverflow(35_000)
+        // One full scan retry still leaves the required 30-second lead and acknowledgment margin.
+        let start = now.addingReportingOverflow(65_000)
         guard !start.overflow else { throw OpticalProtocolRejection.invalidSchedule }
         let duration = Int64(mission.searchDurationSeconds).multipliedReportingOverflow(by: 1_000)
         let deadline = start.partialValue.addingReportingOverflow(duration.partialValue)
@@ -678,12 +690,14 @@ public final class SilentSearchCoordinator {
         startSearch(until: deadline)
     }
 
-    private func retransmissionResponse(
-        for payload: Data,
-        session: inout OpticalProtocolSession
-    ) throws -> Data? {
+    private func retransmissionResponse(for payload: Data) -> Data? {
         guard payload == lastIncomingPayload, payload == lastResponseRequestPayload else { return nil }
-        return try session.retryOutgoing()
+        return lastResponsePayload
+    }
+
+    private func cacheResponse(_ payload: Data) {
+        lastResponseRequestPayload = lastIncomingPayload
+        lastResponsePayload = payload
     }
 
     private func recoverFromExternalScan(
@@ -853,6 +867,20 @@ public final class SilentSearchCoordinator {
             guard !scheduledOpticalBoundaryReached else { return }
             try await present(response, phase: nil)
         }
+    }
+
+    private func resumeFinalResponseRecovery(
+        until boundary: SilentSearchInstant,
+        expectedKind: OpticalMessageKind
+    ) async throws {
+        guard dependencies.clock.monotonicNow < boundary,
+              var session = protocolSession,
+              session.context.localRole == .b else { return }
+        try await recoverFinalResponse(
+            until: boundary,
+            expectedKind: expectedKind,
+            response: session.retryOutgoing()
+        )
     }
 
     private func present(_ payload: Data, phase presentationPhase: SilentSearchPhase?) async throws {
@@ -1139,11 +1167,11 @@ public final class SilentSearchCoordinator {
                 case .readyToSendBStatus:
                     try await prepareRendezvousExchange(heading: -.pi / 2, phase: .ready)
                     try await waitForOperatorAction(.generate(messageKind: .status, isRetransmission: false))
-                    lastResponseRequestPayload = lastIncomingPayload
                     let status = try status(linkedTo: linkHashOfLastIncoming())
                     localStatus = status
                     let payload = try session.prepareOutgoing(body: .status(status),
                                                               at: dependencies.clock.wallNowMilliseconds)
+                    cacheResponse(payload)
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: -.pi / 2)
                 case .awaitingBStatus:
@@ -1151,7 +1179,6 @@ public final class SilentSearchCoordinator {
                 case .readyToSendDecision:
                     try await prepareRendezvousExchange(heading: .pi / 2, phase: .ready)
                     try await waitForOperatorAction(.generate(messageKind: .decision, isRetransmission: false))
-                    lastResponseRequestPayload = lastIncomingPayload
                     guard let aStatus = localStatus,
                           let bStatus = try decodedBody(lastIncomingPayload, as: StatusBody.self),
                           let aPayload = lastPresentedPayload else {
@@ -1166,6 +1193,7 @@ public final class SilentSearchCoordinator {
                     rendezvousDecision = decision
                     let payload = try session.prepareOutgoing(body: .decision(decision),
                                                               at: dependencies.clock.wallNowMilliseconds)
+                    cacheResponse(payload)
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: .pi / 2)
                 case .awaitingDecision:
@@ -1175,12 +1203,12 @@ public final class SilentSearchCoordinator {
                 case .readyToSendConverge:
                     try await prepareRendezvousExchange(heading: .pi / 2, phase: .ready)
                     try await waitForOperatorAction(.generate(messageKind: .converge, isRetransmission: false))
-                    lastResponseRequestPayload = lastIncomingPayload
                     guard let decision = rendezvousDecision,
                           let decisionPayload = lastPresentedPayload else {
                         throw OpticalProtocolRejection.invalidDecision
                     }
-                    let release = dependencies.clock.wallNowMilliseconds.addingReportingOverflow(35_000)
+                    // A dropped decision can require two timeout rounds before convergence is acknowledged.
+                    let release = dependencies.clock.wallNowMilliseconds.addingReportingOverflow(95_000)
                     guard !release.overflow else { throw OpticalProtocolRejection.invalidSchedule }
                     let payload = try session.prepareOutgoing(body: .converge(ConvergeBody(
                         decisionHash: OpticalMessageCodec().messageLinkHash(for: decisionPayload),
@@ -1195,10 +1223,10 @@ public final class SilentSearchCoordinator {
                 case .readyToSendConvergeAck:
                     try await prepareRendezvousExchange(heading: -.pi / 2, phase: .ready)
                     try await waitForOperatorAction(.generate(messageKind: .convergeAck, isRetransmission: false))
-                    lastResponseRequestPayload = lastIncomingPayload
                     let payload = try session.prepareOutgoing(body: .convergeAck(HashAcknowledgementBody(
                         hash: linkHashOfLastIncoming()
                     )), at: dependencies.clock.wallNowMilliseconds)
+                    cacheResponse(payload)
                     protocolSession = session
                     try await rendezvousPresent(payload, heading: -.pi / 2)
                 case .awaitingConvergeAck:
@@ -1324,7 +1352,7 @@ public final class SilentSearchCoordinator {
             let payload = try await rendezvousScan(
                 heading: heading, expectedKind: try expectedMessageKind(for: session.phase)
             )
-            if let response = try retransmissionResponse(for: payload, session: &session) {
+            if let response = retransmissionResponse(for: payload) {
                 protocolSession = session
                 try await rendezvousRetransmit(response, heading: heading)
                 return nil
@@ -1624,11 +1652,21 @@ public final class SilentSearchCoordinator {
             )
             await completeReturn(result)
         case .waitingForSearch:
-            do { try await waitForSearchStart() }
+            do {
+                if let start = scheduledSearchStart {
+                    try await resumeFinalResponseRecovery(until: start, expectedKind: .searchCommit)
+                }
+                try await waitForSearchStart()
+            }
             catch is CancellationError { return }
             catch { await finish(with: .protocolFailure(.invalidSchedule)) }
         case .waitingForConvergence:
-            do { try await waitForConvergenceRelease() }
+            do {
+                if let release = scheduledConvergenceRelease {
+                    try await resumeFinalResponseRecovery(until: release, expectedKind: .converge)
+                }
+                try await waitForConvergenceRelease()
+            }
             catch is CancellationError { return }
             catch { await finish(with: .protocolFailure(.invalidSchedule)) }
         case .handshake:

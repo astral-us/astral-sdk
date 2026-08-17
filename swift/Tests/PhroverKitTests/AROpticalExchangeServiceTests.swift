@@ -55,8 +55,8 @@ final class AROpticalExchangeServiceTests: XCTestCase {
         var started = false
         var cancelled = false
         let service = AROpticalExchangeService(sessionManager: ARSessionManager(),
-            clock: RuntimeSilentSearchClock(), scanner: { _ in [] }, presenter: { payload in
-                guard payload != nil else { return }
+            clock: RuntimeSilentSearchClock(), scanner: { _ in [] }, presenter: { command in
+                guard case .show = command else { return }
                 started = true
                 do {
                     try await Task.sleep(for: .seconds(10))
@@ -76,11 +76,34 @@ final class AROpticalExchangeServiceTests: XCTestCase {
         XCTAssertTrue(cancelled)
     }
 
+    func testCancelEmitsCancellationInsteadOfCleanCompletion() async {
+        var commands: [AROpticalPresentationCommand] = []
+        let service = AROpticalExchangeService(sessionManager: ARSessionManager(),
+            clock: RuntimeSilentSearchClock(), scanner: { _ in [] }, presenter: { command in
+                commands.append(command)
+                if case .show = command {
+                    try await Task.sleep(for: .seconds(10))
+                }
+            })
+        let presentation = Task { @MainActor in
+            try await service.present(payload: Data("payload".utf8))
+        }
+        while commands.isEmpty { await Task.yield() }
+
+        service.cancel()
+        _ = try? await presentation.value
+        for _ in 0..<100 where !commands.contains(.cancel) { await Task.yield() }
+
+        XCTAssertEqual(commands.first, .show(Data("payload".utf8)))
+        XCTAssertTrue(commands.contains(.cancel))
+        XCTAssertFalse(commands.contains(.complete))
+    }
+
     func testCompletePresentationFinishesInFlightPresentationCleanly() async throws {
         var continuation: CheckedContinuation<Void, Never>?
         let service = AROpticalExchangeService(sessionManager: ARSessionManager(),
-            clock: RuntimeSilentSearchClock(), scanner: { _ in [] }, presenter: { payload in
-                guard payload != nil else {
+            clock: RuntimeSilentSearchClock(), scanner: { _ in [] }, presenter: { command in
+                guard case .show = command else {
                     continuation?.resume()
                     continuation = nil
                     return
