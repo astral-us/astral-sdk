@@ -80,6 +80,13 @@ public final class SilentSearchCoordinator {
         let deadline: SilentSearchInstant
         let goal: MissionPoint?
         let candidateID: String?
+        let finalResponseStep: FinalResponseRecoveryStep?
+    }
+
+    private enum FinalResponseRecoveryStep: Equatable {
+        case scan
+        case generate
+        case presentation
     }
 
     private struct OpticalTimeout: Error {}
@@ -803,7 +810,8 @@ public final class SilentSearchCoordinator {
     private func recoverFinalResponse(
         until boundary: SilentSearchInstant,
         expectedKind: OpticalMessageKind,
-        response: Data
+        response: Data,
+        resumedFrom step: FinalResponseRecoveryStep = .scan
     ) async throws {
         scheduledOpticalBoundaryReached = false
         scheduledOpticalBoundaryTask?.cancel()
@@ -826,6 +834,14 @@ public final class SilentSearchCoordinator {
             scheduledOpticalBoundaryReached = false
             isFinalResponseScanActive = false
             clearPendingOperatorAction()
+        }
+
+        if step == .generate || step == .presentation {
+            try await waitForOperatorAction(.generate(
+                messageKind: try messageKind(of: response), isRetransmission: true
+            ))
+            guard !scheduledOpticalBoundaryReached else { return }
+            try await present(response, phase: nil)
         }
 
         while dependencies.clock.monotonicNow < boundary {
@@ -871,7 +887,8 @@ public final class SilentSearchCoordinator {
 
     private func resumeFinalResponseRecovery(
         until boundary: SilentSearchInstant,
-        expectedKind: OpticalMessageKind
+        expectedKind: OpticalMessageKind,
+        step: FinalResponseRecoveryStep
     ) async throws {
         guard dependencies.clock.monotonicNow < boundary,
               var session = protocolSession,
@@ -879,7 +896,8 @@ public final class SilentSearchCoordinator {
         try await recoverFinalResponse(
             until: boundary,
             expectedKind: expectedKind,
-            response: session.retryOutgoing()
+            response: session.retryOutgoing(),
+            resumedFrom: step
         )
     }
 
@@ -1572,12 +1590,26 @@ public final class SilentSearchCoordinator {
         let interruptedPhase = phase
         let interruptedGoal = dependencies.motion.currentMissionPath.last
         let interruptedCandidateID = currentSearchCandidateID
+        let finalResponseStep: FinalResponseRecoveryStep? = switch interruptedPhase {
+        case .waitingForSearch where protocolSession?.context.localRole == .b,
+             .waitingForConvergence where protocolSession?.context.localRole == .b:
+            if case .generate(_, true) = pendingOpticalAction {
+                .generate
+            } else if activePresentationDeadline != nil {
+                .presentation
+            } else {
+                .scan
+            }
+        default:
+            nil
+        }
         let deadline = dependencies.clock.monotonicNow.addingReportingOverflow(5_000_000_000)
         trackingRecovery = TrackingRecovery(
             phase: interruptedPhase,
             deadline: deadline.overflow ? Int64.max : deadline.partialValue,
             goal: interruptedGoal,
-            candidateID: interruptedCandidateID
+            candidateID: interruptedCandidateID,
+            finalResponseStep: finalResponseStep
         )
         isTrackingSuspended = true
         activeOpticalMessageKind = nil
@@ -1654,7 +1686,11 @@ public final class SilentSearchCoordinator {
         case .waitingForSearch:
             do {
                 if let start = scheduledSearchStart {
-                    try await resumeFinalResponseRecovery(until: start, expectedKind: .searchCommit)
+                    try await resumeFinalResponseRecovery(
+                        until: start,
+                        expectedKind: .searchCommit,
+                        step: recovery.finalResponseStep ?? .scan
+                    )
                 }
                 try await waitForSearchStart()
             }
@@ -1663,7 +1699,11 @@ public final class SilentSearchCoordinator {
         case .waitingForConvergence:
             do {
                 if let release = scheduledConvergenceRelease {
-                    try await resumeFinalResponseRecovery(until: release, expectedKind: .converge)
+                    try await resumeFinalResponseRecovery(
+                        until: release,
+                        expectedKind: .converge,
+                        step: recovery.finalResponseStep ?? .scan
+                    )
                 }
                 try await waitForConvergenceRelease()
             }

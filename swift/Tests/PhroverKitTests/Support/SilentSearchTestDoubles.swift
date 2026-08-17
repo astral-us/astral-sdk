@@ -85,21 +85,33 @@ final class FakeSilentSearchOpticalExchange: SilentSearchOpticalExchanging {
 
     private var incoming: [Data] = []
     private var scanContinuations: [CheckedContinuation<Data, Error>] = []
+    var pendingScanCount: Int { scanContinuations.count }
     private(set) var presentedPayloads: [Data] = []
+    private(set) var activePresentedPayload: Data?
     var peer: FakeSilentSearchOpticalExchange?
     var shouldRelay: (Data) -> Bool = { _ in true }
+    var relayPeerPresentationOnScan = false
     var suspendPresent = false
     private var presentContinuations: [CheckedContinuation<Void, Error>] = []
     var suspendedPresentationCount: Int { presentContinuations.count }
 
     func present(payload: Data) async throws {
         presentedPayloads.append(payload)
+        activePresentedPayload = payload
+        defer {
+            if activePresentedPayload == payload { activePresentedPayload = nil }
+        }
         if shouldRelay(payload) { peer?.deliver(payload) }
         guard suspendPresent else { return }
         try await withCheckedThrowingContinuation { presentContinuations.append($0) }
     }
 
     func scan(until deadline: SilentSearchInstant) async throws -> Data {
+        if incoming.isEmpty, relayPeerPresentationOnScan,
+           let peer, let payload = peer.activePresentedPayload,
+           peer.shouldRelay(payload) {
+            deliver(payload)
+        }
         if !incoming.isEmpty { return incoming.removeFirst() }
         return try await withCheckedThrowingContinuation { scanContinuations.append($0) }
     }
@@ -110,6 +122,7 @@ final class FakeSilentSearchOpticalExchange: SilentSearchOpticalExchanging {
         scans.forEach { $0.resume(throwing: Failure.cancelled) }
         let presentations = presentContinuations
         presentContinuations.removeAll()
+        activePresentedPayload = nil
         presentations.forEach { $0.resume(throwing: Failure.cancelled) }
     }
 

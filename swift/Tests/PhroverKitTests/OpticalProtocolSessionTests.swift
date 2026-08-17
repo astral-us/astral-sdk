@@ -116,9 +116,9 @@ final class OpticalProtocolSessionTests: XCTestCase {
         var roverA = OpticalProtocolSession(context: context(.a))
         let offer = try roverA.prepareOutgoing(body: offerBody(), at: now)
         var atBoundary = OpticalProtocolSession(context: context(.b))
-        XCTAssertNoThrow(try atBoundary.receive(offer, at: now + 30_000))
+        XCTAssertNoThrow(try atBoundary.receive(offer, at: now + 15_000))
         var beyondBoundary = OpticalProtocolSession(context: context(.b))
-        XCTAssertThrowsError(try beyondBoundary.receive(offer, at: now + 30_001)) {
+        XCTAssertThrowsError(try beyondBoundary.receive(offer, at: now + 15_001)) {
             XCTAssertEqual($0 as? OpticalProtocolRejection, .clockDisagreement)
         }
 
@@ -128,8 +128,8 @@ final class OpticalProtocolSessionTests: XCTestCase {
             offerHash: OpticalMessageCodec().messageLinkHash(for: offer),
             roverBWallTimeMilliseconds: now)), at: now)
         var acceptedA = roverA
-        XCTAssertNoThrow(try acceptedA.receive(accept, at: now + 30_000))
-        XCTAssertThrowsError(try roverA.receive(accept, at: now + 30_001)) {
+        XCTAssertNoThrow(try acceptedA.receive(accept, at: now + 15_000))
+        XCTAssertThrowsError(try roverA.receive(accept, at: now + 15_001)) {
             XCTAssertEqual($0 as? OpticalProtocolRejection, .clockDisagreement)
         }
     }

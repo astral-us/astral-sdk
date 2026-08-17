@@ -387,7 +387,7 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         let a = SilentSearchTestHarness(optical: opticalA)
         let b = SilentSearchTestHarness(optical: opticalB)
         a.clock.advance(nanoseconds: wallNow * 1_000_000)
-        b.clock.advance(nanoseconds: (wallNow + 30_001) * 1_000_000)
+        b.clock.advance(nanoseconds: (wallNow + 15_001) * 1_000_000)
         let coordinatorA = try await calibratedCoordinator(a, role: .a)
         let coordinatorB = try await calibratedCoordinator(b, role: .b)
         XCTAssertTrue(coordinatorA.startHandshake())

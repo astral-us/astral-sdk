@@ -100,7 +100,7 @@ public struct OpticalProtocolSession: Sendable {
     private var convergenceRelease: Int64?
     private var convergenceHash: String?
 
-    private static let maximumHandshakeClockDifferenceMilliseconds: Int64 = 30_000
+    private static let maximumHandshakeClockDifferenceMilliseconds: Int64 = 15_000
 
     public init(context: OpticalProtocolContext, events: (any SilentSearchEventSink)? = nil) {
         self.context = context
