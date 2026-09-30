@@ -43,6 +43,8 @@ public final class NavigationController {
     private static let obstacleArrivalDistance = 0.65
 
     private var loop: Task<NavigationResult, Never>?
+    private var stopConfirmation: Task<Void, Error>?
+    private var stopUnconfirmed = false
     private var operationGeneration: UInt = 0
     private var replanCounter = 0
     private var activePolicy: (any PathAdmissibilityPolicy)?
@@ -116,13 +118,35 @@ public final class NavigationController {
         ).value
     }
 
+    public func navigateForFollow(to goal: Vec2, stoppingAtForwardClearance clearance: Double) async -> NavigationResult {
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
+        operationGeneration &+= 1
+        let reservation = operationGeneration
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        guard operationGeneration == reservation else { return .cancelled }
+        let task = startNavigation(
+            // This goal already stands off from the person. LiDAR clearance alone
+            // cannot tell the person from a cart crossing in front of the rover;
+            // treating low clearance as target arrival would bypass ObstacleGuard.
+            to: goal, stoppingAtForwardClearance: nil, policy: nil,
+            cancellingCurrent: false, isFollowGoal: true
+        )
+        let generation = operationGeneration
+        let result = await task.value
+        guard operationGeneration == generation else { return .cancelled }
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        return result
+    }
+
     @discardableResult
     private func startNavigation(
         to goal: Vec2,
         stoppingAtForwardClearance: Double?,
         policy: (any PathAdmissibilityPolicy)?,
-        cancellingCurrent: Bool = true
+        cancellingCurrent: Bool = true,
+        isFollowGoal: Bool = false
     ) -> Task<NavigationResult, Never> {
+        if stopUnconfirmed { return Task { .failed(.commandFailed) } }
         if cancellingCurrent { cancel() }
         operationGeneration &+= 1
         replanCounter = 0
@@ -147,7 +171,10 @@ public final class NavigationController {
         ])
         state = .driving
         publishSafetyState(.moving)
-        let task = Task { await drive(to: goal, stoppingAtForwardClearance: stoppingAtForwardClearance) }
+        let task = Task {
+            await drive(to: goal, stoppingAtForwardClearance: stoppingAtForwardClearance,
+                        isFollowGoal: isFollowGoal)
+        }
         loop = task
         return task
     }
@@ -199,6 +226,70 @@ public final class NavigationController {
         _ = await task.value
     }
 
+    public func rotateForFollowScan(by angle: Double) async -> NavigationResult {
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
+        operationGeneration &+= 1
+        let reservation = operationGeneration
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        guard operationGeneration == reservation else { return .cancelled }
+        operationGeneration &+= 1
+        guard let startYaw = currentPose()?.yaw else {
+            let result = NavigationResult.failed(.noPose)
+            finish(result)
+            return result
+        }
+        state = .driving
+        publishSafetyState(.moving)
+        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .scan) }
+        loop = task
+        let result = await task.value
+        guard operationGeneration == reservation + 1 else { return .cancelled }
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        return result
+    }
+
+    /// Invalidate motion before waiting for the loop and an acknowledged motor stop.
+    public func stopAndConfirm() async throws {
+        operationGeneration &+= 1
+        try await confirmStop(retryingFailedStop: true)
+    }
+
+    private func confirmStop(retryingFailedStop: Bool = false) async throws {
+        let generation = operationGeneration
+        let previousStop = stopConfirmation
+        let previousLoop = loop
+        previousLoop?.cancel()
+        let confirmation = Task { @MainActor in
+            // Serialize stops so an older stop cannot race a newer motion command.
+            if retryingFailedStop {
+                _ = try? await previousStop?.value
+            } else {
+                try await previousStop?.value
+            }
+            _ = await previousLoop?.value
+            try await stopRover()
+        }
+        stopConfirmation = confirmation
+        do {
+            try await confirmation.value
+        } catch {
+            stopUnconfirmed = true
+            if operationGeneration == generation {
+                state = .failed("Rover stop could not be confirmed.")
+                publishSafetyState(.failed(.commandFailed))
+            }
+            throw error
+        }
+        guard operationGeneration == generation else { return }
+        stopUnconfirmed = false
+        loop = nil
+        activePolicy = nil
+        path = []
+        state = .idle
+        publishSafetyState(.idle)
+    }
+
     /// Stop and clear the current goal.
     public func cancel() {
         operationGeneration &+= 1
@@ -206,7 +297,11 @@ public final class NavigationController {
         loop = nil
         activePolicy = nil
         path = []
-        Task { try? await stopRover() }
+        let previousStop = stopConfirmation
+        stopConfirmation = Task { @MainActor in
+            _ = try? await previousStop?.value
+            try await stopRover()
+        }
         // Without this, an external cancel (e.g. a hard-stop bypassing the brain) leaves
         // `state` at `.driving` forever, so anything polling `state == .driving` to know
         // when motion has settled never returns.
@@ -231,7 +326,8 @@ public final class NavigationController {
 
     // MARK: - Loop
 
-    private func drive(to goal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?) async -> NavigationResult {
+    private func drive(to goal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?,
+                       isFollowGoal: Bool) async -> NavigationResult {
         var hasSentCommand = false
         var consecutiveCommandFailures = 0
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
@@ -290,6 +386,16 @@ public final class NavigationController {
                 break
             case .stopObstacle(let clearance):
                 try? await stopRover()
+                if isFollowGoal {
+                    let result = NavigationResult.failed(.obstacle)
+                    finish(result)
+                    RuntimeFileLog.append("nav_safety_stop", fields: [
+                        "reason": "obstacle",
+                        "clearance": String(format: "%.2f", clearance),
+                        "state": "follow_obstacle"
+                    ])
+                    return result
+                }
                 state = Self.stateAfterObstacleStop(pose: pose, goal: goal, clearance: clearance)
                 if case .failed = state { publishSafetyState(.failed(.obstacle)) }
                 RuntimeFileLog.append("nav_safety_stop", fields: [
@@ -490,7 +596,14 @@ public final class NavigationController {
             }
             if mode == .scan {
                 await sleep(.seconds(RoverConfig.scanTurnPulseDuration))
-                try? await stopRover()
+                do {
+                    try await stopRover()
+                } catch {
+                    stopUnconfirmed = true
+                    let result = NavigationResult.failed(.commandFailed)
+                    finish(result)
+                    return result
+                }
                 RuntimeFileLog.append("nav_scan_turn_settle", fields: [
                     "settle_seconds": String(format: "%.2f", RoverConfig.scanTurnSettleDuration)
                 ])

@@ -4,6 +4,99 @@ import RoverNav
 
 @MainActor
 final class NavigationSafetyTests: XCTestCase {
+    func testConfirmedStopPropagatesFailureAndBarsFollowGoal() async {
+        var goals = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in goals += 1; return [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in },
+            stopRover: { throw FakeCommandError.timedOut },
+            sleep: { _ in }
+        )
+
+        do {
+            try await controller.stopAndConfirm()
+            XCTFail("Stop must propagate its error")
+        } catch {
+            XCTAssertEqual(error as? FakeCommandError, .timedOut)
+        }
+        let result = await controller.navigateForFollow(to: Vec2(2, 0), stoppingAtForwardClearance: 1.5)
+        XCTAssertEqual(result, .failed(.commandFailed))
+        XCTAssertEqual(goals, 0)
+    }
+
+    func testFollowGoalWaitsForMotorStopBeforePlanning() async {
+        let stop = SuspendedNavigationStop()
+        var plans = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in plans += 1; return [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in throw FakeCommandError.timedOut },
+            stopRover: { await stop.confirm() },
+            sleep: { _ in }
+        )
+        let goal = Task { await controller.navigateForFollow(to: Vec2(2, 0), stoppingAtForwardClearance: 1.5) }
+        await stop.waitUntilRequested()
+        XCTAssertEqual(plans, 0)
+        stop.finish()
+        let result = await goal.value
+        XCTAssertEqual(plans, 1)
+        XCTAssertEqual(result, .failed(.commandFailed))
+    }
+
+
+    func testFollowGoalDoesNotReportArrivalWhenMotorStopFails() async {
+        var stops = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in },
+            stopRover: {
+                stops += 1
+                if stops > 1 { throw FakeCommandError.timedOut }
+            },
+            sleep: { _ in }
+        )
+        let result = await controller.navigateForFollow(to: .zero, stoppingAtForwardClearance: 1.5)
+        XCTAssertEqual(result, .failed(.commandFailed))
+    }
+
+    func testFollowGoalDoesNotTreatUnrelatedNearObstacleAsPersonArrival() async {
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 0.30 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { Date() },
+            sendCommand: { _ in },
+            stopRover: {},
+            sleep: { _ in }
+        )
+
+        let result = await controller.navigateForFollow(to: Vec2(0, 1),
+                                                         stoppingAtForwardClearance: 1.25)
+
+        XCTAssertEqual(result, .failed(.obstacle))
+    }
+
+    func testFollowGoalDoesNotCountObstacleAsArrivalEvenNearWaypoint() async {
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 0.30 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { Date() },
+            sendCommand: { _ in }, stopRover: {}, sleep: { _ in }
+        )
+
+        let result = await controller.navigateForFollow(to: Vec2(0, 0.5),
+                                                         stoppingAtForwardClearance: 1.25)
+        XCTAssertEqual(result, .failed(.obstacle))
+    }
     func testNavigationPublishesTypedCommandFailureDuringMovement() async {
         let controller = NavigationController(
             currentPose: { Pose2D(position: .zero, yaw: 0) },
@@ -216,6 +309,28 @@ final class NavigationSafetyTests: XCTestCase {
         XCTAssertEqual(fields["wheel_left"], "0.12")
         XCTAssertEqual(fields["wheel_right"], "0.34")
         XCTAssertEqual(fields["command_failures"], "1")
+    }
+}
+
+@MainActor
+private final class SuspendedNavigationStop {
+    private var requested = false
+    private var requestWaiter: CheckedContinuation<Void, Never>?
+    private var stopWaiter: CheckedContinuation<Void, Never>?
+    func confirm() async {
+        guard !requested else { return }
+        requested = true
+        requestWaiter?.resume()
+        requestWaiter = nil
+        await withCheckedContinuation { stopWaiter = $0 }
+    }
+    func waitUntilRequested() async {
+        if requested { return }
+        await withCheckedContinuation { requestWaiter = $0 }
+    }
+    func finish() {
+        stopWaiter?.resume()
+        stopWaiter = nil
     }
 }
 

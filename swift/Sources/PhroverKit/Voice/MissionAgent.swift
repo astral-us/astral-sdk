@@ -14,9 +14,11 @@ public protocol RoverMotion: AnyObject {
     func rotate(by angle: Double) async
     func rotateForScan(by angle: Double) async
     func cancel()
+    func stopAndConfirm() async throws
 }
 
 extension RoverMotion {
+    public func stopAndConfirm() async throws { cancel() }
     public func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) {
         navigate(to: goal)
     }
@@ -220,6 +222,7 @@ public final class MissionAgent {
     private var nextCandidateNumber = 1
     private var isHandlingMission = false
     private var missionGeneration = 0
+    private var stopUnconfirmed = false
     /// Ring buffer of "action → outcome" lines fed to the brain as `recentActions` (see
     /// `makeContext`) so it can notice it's repeating itself — persists across `handle()`
     /// calls within one mission agent, same as `memory`, so a multi-turn mission ("search,
@@ -289,15 +292,20 @@ public final class MissionAgent {
 
         RuntimeFileLog.append("voice_command_received", fields: ["utterance": trimmedUtterance])
         if isEmergencyStopUtterance(trimmedUtterance) {
-            missionGeneration += 1
-            isHandlingMission = false
             phase = .acting
-            motion.cancel()
-            phase = .idle
+            do {
+                try await cancelCurrentMissionAndWait()
+            } catch {
+                RuntimeFileLog.append("voice_command_stop_failed", fields: ["error": error.localizedDescription])
+            }
             RuntimeFileLog.append("voice_command_stop", fields: ["utterance": trimmedUtterance])
             return
         }
 
+        guard !stopUnconfirmed else {
+            voice.speak("Rover stop could not be confirmed.")
+            return
+        }
         guard !isHandlingMission else {
             voice.speak("I'm still working on the previous command. Say stop if you want me to cancel it.")
             RuntimeFileLog.append("voice_command_busy", fields: ["utterance": trimmedUtterance])
@@ -334,6 +342,19 @@ public final class MissionAgent {
             "return_requested": Self.hasReturnIntent(trimmedUtterance) ? "true" : "false"
         ])
         await runLoop(firstUtterance: trimmedUtterance, missionID: missionID)
+    }
+
+    public func cancelCurrentMissionAndWait() async throws {
+        missionGeneration += 1
+        let generation = missionGeneration
+        isHandlingMission = false
+        phase = .acting
+        stopUnconfirmed = true
+        try await motion.stopAndConfirm()
+        if missionGeneration == generation {
+            stopUnconfirmed = false
+            phase = .idle
+        }
     }
 
     // MARK: - Loop
@@ -571,8 +592,11 @@ public final class MissionAgent {
                 outcome = "claimRoom(\(roomId)) → broadcast"
 
             case .stop:
-                motion.cancel()
-                phase = .idle
+                do {
+                    try await cancelCurrentMissionAndWait()
+                } catch {
+                    RuntimeFileLog.append("mission_stop_failed", fields: ["error": error.localizedDescription])
+                }
                 return
 
             case .done:

@@ -27,6 +27,36 @@ final class PhroverOperatorUITests: XCTestCase {
         )
     }
 
+    func testTalkTypedFollowShowsStopWithoutMicrophonePermission() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing", "-talk-scenario", "ready"]
+        app.launch()
+        let field = app.descendants(matching: .any)["talk_command_field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        field.tap()
+        field.typeText("follow me")
+        app.buttons["talk_send_command"].tap()
+        XCTAssertTrue(app.buttons["talk_stop_following"].waitForExistence(timeout: 5))
+        XCTAssertEqual(field.value as? String, "Type a request")
+        app.buttons["talk_stop_following"].tap()
+        XCTAssertFalse(app.buttons["talk_stop_following"].waitForExistence(timeout: 2))
+    }
+
+    func testLeavingTalkAfterFollowStopsBeforeShowingDrive() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing", "-talk-scenario", "ready"]
+        app.launch()
+        let field = app.descendants(matching: .any)["talk_command_field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        field.tap()
+        field.typeText("follow me")
+        app.buttons["talk_send_command"].tap()
+        XCTAssertTrue(app.buttons["talk_stop_following"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.keyboards.firstMatch.exists, "Send should dismiss the keyboard so other tabs remain reachable")
+        app.buttons["Drive"].tap()
+        XCTAssertFalse(app.buttons["talk_stop_following"].waitForExistence(timeout: 2))
+    }
+
     /// Gated integration path: drive forward on the D-pad and confirm the command
     /// actually reached the (mocked) WAVE ROVER base — proves the phone->ESP32 control
     /// loop end-to-end with no chassis needed.

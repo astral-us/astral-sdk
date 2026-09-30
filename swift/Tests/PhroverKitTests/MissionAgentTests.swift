@@ -10,6 +10,39 @@ import RoverNav
 /// only be verified on a real device (see rover/README.md status notes).
 @MainActor
 final class MissionAgentTests: XCTestCase {
+    func testDirectCancellationInvalidatesMissionBeforeAwaitingConfirmedStop() async throws {
+        let motion = FakeMotion()
+        motion.suspendConfirmedStop = true
+        let brain = BlockingBrain()
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice()) { brain }
+        let mission = Task { await agent.handle("go to chair") }
+        await brain.waitUntilEntered()
+        let cancellation = Task { try await agent.cancelCurrentMissionAndWait() }
+        await motion.waitUntilStopRequested()
+        XCTAssertEqual(agent.phase, .acting, "Mission must not report idle before motor stop acknowledgement")
+        brain.finishAll(with: .navigate(.worldPoint(Vec2(4, 5))))
+        await mission.value
+        XCTAssertTrue(motion.navigateCalls.isEmpty)
+        motion.finishConfirmedStop()
+        try await cancellation.value
+        XCTAssertEqual(motion.confirmedStopCount, 1)
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
+    func testFailedMissionStopDoesNotReleaseOwnership() async {
+        let motion = FakeMotion()
+        motion.confirmedStopError = FakeBrainError.modelUnavailable
+        let brain = FakeBrain(script: [.done])
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice()) { brain }
+        do {
+            try await agent.cancelCurrentMissionAndWait()
+            XCTFail("Expected stop error")
+        } catch {
+            XCTAssertEqual(error as? FakeBrainError, .modelUnavailable)
+        }
+        await agent.handle("new mission")
+        XCTAssertTrue(brain.seenContexts.isEmpty)
+    }
     func testGroundsVisibleTargetAndFinishes() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -802,6 +835,22 @@ final class MissionAgentTests: XCTestCase {
         XCTAssertEqual(motion.cancelCallCount, 1)
     }
 
+    func testBrainStopDecisionAwaitsMotorStopAcknowledgement() async {
+        let motion = FakeMotion()
+        motion.suspendConfirmedStop = true
+        let brain = FakeBrain(script: [.stop])
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice()) { brain }
+        var completed = false
+        let mission = Task { await agent.handle("never mind"); completed = true }
+        await motion.waitUntilStopRequested()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertFalse(completed)
+        XCTAssertEqual(agent.phase, .acting)
+        motion.finishConfirmedStop()
+        await mission.value
+        XCTAssertEqual(agent.phase, .idle)
+    }
+
     func testEmergencyStopBypassesMissingPoseAndBrain() async {
         let motion = FakeMotion()
         let perception = FakePerception()
@@ -969,6 +1018,34 @@ private final class BlockingBrain: RoverBrain {
 
 @MainActor
 private final class FakeMotion: RoverMotion {
+    var suspendConfirmedStop = false
+    var confirmedStopError: Error?
+    private(set) var confirmedStopCount = 0
+    private var stopRequested = false
+    private var stopRequestWaiter: CheckedContinuation<Void, Never>?
+    private var confirmedStopWaiter: CheckedContinuation<Void, Never>?
+
+    func stopAndConfirm() async throws {
+        confirmedStopCount += 1
+        stopRequested = true
+        stopRequestWaiter?.resume()
+        stopRequestWaiter = nil
+        if suspendConfirmedStop {
+            await withCheckedContinuation { confirmedStopWaiter = $0 }
+        }
+        if let confirmedStopError { throw confirmedStopError }
+        cancel()
+    }
+
+    func waitUntilStopRequested() async {
+        if stopRequested { return }
+        await withCheckedContinuation { stopRequestWaiter = $0 }
+    }
+
+    func finishConfirmedStop() {
+        confirmedStopWaiter?.resume()
+        confirmedStopWaiter = nil
+    }
     var state: NavigationController.State = .idle
     private(set) var navigateCalls: [Vec2] = []
     private(set) var navigateStopClearances: [Double] = []

@@ -15,6 +15,23 @@ struct ConversationView: View {
     let ar: ARSessionManager
     let nav: NavigationController
     let cloudBrain: CloudBrain?
+    private let scripted: Bool
+    private let otherMotionActive: @MainActor () -> Bool
+
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var model: ConversationViewModel
+    @FocusState private var commandFocused: Bool
+
+    init(ar: ARSessionManager, nav: NavigationController, cloudBrain: CloudBrain?,
+         model: ConversationViewModel? = nil, scripted: Bool = false,
+         otherMotionActive: @escaping @MainActor () -> Bool = { false }) {
+        self.ar = ar
+        self.nav = nav
+        self.cloudBrain = cloudBrain
+        self.scripted = scripted
+        self.otherMotionActive = otherMotionActive
+        _model = State(initialValue: model ?? ConversationViewModel())
+    }
 
     @State private var speechIn = SpeechIn()
     @State private var speechOut = SpeechOut()
@@ -22,6 +39,8 @@ struct ConversationView: View {
     @State private var missionPhase: MissionAgent.Phase = .idle
     @State private var authorized = false
     @State private var detector: Detector?
+    @State private var coordinator: FollowMeCoordinator?
+    @State private var router: OperatorCommandRouter?
 
     var body: some View {
         VStack(spacing: 18) {
@@ -29,8 +48,33 @@ struct ConversationView: View {
                 Text(statusLabel).font(.headline)
             }
 
-            LiveCameraDebugPanel(ar: ar, detector: detector)
-                .frame(maxWidth: 320)
+            if !scripted {
+                LiveCameraDebugPanel(ar: ar, detector: detector)
+                    .frame(maxWidth: 320)
+            }
+
+            TextField("Type a request", text: $model.draft, axis: .vertical)
+                .lineLimit(1...3)
+                .submitLabel(.send)
+                .focused($commandFocused)
+                .onSubmit { Task { await model.submitText(); commandFocused = false } }
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("talk_command_field")
+            Button("Send") { Task { await model.submitText(); commandFocused = false } }
+                .disabled(!model.isSendEnabled)
+                .accessibilityIdentifier("talk_send_command")
+            if !model.status.isEmpty {
+                Text(model.status).accessibilityIdentifier("talk_follow_status")
+            }
+            if let errorMessage = model.errorMessage {
+                Text(errorMessage).foregroundStyle(.red)
+            }
+            if model.showsStopFollowing {
+                Button("Stop Following", role: .destructive) {
+                    Task { await model.stopFollowing() }
+                }
+                .accessibilityIdentifier("talk_stop_following")
+            }
 
             Text(speechIn.partialTranscript)
                 .foregroundStyle(.secondary)
@@ -64,7 +108,7 @@ struct ConversationView: View {
         .padding(.top, 44)
         .padding(.bottom, 12)
         .task {
-            authorized = await speechIn.requestAuthorization()
+            guard !scripted else { return }
             let detector = await Detector()
             self.detector = detector
             let perception = ARPerceptionSource(ar: ar, detector: detector)
@@ -74,10 +118,35 @@ struct ConversationView: View {
             agent = MissionAgent(motion: nav, perception: perception, voice: voice, phaseDidChange: { phase in
                 missionPhase = phase
             }) { brain }
+            let follow = FollowMeCoordinator(
+                perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
+                motion: NavigationFollowMeMotion(navigation: nav), clock: SystemFollowClock()
+            )
+            coordinator = follow
+            guard let agent else { return }
+            let router = OperatorCommandRouter(mission: agent, follow: follow,
+                                               mayStartFollow: otherMotionActive)
+            self.router = router
+            model.configure(submit: { await router.submit($0) },
+                            stop: { await router.stop() }, followState: { follow.state },
+                            inhibit: { follow.inhibitMotion() })
+            authorized = await speechIn.requestAuthorization()
+            model.speechAuthorized = authorized
+        }
+        .onDisappear {
+            model.prepareToLeave()
+            Task { _ = await model.leaveTalk() }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase != .active {
+                model.prepareToLeave()
+                Task { _ = await model.leaveTalk() }
+            }
         }
     }
 
     private var statusLabel: String {
+        if scripted { return "" }
         if !authorized { return "Enable Speech Recognition in Settings" }
         switch speechIn.state {
         case .listening: return "Listening…"
@@ -109,7 +178,7 @@ struct ConversationView: View {
         try? speechIn.start { utterance in
             Task { @MainActor in
                 missionPhase = .thinking
-                await agent?.handle(utterance)
+                await model.submitFinalSpeech(utterance)
             }
         }
     }

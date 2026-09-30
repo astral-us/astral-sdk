@@ -4,6 +4,46 @@ import RoverNav
 
 @MainActor
 final class NavigationRotationWatchdogTests: XCTestCase {
+    func testFollowScanWaitsForConfirmedStopAndReturnsResult() async {
+        let stop = SuspendedRotationStop()
+        var commands = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in commands += 1 },
+            stopRover: { try await stop.confirm() },
+            sleep: { _ in }
+        )
+        let scan = Task { await controller.rotateForFollowScan(by: .pi / 6) }
+        await stop.waitUntilRequested()
+        XCTAssertEqual(commands, 0)
+        stop.fail()
+        let result = await scan.value
+        XCTAssertEqual(result, .failed(.commandFailed))
+        XCTAssertEqual(commands, 0)
+    }
+
+    func testFollowScanStopsSendingPulsesWhenPulseStopFails() async {
+        var stopCount = 0
+        var commands = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in commands += 1 },
+            stopRover: {
+                stopCount += 1
+                if stopCount == 2 { throw RotationStopError.failed }
+            },
+            sleep: { _ in }
+        )
+        let result = await controller.rotateForFollowScan(by: .pi / 6)
+        XCTAssertEqual(result, .failed(.commandFailed))
+        XCTAssertEqual(commands, 1)
+    }
     func testCommandedRotationWithoutYawProgressStopsAndFailsStalled() async {
         let harness = RotationHarness(yaws: [0])
         let controller = harness.makeController()
@@ -53,6 +93,30 @@ final class NavigationRotationWatchdogTests: XCTestCase {
         XCTAssertFalse(harness.stopInProgress)
     }
 }
+
+@MainActor
+private final class SuspendedRotationStop {
+    private var requested = false
+    private var requestWaiter: CheckedContinuation<Void, Never>?
+    private var stopWaiter: CheckedContinuation<Void, Error>?
+
+    func confirm() async throws {
+        requested = true
+        requestWaiter?.resume()
+        requestWaiter = nil
+        try await withCheckedThrowingContinuation { stopWaiter = $0 }
+    }
+    func waitUntilRequested() async {
+        if requested { return }
+        await withCheckedContinuation { requestWaiter = $0 }
+    }
+    func fail() {
+        stopWaiter?.resume(throwing: RotationStopError.failed)
+        stopWaiter = nil
+    }
+}
+
+private enum RotationStopError: Error { case failed }
 
 @MainActor
 private final class RotationHarness {

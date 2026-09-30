@@ -22,6 +22,8 @@
 		16A000000000000000000008 /* CalibrationCameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000009 /* CalibrationCameraPreview.swift */; };
 		16A000000000000000000009 /* OpticalScanPreviewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000010 /* OpticalScanPreviewModel.swift */; };
 		16A000000000000000000010 /* ManualQRExchangeViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16B000000000000000000011 /* ManualQRExchangeViewModelTests.swift */; };
+		19A000000000000000000001 /* ConversationViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19B000000000000000000001 /* ConversationViewModelTests.swift */; };
+		19A000000000000000000002 /* ConversationViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19B000000000000000000002 /* ConversationViewModel.swift */; };
 		8FFCFF02ACA403C6A45A7CD2 /* PhroverOperatorApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B7B6DA99859F472611A5565 /* PhroverOperatorApp.swift */; };
 		B2EEC0187E90F315C30ED2E5 /* AuthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBFEE1680DCB21877C94633F /* AuthView.swift */; };
 		C70F32962F9A479D5233BB02 /* ConversationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 825DADB380F51DD21F75FA9B /* ConversationView.swift */; };
@@ -58,6 +60,8 @@
 		16B000000000000000000009 /* CalibrationCameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalibrationCameraPreview.swift; sourceTree = "<group>"; };
 		16B000000000000000000010 /* OpticalScanPreviewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpticalScanPreviewModel.swift; sourceTree = "<group>"; };
 		16B000000000000000000011 /* ManualQRExchangeViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualQRExchangeViewModelTests.swift; sourceTree = "<group>"; };
+		19B000000000000000000001 /* ConversationViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationViewModelTests.swift; sourceTree = "<group>"; };
+		19B000000000000000000002 /* ConversationViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationViewModel.swift; sourceTree = "<group>"; };
 		3304DDCFABDAC0EE11CAB10A /* NavigateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigateView.swift; sourceTree = "<group>"; };
 		53BB791CB7FE020013A1DA06 /* DriveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveView.swift; sourceTree = "<group>"; };
 		6017D80B2B300131026E7F5C /* PhroverCloud.example.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = PhroverCloud.example.plist; sourceTree = "<group>"; };
@@ -104,6 +108,7 @@
 		16D000000000000000000001 /* PhroverOperatorTests */ = {
 			isa = PBXGroup;
 			children = (
+				19B000000000000000000001 /* ConversationViewModelTests.swift */,
 				16B000000000000000000011 /* ManualQRExchangeViewModelTests.swift */,
 				16B000000000000000000007 /* CalibrationPreviewModelTests.swift */,
 				16B000000000000000000005 /* SilentSearchMapTransformTests.swift */,
@@ -152,6 +157,7 @@
 		FA5A7BCA302EDDB229C36BF6 /* App */ = {
 			isa = PBXGroup;
 			children = (
+				19B000000000000000000002 /* ConversationViewModel.swift */,
 				6B7B6DA99859F472611A5565 /* PhroverOperatorApp.swift */,
 				16B000000000000000000008 /* CalibrationPreviewModel.swift */,
 				16B000000000000000000010 /* OpticalScanPreviewModel.swift */,
@@ -267,6 +273,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				19A000000000000000000002 /* ConversationViewModel.swift in Sources */,
 				8FFCFF02ACA403C6A45A7CD2 /* PhroverOperatorApp.swift in Sources */,
 				16A000000000000000000007 /* CalibrationPreviewModel.swift in Sources */,
 				16A000000000000000000009 /* OpticalScanPreviewModel.swift in Sources */,
@@ -294,6 +301,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				19A000000000000000000001 /* ConversationViewModelTests.swift in Sources */,
 				16A000000000000000000006 /* CalibrationPreviewModelTests.swift in Sources */,
 				16A000000000000000000010 /* ManualQRExchangeViewModelTests.swift in Sources */,
 				16A000000000000000000005 /* SilentSearchMapTransformTests.swift in Sources */,
