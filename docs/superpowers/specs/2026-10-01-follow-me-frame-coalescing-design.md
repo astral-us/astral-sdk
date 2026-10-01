@@ -93,7 +93,7 @@ If motor-stop confirmation fails, the existing failed/blocked behavior remains a
 
 Existing `follow_state`, `follow_frame`, `follow_perception_unavailable`, and `follow_perception_recovered` events remain. Frame diagnostics describe frames actually selected for processing rather than every superseded frame. The latest batch remains available for failure details such as tracking reason, frame age, depth availability, and inference duration.
 
-No high-volume log is added for every dropped frame. A bounded aggregate or occasional coalescing diagnostic may be added only if needed by tests or physical validation.
+No new dropped-frame or coalescing log is added in this change; physical validation uses the existing selected-frame age diagnostics.
 
 ## Testing
 
