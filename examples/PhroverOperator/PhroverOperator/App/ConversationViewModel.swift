@@ -4,8 +4,6 @@ import PhroverKit
 @Observable
 @MainActor
 final class ConversationViewModel {
-    var draft = ""
-    var speechAuthorized = false
     private(set) var errorMessage: String?
     private var submit: (String) async -> OperatorSubmission
     private var stop: () async -> OperatorSubmission
@@ -32,7 +30,6 @@ final class ConversationViewModel {
         self.inhibit = inhibit
     }
 
-    var isSendEnabled: Bool { !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     var showsStopFollowing: Bool {
         if followState().isActive { return true }
         if case .failed("Rover stop could not be confirmed.") = followState() { return true }
@@ -47,17 +44,6 @@ final class ConversationViewModel {
         case .reacquiring: return "Person lost — searching…"
         case .stopped: return "Stopped"
         case .failed(let message): return message
-        }
-    }
-
-    func submitText() async {
-        guard isSendEnabled else { return }
-        let original = draft
-        switch await submit(original) {
-        case .accepted:
-            if draft == original { draft = "" }
-            errorMessage = nil
-        case .rejected(let message): errorMessage = message
         }
     }
 

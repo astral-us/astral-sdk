@@ -4,27 +4,23 @@ import PhroverKit
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
-    func testAcceptedTypedRequestClearsDraftWithoutSpeechPermission() async {
+    func testFinalSpeechRoutesFollowMeWithoutTextEntry() async {
         var received: [String] = []
         let model = ConversationViewModel(submit: { text in
             received.append(text)
             return .accepted
         }, stop: { .accepted }, followState: { .idle })
-        model.speechAuthorized = false
-        model.draft = "follow me"
 
-        await model.submitText()
+        await model.submitFinalSpeech("follow me")
 
         XCTAssertEqual(received, ["follow me"])
-        XCTAssertEqual(model.draft, "")
+        XCTAssertNil(model.errorMessage)
     }
 
-    func testRejectedRequestRetainsDraft() async {
+    func testRejectedFinalSpeechDisplaysGuidanceWhileStopRemainsAvailable() async {
         let model = ConversationViewModel(submit: { _ in .rejected("Stop following first.") },
                                           stop: { .accepted }, followState: { .searching })
-        model.draft = "go to the kitchen"
-        await model.submitText()
-        XCTAssertEqual(model.draft, "go to the kitchen")
+        await model.submitFinalSpeech("go to the kitchen")
         XCTAssertEqual(model.errorMessage, "Stop following first.")
         XCTAssertTrue(model.showsStopFollowing)
     }

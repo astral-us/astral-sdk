@@ -3,6 +3,8 @@
 **Date:** 2026-09-29
 **Status:** Approved
 
+**Voice-only scope amendment:** `2026-09-30-follow-me-voice-only-amendment.md` supersedes the text-entry and Send-button requirements below; follow-me is now press-and-hold microphone only.
+
 ## Problem
 
 The operator can currently submit missions only by holding the microphone on the Talk screen. A follow request is awkward because the operator faces the iPhone display while the rover perceives the world through the rear camera. The rover also has no continuous person-following lifecycle: ordinary visual-target navigation approaches a target once and finishes.

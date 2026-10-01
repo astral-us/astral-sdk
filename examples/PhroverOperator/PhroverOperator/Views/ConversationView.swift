@@ -20,7 +20,6 @@ struct ConversationView: View {
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var model: ConversationViewModel
-    @FocusState private var commandFocused: Bool
 
     init(ar: ARSessionManager, nav: NavigationController, cloudBrain: CloudBrain?,
          model: ConversationViewModel? = nil, scripted: Bool = false,
@@ -39,8 +38,6 @@ struct ConversationView: View {
     @State private var missionPhase: MissionAgent.Phase = .idle
     @State private var authorized = false
     @State private var detector: Detector?
-    @State private var coordinator: FollowMeCoordinator?
-    @State private var router: OperatorCommandRouter?
 
     var body: some View {
         VStack(spacing: 18) {
@@ -53,16 +50,6 @@ struct ConversationView: View {
                     .frame(maxWidth: 320)
             }
 
-            TextField("Type a request", text: $model.draft, axis: .vertical)
-                .lineLimit(1...3)
-                .submitLabel(.send)
-                .focused($commandFocused)
-                .onSubmit { Task { await model.submitText(); commandFocused = false } }
-                .textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("talk_command_field")
-            Button("Send") { Task { await model.submitText(); commandFocused = false } }
-                .disabled(!model.isSendEnabled)
-                .accessibilityIdentifier("talk_send_command")
             if !model.status.isEmpty {
                 Text(model.status).accessibilityIdentifier("talk_follow_status")
             }
@@ -93,6 +80,7 @@ struct ConversationView: View {
                 Image(systemName: "mic.circle.fill")
                     .font(.system(size: 72))
                     .foregroundStyle(speechIn.state == .listening ? .red : .accentColor)
+                    .accessibilityIdentifier("talk_microphone")
                     .gesture(
                         DragGesture(minimumDistance: 0)
                             .onChanged { _ in startListening() }
@@ -122,16 +110,13 @@ struct ConversationView: View {
                 perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
                 motion: NavigationFollowMeMotion(navigation: nav), clock: SystemFollowClock()
             )
-            coordinator = follow
             guard let agent else { return }
             let router = OperatorCommandRouter(mission: agent, follow: follow,
                                                mayStartFollow: otherMotionActive)
-            self.router = router
             model.configure(submit: { await router.submit($0) },
                             stop: { await router.stop() }, followState: { follow.state },
                             inhibit: { follow.inhibitMotion() })
             authorized = await speechIn.requestAuthorization()
-            model.speechAuthorized = authorized
         }
         .onDisappear {
             model.prepareToLeave()

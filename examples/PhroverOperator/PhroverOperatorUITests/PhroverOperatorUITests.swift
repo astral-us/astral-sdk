@@ -27,32 +27,20 @@ final class PhroverOperatorUITests: XCTestCase {
         )
     }
 
-    func testTalkTypedFollowShowsStopWithoutMicrophonePermission() {
+    func testTalkOffersPressAndHoldMicrophoneWithoutTextEntry() {
         let app = XCUIApplication()
         app.launchArguments = ["-ui-testing", "-talk-scenario", "ready"]
         app.launch()
-        let field = app.descendants(matching: .any)["talk_command_field"]
-        XCTAssertTrue(field.waitForExistence(timeout: 10))
-        field.tap()
-        field.typeText("follow me")
-        app.buttons["talk_send_command"].tap()
-        XCTAssertTrue(app.buttons["talk_stop_following"].waitForExistence(timeout: 5))
-        XCTAssertEqual(field.value as? String, "Type a request")
-        app.buttons["talk_stop_following"].tap()
-        XCTAssertFalse(app.buttons["talk_stop_following"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.descendants(matching: .any)["talk_microphone"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.descendants(matching: .any)["talk_command_field"].exists)
+        XCTAssertFalse(app.buttons["talk_send_command"].exists)
     }
 
     func testLeavingTalkAfterFollowStopsBeforeShowingDrive() {
         let app = XCUIApplication()
-        app.launchArguments = ["-ui-testing", "-talk-scenario", "ready"]
+        app.launchArguments = ["-ui-testing", "-talk-scenario", "searching"]
         app.launch()
-        let field = app.descendants(matching: .any)["talk_command_field"]
-        XCTAssertTrue(field.waitForExistence(timeout: 10))
-        field.tap()
-        field.typeText("follow me")
-        app.buttons["talk_send_command"].tap()
         XCTAssertTrue(app.buttons["talk_stop_following"].waitForExistence(timeout: 5))
-        XCTAssertFalse(app.keyboards.firstMatch.exists, "Send should dismiss the keyboard so other tabs remain reachable")
         app.buttons["Drive"].tap()
         XCTAssertFalse(app.buttons["talk_stop_following"].waitForExistence(timeout: 2))
     }
