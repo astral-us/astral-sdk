@@ -33,11 +33,14 @@ final class ARFollowMePerceptionSourceTests: XCTestCase {
                                boundingBox: CGRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2))
         ]
 
-        let batch = ARFollowMePerceptionSource.batch(from: snapshot, detections: detections)
+        let batch = ARFollowMePerceptionSource.batch(from: snapshot, detections: detections,
+                                                    trackingReason: .excessiveMotion)
 
         XCTAssertEqual(batch.frameID, id)
         XCTAssertEqual(batch.timestamp, 12)
         XCTAssertEqual(batch.people.count, 1)
+        XCTAssertEqual(batch.trackingQuality, .normal)
+        XCTAssertEqual(batch.pose, snapshot.pose, "Live diagnostic limitations cannot invalidate a normal snapshot")
         // Vision's portrait y=.2 maps to raw sensor x=16; (16-10)/10 * 3 = 1.8.
         XCTAssertEqual(batch.people[0].position.x, 1.8, accuracy: 0.01)
         XCTAssertEqual(batch.people[0].position.y, -3, accuracy: 0.01)
@@ -63,5 +66,58 @@ final class ARFollowMePerceptionSourceTests: XCTestCase {
         guard case .interrupted? = await iterator.next() else {
             return XCTFail("An AR interruption must never be discarded in favor of a frame")
         }
+    }
+
+    func testLimitedSnapshotKeepsItsQualityAndCannotUseDiagnosticNormalTrackingForPerception() throws {
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        let snapshot = ARFrameSnapshot(
+            id: ARFrameID(generation: 1, sequence: 4), timestamp: 8,
+            image: try XCTUnwrap(image), cameraTransform: simd_float4x4(1),
+            cameraIntrinsics: simd_float3x3(1), imageResolution: CGSize(width: 20, height: 20),
+            depthMap: nil, pose: Pose2D(position: Vec2(2, 3), yaw: 0), trackingQuality: .limited)
+        let batch = ARFollowMePerceptionSource.batch(from: snapshot, detections: [],
+                                                    trackingReason: nil, inferenceDuration: 0.125)
+        XCTAssertEqual(batch.trackingQuality, .limited)
+        XCTAssertNil(batch.pose)
+        XCTAssertTrue(batch.people.isEmpty)
+        XCTAssertEqual(batch.inferenceDuration, 0.125)
+        XCTAssertEqual(ARFollowMePerceptionSource.trackingReason(from: .limited(.excessiveMotion)), .excessiveMotion)
+        XCTAssertEqual(ARFollowMePerceptionSource.trackingReason(from: .limited(.insufficientFeatures)), .insufficientFeatures)
+        XCTAssertEqual(ARFollowMePerceptionSource.trackingReason(from: .limited(.initializing)), .initializing)
+        XCTAssertEqual(ARFollowMePerceptionSource.trackingReason(from: .limited(.relocalizing)), .relocalizing)
+        XCTAssertNil(ARFollowMePerceptionSource.trackingReason(from: .normal))
+    }
+
+    func testStreamMeasuresInferenceAndSkipsItForLimitedTracking() async throws {
+        let ar = ARSessionManager()
+        var inferenceCount = 0
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in
+            inferenceCount += 1
+            Thread.sleep(forTimeInterval: 0.02)
+            return []
+        })
+        let source = ARFollowMePerceptionSource(ar: ar, detector: detector)
+        var iterator = source.events().makeAsyncIterator()
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        let buffer = try XCTUnwrap(image)
+        ar.ingestForTesting(image: buffer, timestamp: 3,
+                            cameraTransform: simd_float4x4(1), intrinsics: simd_float3x3(1),
+                            imageResolution: CGSize(width: 20, height: 20), depthMap: nil,
+                            trackingQuality: .normal)
+        guard case .frame(let normal)? = await iterator.next() else { return XCTFail("Expected normal batch") }
+        XCTAssertEqual(normal.trackingQuality, .normal)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(normal.inferenceDuration), 0.02)
+        XCTAssertEqual(inferenceCount, 1)
+        ar.ingestForTesting(image: buffer, timestamp: 4,
+                            cameraTransform: simd_float4x4(1), intrinsics: simd_float3x3(1),
+                            imageResolution: CGSize(width: 20, height: 20), depthMap: nil,
+                            trackingQuality: .limited)
+        guard case .frame(let limited)? = await iterator.next() else { return XCTFail("Expected limited batch") }
+        XCTAssertEqual(limited.trackingQuality, .limited)
+        XCTAssertNil(limited.pose)
+        XCTAssertEqual(limited.inferenceDuration, 0)
+        XCTAssertEqual(inferenceCount, 1)
     }
 }

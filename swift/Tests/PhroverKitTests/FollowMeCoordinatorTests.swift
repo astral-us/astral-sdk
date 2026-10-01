@@ -9,7 +9,8 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let perception = FollowPerceptionFake()
         let motion = FollowMotionFake()
         let clock = ManualFollowClock()
-        return (FollowMeCoordinator(perception: perception, motion: motion, clock: clock), perception, motion, clock)
+        return (FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+                                    eventSink: { _, _ in }), perception, motion, clock)
     }
 
     private func frame(_ sequence: UInt64, at time: TimeInterval = 0, pose: Pose2D? = Pose2D(position: .zero, yaw: 0), depth: Bool = true, people: [FollowPersonObservation] = []) -> FollowPerceptionEvent {
@@ -61,6 +62,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         perception.send(frame(1))
         await drain()
+        for _ in 0..<20 where coordinator.isActive { await drain() }
         XCTAssertEqual(motion.rotations.count, 12)
         XCTAssertTrue(motion.rotations.allSatisfy { abs($0 - .pi / 6) < 0.0001 })
         XCTAssertEqual(coordinator.state, .failed("No person found."))
@@ -165,7 +167,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.isActive)
         clock.advance(to: 2)
         await drain()
-        XCTAssertEqual(coordinator.state, .failed("Pose or depth unavailable."))
+        XCTAssertEqual(coordinator.state, .failed("Depth unavailable. Check LiDAR visibility and depth support."))
         XCTAssertGreaterThanOrEqual(motion.stops, 2)
     }
 
@@ -333,7 +335,174 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .searching)
         clock.advance(to: 2)
         await drain()
-        XCTAssertEqual(coordinator.state, .failed("Pose or depth unavailable."))
+        XCTAssertEqual(coordinator.state, .failed("No camera frames received. Check the AR session and camera access."))
         XCTAssertGreaterThanOrEqual(motion.stops, 1)
+    }
+
+    func testMissingPoseAndExpiredFrameHaveDistinctActionableFailures() async {
+        for missingPose in [true, false] {
+            let (coordinator, perception, motion, clock) = setup()
+            _ = await coordinator.start()
+            perception.send(frame(1, at: missingPose ? 0 : -1,
+                                  pose: missingPose ? nil : Pose2D(position: .zero, yaw: 0)))
+            await drain()
+            clock.advance(to: 2)
+            await drain()
+            XCTAssertEqual(coordinator.state, .failed(missingPose
+                ? "Rover pose unavailable. Wait for AR tracking to recover."
+                : "Camera frame stale or timestamp invalid. Check camera delivery and inference latency."))
+            XCTAssertTrue(motion.goals.isEmpty)
+            XCTAssertTrue(motion.rotations.isEmpty)
+        }
+    }
+
+    func testRecoveryDeadlineUsesLatestPersistentTrackingIssueAndReason() async {
+        let (coordinator, perception, motion, clock) = setup()
+        _ = await coordinator.start()
+        perception.send(frame(1, depth: false))
+        await drain()
+        clock.advance(to: 1.5)
+        perception.send(.frame(FollowFrameBatch(
+            frameID: ARFrameID(generation: 1, sequence: 2), timestamp: 1.5,
+            pose: nil, depthAvailable: true, people: [],
+            trackingQuality: .limited, trackingReason: .initializing)))
+        await drain()
+        XCTAssertEqual(coordinator.perceptionIssue, .trackingLimited)
+        clock.advance(to: 1.9)
+        perception.send(.frame(FollowFrameBatch(
+            frameID: ARFrameID(generation: 1, sequence: 3), timestamp: 1.9,
+            pose: nil, depthAvailable: true, people: [],
+            trackingQuality: .limited, trackingReason: .excessiveMotion)))
+        await drain()
+        clock.advance(to: 2)
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("AR tracking limited (excessiveMotion). Move the camera slowly and keep it steady."))
+        XCTAssertTrue(motion.goals.isEmpty)
+        XCTAssertTrue(motion.rotations.isEmpty)
+    }
+
+    func testDiagnosticsAreThrottledAndReportUnavailableReasonChangesAndRecovery() async {
+        let perception = FollowPerceptionFake()
+        let motion = FollowMotionFake()
+        let clock = ManualFollowClock()
+        var logs: [(String, [String: String])] = []
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+                                             eventSink: { logs.append(($0, $1)) })
+        _ = await coordinator.start()
+        for sequence in 1...3 {
+            perception.send(.frame(FollowFrameBatch(
+                frameID: ARFrameID(generation: 4, sequence: UInt64(sequence)), timestamp: 0,
+                pose: nil, depthAvailable: true, people: [], trackingQuality: .limited,
+                trackingReason: .initializing, inferenceDuration: 0)))
+            await drain()
+        }
+        XCTAssertEqual(logs.filter { $0.0 == "follow_frame" }.count, 1)
+        XCTAssertEqual(logs.filter { $0.0 == "follow_perception_unavailable" }.count, 2, "No frames then limited, not every frame")
+        clock.advance(to: 0.2)
+        perception.send(.frame(FollowFrameBatch(
+            frameID: ARFrameID(generation: 4, sequence: 4), timestamp: 0.1,
+            pose: nil, depthAvailable: true, people: [], trackingQuality: .limited,
+            trackingReason: .insufficientFeatures, inferenceDuration: 0.08)))
+        await drain()
+        let changed = logs.last { $0.0 == "follow_perception_unavailable" }?.1
+        XCTAssertEqual(changed?["issue"], "trackingLimited")
+        XCTAssertEqual(changed?["frame_id"], "4:4")
+        XCTAssertEqual(changed?["frame_timestamp"], "0.1")
+        XCTAssertEqual(changed?["frame_age_seconds"], "0.1")
+        XCTAssertEqual(changed?["tracking_quality"], "limited")
+        XCTAssertEqual(changed?["tracking_reason"], "insufficientFeatures")
+        XCTAssertEqual(changed?["depth_available"], "true")
+        XCTAssertEqual(changed?["inference_duration_seconds"], "0.08")
+        perception.send(frame(5, at: 0.2, people: [person(5, at: 0.2, y: 1.5)]))
+        await drain()
+        XCTAssertNil(coordinator.perceptionIssue)
+        XCTAssertEqual(coordinator.state, .holdingDistance)
+        XCTAssertEqual(logs.filter { $0.0 == "follow_perception_recovered" }.count, 1)
+        perception.send(frame(6, at: 0.2, people: [person(6, at: 0.2, y: 1.5)]))
+        await drain()
+        XCTAssertEqual(logs.filter { $0.0 == "follow_state" }.count, 2, "Searching and holding, not repeated states")
+        clock.advance(to: 0.3)
+        perception.send(frame(7, at: 0.3, depth: false))
+        await drain()
+        clock.advance(to: 1.3)
+        perception.send(frame(8, at: 1.3, depth: false))
+        await drain()
+        XCTAssertEqual(logs.filter { $0.0 == "follow_frame" }.count, 2)
+        _ = await coordinator.stop()
+    }
+
+    func testFreshFrameDuringWatchdogStopCannotResurrectOldRecoveryTimer() async {
+        let (coordinator, perception, motion, clock) = setup()
+        _ = await coordinator.start()
+        perception.send(frame(1, people: [person(1, y: 2)]))
+        await drain()
+        motion.suspendStop = true
+        clock.advance(to: 0.501)
+        await drain()
+        XCTAssertEqual(coordinator.perceptionIssue, .staleFrame)
+        perception.send(frame(2, at: 0.501, people: [person(2, at: 0.501, y: 1.5)]))
+        await drain()
+        XCTAssertNil(coordinator.perceptionIssue)
+        motion.suspendStop = false
+        motion.releaseStop()
+        await drain()
+        XCTAssertEqual(coordinator.state, .holdingDistance)
+        // Wake cancelled sleepers while continuing to provide usable camera frames.
+        for (index, time) in [1.0, 1.5, 2.0, 2.5, 2.501].enumerated() {
+            clock.advance(to: time)
+            perception.send(frame(UInt64(index + 3), at: time,
+                                  people: [person(UInt64(index + 3), at: time, y: 1.5)]))
+            await drain()
+        }
+        XCTAssertEqual(coordinator.state, .holdingDistance)
+        XCTAssertNil(coordinator.perceptionIssue)
+        _ = await coordinator.stop()
+    }
+
+    func testCancelledSafetyFailureDuringReplacementStillStopsFollow() async {
+        let (coordinator, perception, motion, clock) = setup()
+        _ = await coordinator.start()
+        perception.send(frame(1, people: [person(1)]))
+        await drain()
+        motion.suspendStop = true
+        clock.advance(to: 0.334)
+        perception.send(frame(2, at: 0.334, people: [person(2, at: 0.334, y: 4.5)]))
+        await drain()
+        motion.safety(.failed(.cancelled))
+        perception.send(frame(3, at: 0.334, people: [person(3, at: 0.334, y: 5)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Navigation safety failure."))
+        XCTAssertEqual(motion.goals.count, 1)
+        motion.suspendStop = false
+        motion.releaseStop()
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Navigation safety failure."))
+        XCTAssertGreaterThanOrEqual(motion.stops, 3)
+    }
+
+    func testFreshnessBoundaryAndUnavailableTrackingRemainFailClosed() async {
+        for quality in [ARTrackingQuality.normal, .unavailable] {
+            let (coordinator, perception, motion, clock) = setup()
+            _ = await coordinator.start()
+            clock.advance(to: 0.5)
+            perception.send(.frame(FollowFrameBatch(
+                frameID: ARFrameID(generation: 1, sequence: 1), timestamp: 0,
+                pose: quality == .normal ? Pose2D(position: .zero, yaw: 0) : nil,
+                depthAvailable: true, people: [person(1)], trackingQuality: quality)))
+            await drain()
+            if quality == .normal {
+                XCTAssertEqual(coordinator.state, .following)
+                XCTAssertEqual(motion.goals.count, 1, "Exactly 0.5 seconds remains usable")
+                clock.advance(to: 0.501)
+                perception.send(frame(2, people: [person(2)]))
+                await drain()
+                XCTAssertEqual(coordinator.perceptionIssue, .staleFrame)
+            } else {
+                XCTAssertEqual(coordinator.perceptionIssue, .trackingUnavailable)
+                XCTAssertTrue(motion.goals.isEmpty)
+                XCTAssertTrue(motion.rotations.isEmpty)
+            }
+            _ = await coordinator.stop()
+        }
     }
 }

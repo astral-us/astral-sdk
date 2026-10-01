@@ -4,6 +4,47 @@ import RoverNav
 
 @MainActor
 final class NavigationRotationWatchdogTests: XCTestCase {
+    func testStopAndConfirmCancelsSuspendedRotationSendsWithoutPublishingFailure() async throws {
+        for scan in [false, true] {
+            for error: Error in [CancellationError(), URLError(.cancelled)] {
+                let send = SuspendedNavigationSend(error: error)
+                var stops = 0
+                let controller = NavigationController(
+                    currentPose: { Pose2D(position: .zero, yaw: 0) },
+                    forwardClearance: { 2 },
+                    plan: { _, goal in [goal] },
+                    lastAckAt: { nil },
+                    sendCommand: { _ in try await send.send() },
+                    stopRover: { stops += 1 },
+                    sleep: { _ in }
+                )
+                let states = controller.safetyStates()
+                let received = Task { () -> [NavigationSafetyState] in
+                    var result: [NavigationSafetyState] = []
+                    for await state in states {
+                        result.append(state)
+                        if result.contains(.moving), state == .idle { break }
+                    }
+                    return result
+                }
+                let rotation = Task {
+                    if scan { return await controller.rotateForFollowScan(by: .pi / 6) }
+                    return await controller.rotateAndWait(by: .pi / 6)
+                }
+                await send.waitUntilRequested()
+
+                try await controller.stopAndConfirm()
+
+                let result = await rotation.value
+                let safetyStates = await received.value
+                XCTAssertEqual(result, .cancelled)
+                XCTAssertEqual(safetyStates, [.idle, .moving, .idle], "scan=\(scan), error=\(error)")
+                XCTAssertEqual(controller.state, .idle)
+                XCTAssertGreaterThanOrEqual(stops, 2)
+            }
+        }
+    }
+
     func testFollowScanWaitsForConfirmedStopAndReturnsResult() async {
         let stop = SuspendedRotationStop()
         var commands = 0
@@ -23,6 +64,70 @@ final class NavigationRotationWatchdogTests: XCTestCase {
         let result = await scan.value
         XCTAssertEqual(result, .failed(.commandFailed))
         XCTAssertEqual(commands, 0)
+    }
+
+    func testUnrequestedURLRotationSendCancellationRemainsCommandFailure() async {
+        for scan in [false, true] {
+            let controller = NavigationController(
+                currentPose: { Pose2D(position: .zero, yaw: 0) },
+                forwardClearance: { 2 },
+                plan: { _, goal in [goal] },
+                lastAckAt: { nil },
+                sendCommand: { _ in throw URLError(.cancelled) },
+                stopRover: {},
+                sleep: { _ in }
+            )
+            let states = controller.safetyStates()
+            let failure = Task { () -> NavigationSafetyState? in
+                for await state in states {
+                    if case .failed = state { return state }
+                }
+                return nil
+            }
+
+            let result = scan
+                ? await controller.rotateForFollowScan(by: .pi / 6)
+                : await controller.rotateAndWait(by: .pi / 6)
+
+            XCTAssertEqual(result, .failed(.commandFailed))
+            let publishedFailure = await failure.value
+            XCTAssertEqual(publishedFailure, .failed(.commandFailed))
+        }
+    }
+
+    func testCancelledScanPulseStopRemainsFailureWhenFinalStopIsUnconfirmed() async {
+        let pulseStop = SuspendedNavigationSend(error: URLError(.cancelled))
+        var stops = 0
+        var commands = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in commands += 1 },
+            stopRover: {
+                stops += 1
+                if stops == 2 { try await pulseStop.send() }
+                if stops > 2 { throw RotationStopError.failed }
+            },
+            sleep: { _ in }
+        )
+        let scan = Task { await controller.rotateForFollowScan(by: .pi / 6) }
+        await pulseStop.waitUntilRequested()
+
+        do {
+            try await controller.stopAndConfirm()
+            XCTFail("A cancelled pulse stop does not confirm that the motors stopped")
+        } catch {
+            XCTAssertEqual(error as? RotationStopError, .failed)
+        }
+
+        _ = await scan.value
+        XCTAssertEqual(controller.safetyState, .failed(.commandFailed))
+        XCTAssertEqual(controller.state, .failed("Rover stop could not be confirmed."))
+        let nextScan = await controller.rotateForFollowScan(by: .pi / 6)
+        XCTAssertEqual(nextScan, .failed(.commandFailed))
+        XCTAssertEqual(commands, 1, "An unconfirmed pulse stop must prevent more motion")
     }
 
     func testFollowScanStopsSendingPulsesWhenPulseStopFails() async {

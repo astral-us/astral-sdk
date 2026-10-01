@@ -4,6 +4,103 @@ import RoverNav
 
 @MainActor
 final class NavigationSafetyTests: XCTestCase {
+    func testStopAndConfirmCancelsSuspendedURLSendWithoutPublishingFailure() async throws {
+        try await assertIntentionalSendCancellation(error: URLError(.cancelled))
+    }
+
+    func testStopAndConfirmCancelsSuspendedTaskSendWithoutPublishingFailure() async throws {
+        try await assertIntentionalSendCancellation(error: CancellationError())
+    }
+
+    private func assertIntentionalSendCancellation(error: Error) async throws {
+        let send = SuspendedNavigationSend(error: error)
+        var stops = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in try await send.send() },
+            stopRover: { stops += 1 },
+            sleep: { _ in }
+        )
+        let states = controller.safetyStates()
+        let received = Task { () -> [NavigationSafetyState] in
+            var result: [NavigationSafetyState] = []
+            for await state in states {
+                result.append(state)
+                if result.contains(.moving), state == .idle { break }
+            }
+            return result
+        }
+        let navigation = Task { await controller.navigateAndWait(to: Vec2(2, 0)) }
+        await send.waitUntilRequested()
+
+        try await controller.stopAndConfirm()
+
+        let result = await navigation.value
+        let safetyStates = await received.value
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertEqual(safetyStates, [.idle, .moving, .idle])
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertGreaterThanOrEqual(stops, 2, "Cancellation still requires an acknowledged motor stop")
+    }
+
+    func testUnrequestedURLSendCancellationRemainsCommandFailure() async {
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { nil },
+            sendCommand: { _ in throw URLError(.cancelled) },
+            stopRover: {},
+            sleep: { _ in }
+        )
+
+        let result = await controller.navigateAndWait(to: Vec2(2, 0))
+
+        XCTAssertEqual(result, .failed(.commandFailed))
+        XCTAssertEqual(controller.safetyState, .failed(.commandFailed))
+    }
+
+    func testIntentionalSendCancellationDoesNotHideUnconfirmedMotorStop() async {
+        for error: Error in [FakeCommandError.timedOut, URLError(.cancelled)] {
+            let send = SuspendedNavigationSend(error: URLError(.cancelled))
+            var stops = 0
+            var plans = 0
+            let controller = NavigationController(
+                currentPose: { Pose2D(position: .zero, yaw: 0) },
+                forwardClearance: { 2 },
+                plan: { _, goal in plans += 1; return [goal] },
+                lastAckAt: { nil },
+                sendCommand: { _ in try await send.send() },
+                stopRover: {
+                    stops += 1
+                    if stops > 1 { throw error }
+                },
+                sleep: { _ in }
+            )
+            let navigation = Task { await controller.navigateAndWait(to: Vec2(2, 0)) }
+            await send.waitUntilRequested()
+
+            do {
+                try await controller.stopAndConfirm()
+                XCTFail("An unconfirmed motor stop must throw")
+            } catch let stopError {
+                XCTAssertEqual((stopError as NSError).domain, (error as NSError).domain)
+                XCTAssertEqual((stopError as NSError).code, (error as NSError).code)
+            }
+
+            let result = await navigation.value
+            XCTAssertEqual(result, .cancelled, "The motion task is cancelled, not arrived")
+            XCTAssertEqual(controller.state, .failed("Rover stop could not be confirmed."))
+            XCTAssertEqual(controller.safetyState, .failed(.commandFailed))
+            let nextGoal = await controller.navigateForFollow(to: Vec2(3, 0), stoppingAtForwardClearance: 1.5)
+            XCTAssertEqual(nextGoal, .failed(.commandFailed))
+            XCTAssertEqual(plans, 1, "Failed stop confirmation must bar subsequent motion")
+        }
+    }
+
     func testConfirmedStopPropagatesFailureAndBarsFollowGoal() async {
         var goals = 0
         let controller = NavigationController(
@@ -339,5 +436,31 @@ private enum FakeCommandError: LocalizedError {
 
     var errorDescription: String? {
         "Timed out talking to rover."
+    }
+}
+
+@MainActor
+final class SuspendedNavigationSend {
+    private let error: Error
+    private var requested = false
+    private var requestWaiter: CheckedContinuation<Void, Never>?
+
+    init(error: Error) { self.error = error }
+
+    func send() async throws {
+        requested = true
+        requestWaiter?.resume()
+        requestWaiter = nil
+        do {
+            try await Task.sleep(for: .seconds(60))
+            XCTFail("Expected the suspended send to be cancelled")
+        } catch {
+            throw self.error
+        }
+    }
+
+    func waitUntilRequested() async {
+        if requested { return }
+        await withCheckedContinuation { requestWaiter = $0 }
     }
 }

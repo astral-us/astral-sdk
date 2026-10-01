@@ -22,14 +22,22 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
         // Never discard a safety event when a newer camera frame arrives. The upstream
         // AR snapshot stream already bounds frame production to its newest sample.
         return AsyncStream(bufferingPolicy: .unbounded) { continuation in
-            let frameTask = Task { [detector] in
+            let frameTask = Task { [detector, ar] in
                 for await snapshot in frames {
                     guard !Task.isCancelled else { break }
+                    // The live frame may differ from the snapshot. This reason is diagnostic
+                    // only; all perception eligibility and projection use the snapshot.
+                    let reason = ar.session.currentFrame.map { Self.trackingReason(from: $0.camera.trackingState) } ?? nil
                     if snapshot.trackingQuality != .normal {
-                        continuation.yield(.frame(Self.batch(from: snapshot, detections: [])))
+                        continuation.yield(.frame(Self.batch(from: snapshot, detections: [],
+                                                            trackingReason: reason, inferenceDuration: 0)))
                         continue
                     }
-                    continuation.yield(.frame(Self.batch(from: snapshot, detections: detector.detect(snapshot).detections)))
+                    let started = ProcessInfo.processInfo.systemUptime
+                    let detections = detector.detect(snapshot).detections
+                    let duration = ProcessInfo.processInfo.systemUptime - started
+                    continuation.yield(.frame(Self.batch(from: snapshot, detections: detections,
+                                                        trackingReason: reason, inferenceDuration: duration)))
                 }
             }
             let lifecycleTask = Task {
@@ -50,7 +58,9 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
     }
 
     public static func batch(from snapshot: ARFrameSnapshot,
-                             detections: [Detector.Detection]) -> FollowFrameBatch {
+                             detections: [Detector.Detection],
+                             trackingReason: FollowTrackingReason? = nil,
+                             inferenceDuration: TimeInterval? = nil) -> FollowFrameBatch {
         let people: [FollowPersonObservation] = snapshot.trackingQuality == .normal ? detections.compactMap { detection in
             guard detection.label.lowercased() == "person", snapshot.depthMap != nil else { return nil }
             let foot = CGPoint(x: detection.boundingBox.midX, y: detection.boundingBox.minY)
@@ -62,7 +72,24 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
         } : []
         return FollowFrameBatch(frameID: snapshot.id, timestamp: snapshot.timestamp,
                                 pose: snapshot.trackingQuality == .normal ? snapshot.pose : nil,
-                                depthAvailable: snapshot.depthMap != nil, people: people)
+                                depthAvailable: snapshot.depthMap != nil, people: people,
+                                trackingQuality: snapshot.trackingQuality, trackingReason: trackingReason,
+                                inferenceDuration: inferenceDuration)
+    }
+
+    public static func trackingReason(from state: ARCamera.TrackingState) -> FollowTrackingReason? {
+        switch state {
+        case .normal: return nil
+        case .notAvailable: return .notAvailable
+        case .limited(let reason):
+            switch reason {
+            case .initializing: return .initializing
+            case .excessiveMotion: return .excessiveMotion
+            case .insufficientFeatures: return .insufficientFeatures
+            case .relocalizing: return .relocalizing
+            @unknown default: return .unknown
+            }
+        }
     }
 }
 

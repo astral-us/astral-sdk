@@ -461,6 +461,10 @@ public final class NavigationController {
                 consecutiveCommandFailures = 0
                 hasSentCommand = true
             } catch {
+                // stopAndConfirm cancels this task; URLSession may surface that as
+                // URLError.cancelled rather than CancellationError. Let the stop
+                // confirmation own the outcome instead of publishing a send failure.
+                if Task.isCancelled { break }
                 consecutiveCommandFailures += 1
                 RuntimeFileLog.append("nav_command_send_failed", fields: Self.driveTelemetryFields(
                     pose: pose,
@@ -585,6 +589,8 @@ public final class NavigationController {
                 try await sendCommand(cmd)
                 hasSentCommand = true
             } catch {
+                // A cancelled motion send is not a failed motor-stop confirmation.
+                if Task.isCancelled { break }
                 try? await stopRover()
                 state = Self.stateAfterCommandFailure(error)
                 publishSafetyState(.failed(.commandFailed))

@@ -16,7 +16,12 @@ public enum FollowMeState: Equatable {
 @Observable
 @MainActor
 public final class FollowMeCoordinator {
-    public private(set) var state: FollowMeState = .idle
+    public private(set) var state: FollowMeState = .idle {
+        didSet {
+            if state != oldValue { log("follow_state") }
+        }
+    }
+    public private(set) var perceptionIssue: FollowPerceptionIssue?
     public var isActive: Bool { state.isActive }
 
     private let perception: any FollowMePerception
@@ -24,6 +29,10 @@ public final class FollowMeCoordinator {
     private let clock: any FollowMeClock
     private let tracker: FollowTargetTracker
     private let config: FollowMeConfiguration
+    private let eventSink: @MainActor (String, [String: String]) -> Void
+    private var lastFrameLogTime: TimeInterval?
+    private var loggedIssue: FollowPerceptionIssue?
+    private var loggedTrackingReason: FollowTrackingReason?
     private var generation: UInt64 = 0
     private var operation: UInt64 = 0
     private var framesTask: Task<Void, Never>?
@@ -45,14 +54,27 @@ public final class FollowMeCoordinator {
     private var lastGoal: Vec2?
     private var lastGoalTime: TimeInterval?
     private var latestFrame: ARFrameID?
+    private var latestBatch: FollowFrameBatch?
+
+    private var perceptionFailureMessage: String {
+        let issue = perceptionIssue ?? .poseUnavailable
+        if issue == .trackingLimited, let reason = latestBatch?.trackingReason {
+            return "AR tracking limited (\(reason.rawValue)). \(reason.action)"
+        }
+        return issue.message
+    }
 
     public init(perception: any FollowMePerception, motion: any FollowMeMotion,
-                clock: any FollowMeClock, configuration: FollowMeConfiguration = .init()) {
+                clock: any FollowMeClock, configuration: FollowMeConfiguration = .init(),
+                eventSink: @escaping @MainActor (String, [String: String]) -> Void = {
+                    RuntimeFileLog.append($0, fields: $1)
+                }) {
         self.perception = perception
         self.motion = motion
         self.clock = clock
         self.config = configuration
         self.tracker = FollowTargetTracker(configuration: configuration)
+        self.eventSink = eventSink
     }
 
     @discardableResult
@@ -73,7 +95,13 @@ public final class FollowMeCoordinator {
         lastGoal = nil
         lastGoalTime = nil
         latestFrame = nil
+        latestBatch = nil
+        lastFrameLogTime = nil
+        loggedIssue = nil
+        loggedTrackingReason = nil
+        perceptionIssue = .noFrames
         state = .searching
+        updatePerceptionIssue(.noFrames)
         let events = perception.events()
         let safety = motion.safetyStates()
         framesTask = Task { [weak self] in
@@ -92,7 +120,7 @@ public final class FollowMeCoordinator {
         startupTask = Task { [weak self, clock, config] in
             await clock.sleep(seconds: config.perceptionRecoverySeconds)
             guard let self, self.generation == token, self.latestFrame == nil else { return }
-            _ = await self.finish(.failed("Pose or depth unavailable."))
+            _ = await self.finish(.failed((self.perceptionIssue ?? .noFrames).message))
         }
         return true
     }
@@ -193,6 +221,7 @@ public final class FollowMeCoordinator {
         if let latestFrame, batch.frameID.generation == latestFrame.generation,
            batch.frameID.sequence <= latestFrame.sequence { return }
         latestFrame = batch.frameID
+        latestBatch = batch
         startupTask?.cancel()
         startupTask = nil
         let now = clock.now
@@ -200,15 +229,32 @@ public final class FollowMeCoordinator {
         let frameID = batch.frameID
         frameWatchdogTask = Task { [weak self, clock, config] in
             await clock.sleep(seconds: config.maximumObservationAge + 0.001)
-            guard let self, self.generation == token, self.latestFrame == frameID,
-                  self.state != .reacquiring,
-                  self.clock.now - batch.timestamp > config.maximumObservationAge else { return }
-            await self.perceptionUnavailable(generation: token)
+            guard !Task.isCancelled, let self, self.generation == token, self.latestFrame == frameID,
+                   self.state != .reacquiring,
+                   self.clock.now - batch.timestamp > config.maximumObservationAge else { return }
+            await self.perceptionUnavailable(self.perceptionIssue ?? .staleFrame, generation: token)
         }
-        guard batch.pose != nil, batch.depthAvailable,
-              batch.timestamp.isFinite, now - batch.timestamp >= 0,
-              now - batch.timestamp <= config.maximumObservationAge else {
-            await perceptionUnavailable(generation: token)
+        let issue: FollowPerceptionIssue?
+        if !batch.timestamp.isFinite || now - batch.timestamp < 0 || now - batch.timestamp > config.maximumObservationAge {
+            issue = .staleFrame
+        } else if batch.trackingQuality == .unavailable {
+            issue = .trackingUnavailable
+        } else if batch.trackingQuality == .limited {
+            issue = .trackingLimited
+        } else if batch.pose == nil {
+            issue = .poseUnavailable
+        } else if !batch.depthAvailable {
+            issue = .depthUnavailable
+        } else {
+            issue = nil
+        }
+        updatePerceptionIssue(issue)
+        if lastFrameLogTime == nil || clock.now - lastFrameLogTime! >= 1 {
+            lastFrameLogTime = clock.now
+            log("follow_frame")
+        }
+        if let issue {
+            await perceptionUnavailable(issue, generation: token)
             return
         }
         poseDeadline = nil
@@ -268,7 +314,7 @@ public final class FollowMeCoordinator {
               clock.now - selected.timestamp >= 0,
               clock.now - selected.timestamp <= config.maximumObservationAge,
               poseDeadline == nil else {
-            await perceptionUnavailable(generation: token)
+            await perceptionUnavailable(perceptionIssue ?? .staleFrame, generation: token)
             return
         }
         lastGoal = goal
@@ -361,19 +407,56 @@ public final class FollowMeCoordinator {
         scan(generation: token)
     }
 
-    private func perceptionUnavailable(generation token: UInt64) async {
+    private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
+        updatePerceptionIssue(issue)
         if poseDeadline == nil { poseDeadline = clock.now + config.perceptionRecoverySeconds }
         guard await confirmStop(generation: token) else { return }
+        // A fresh frame or terminal stop can arrive while motor acknowledgement is
+        // pending. Never resurrect a cleared deadline from a cancelled watchdog.
+        guard !Task.isCancelled, generation == token, let deadline = poseDeadline,
+              perceptionIssue != nil else { return }
         lastGoal = nil
         scanning = false
-        let deadline = poseDeadline!
         poseTask?.cancel()
         poseTask = Task { [weak self, clock] in
             await clock.sleep(seconds: max(0, deadline - clock.now))
-            guard let self, self.generation == token, self.poseDeadline == deadline,
+            guard !Task.isCancelled, let self, self.generation == token, self.poseDeadline == deadline,
                   self.clock.now >= deadline else { return }
-            _ = await self.finish(.failed("Pose or depth unavailable."))
+            _ = await self.finish(.failed(self.perceptionFailureMessage))
         }
+    }
+
+    private func updatePerceptionIssue(_ issue: FollowPerceptionIssue?) {
+        perceptionIssue = issue
+        let reason = issue == .trackingLimited ? latestBatch?.trackingReason : nil
+        guard issue != loggedIssue || reason != loggedTrackingReason else { return }
+        let previous = loggedIssue
+        loggedIssue = issue
+        loggedTrackingReason = reason
+        if issue != nil {
+            log("follow_perception_unavailable")
+        } else if previous != nil {
+            log("follow_perception_recovered", extra: ["previous_issue": previous!.rawValue])
+        }
+    }
+
+    private func log(_ event: String, extra: [String: String] = [:]) {
+        let batch = latestBatch
+        var fields: [String: String] = [
+            "state": String(describing: state),
+            "issue": perceptionIssue?.rawValue ?? "none",
+            "frame_id": batch.map { "\($0.frameID.generation):\($0.frameID.sequence)" } ?? "none",
+            "frame_timestamp": batch.map { String($0.timestamp) } ?? "unknown",
+            "frame_age_seconds": batch.map { String(clock.now - $0.timestamp) } ?? "unknown",
+            "tracking_quality": batch?.trackingQuality.map { String(describing: $0) } ?? "unknown",
+            "tracking_reason": batch?.trackingReason?.rawValue ?? "unknown",
+            "tracking_reason_source": "live_ar_diagnostic_only",
+            "pose_available": batch.map { String($0.pose != nil) } ?? "unknown",
+            "depth_available": batch.map { String($0.depthAvailable) } ?? "unknown",
+            "inference_duration_seconds": batch?.inferenceDuration.map { String($0) } ?? "unknown"
+        ]
+        fields.merge(extra) { _, new in new }
+        eventSink(event, fields)
     }
 }
