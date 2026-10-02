@@ -10,6 +10,33 @@ import RoverNav
 /// only be verified on a real device (see rover/README.md status notes).
 @MainActor
 final class MissionAgentTests: XCTestCase {
+    func testOldBrainCompletionAfterConfirmedStopCannotOverwriteNewMissionPhase() async throws {
+        let firstBrain = BlockingBrain()
+        let secondBrain = BlockingBrain()
+        var brain: RoverBrain = firstBrain
+        var phases: [MissionAgent.Phase] = []
+        let motion = FakeMotion()
+        let agent = MissionAgent(motion: motion, perception: FakePerception(), voice: FakeVoice(),
+                                 phaseDidChange: { phases.append($0) }) { brain }
+        let first = Task { await agent.handle("first mission") }
+        await firstBrain.waitUntilEntered()
+        try await agent.cancelCurrentMissionAndWait()
+        XCTAssertEqual(motion.confirmedStopCount, 1)
+        brain = secondBrain
+        let second = Task { await agent.handle("second mission") }
+        await secondBrain.waitUntilEntered()
+        let currentPhases = phases
+        XCTAssertEqual(agent.phase, .thinking)
+        firstBrain.finishAll(with: .done)
+        await first.value
+        XCTAssertEqual(agent.phase, .thinking)
+        XCTAssertEqual(phases, currentPhases, "An old generation cannot emit idle into the new mission's UI")
+        secondBrain.finishAll(with: .done)
+        await second.value
+        XCTAssertEqual(agent.phase, .idle)
+        XCTAssertEqual(Array(phases.suffix(2)), [.acting, .idle], "Current mission completion must still publish idle")
+    }
+
     func testDirectCancellationInvalidatesMissionBeforeAwaitingConfirmedStop() async throws {
         let motion = FakeMotion()
         motion.suspendConfirmedStop = true

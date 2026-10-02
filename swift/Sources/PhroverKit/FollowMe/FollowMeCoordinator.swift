@@ -2,12 +2,12 @@ import Foundation
 import RoverNav
 
 public enum FollowMeState: Equatable {
-    case idle, pausing, searching, aligning, waitingForMovement, following, holdingDistance, reacquiring, stopped
+    case idle, pausing, searching, aligning, signalingReady, waitingForMovement, following, holdingDistance, reacquiring, stopped
     case failed(String)
 
     public var isActive: Bool {
         switch self {
-        case .pausing, .searching, .aligning, .waitingForMovement, .following, .holdingDistance, .reacquiring: true
+        case .pausing, .searching, .aligning, .signalingReady, .waitingForMovement, .following, .holdingDistance, .reacquiring: true
         default: false
         }
     }
@@ -50,6 +50,10 @@ public final class FollowMeCoordinator {
     private var alignmentConfirmedAfter: ARFrameID?
     private var alignmentCompletionTime: TimeInterval?
     private var departureBaseline: Double?
+    private var readySignalAttempted = false
+    private var readySignalSucceeded = false
+    private var readySignalConfirmedAfter: ARFrameID?
+    private var readySignalCompletionTime: TimeInterval?
     private var departurePending = true
     private var perceptionReady = false
     private var readinessDeadline: TimeInterval?
@@ -101,6 +105,10 @@ public final class FollowMeCoordinator {
         locked = nil
         alignmentConfirmedAfter = nil
         departureBaseline = nil
+        readySignalAttempted = false
+        readySignalSucceeded = false
+        readySignalConfirmedAfter = nil
+        readySignalCompletionTime = nil
         departurePending = config.departureRangeIncrease > 0
         lastPosition = nil
         reacquireDeadline = nil
@@ -365,7 +373,7 @@ public final class FollowMeCoordinator {
                     await follow(selected, rover: batch.pose!.position, generation: token)
                 }
             } else if !scanning { scan(generation: token) }
-        case .aligning, .waitingForMovement:
+        case .aligning, .signalingReady, .waitingForMovement:
             guard let locked else { return }
             switch tracker.continueTrack(batch.people, previous: locked, predictedPosition: locked.position, now: now) {
             case .matched(let selected):
@@ -376,16 +384,35 @@ public final class FollowMeCoordinator {
                        batch.pose!.position.distance(to: selected.position) >= baseline + config.departureRangeIncrease {
                         await follow(selected, rover: batch.pose!.position, generation: token)
                     }
+                } else if state == .signalingReady {
+                    if !readySignalSucceeded,
+                       batch.pose!.position.distance(to: selected.position) < config.minimumHoldDistance + 0.12 {
+                        _ = await finish(.failed("Person too close during ready signal. Step back and start following again."))
+                        return
+                    }
+                    if readySignalSucceeded, let confirmed = readySignalConfirmedAfter,
+                       confirmed != batch.frameID, let completed = readySignalCompletionTime,
+                       batch.timestamp >= completed {
+                        departureBaseline = batch.pose!.position.distance(to: selected.position)
+                        state = .waitingForMovement
+                    }
                 } else if alignmentTask == nil {
                     if let completed = alignmentCompletionTime, batch.timestamp < completed { return }
                     let heading = atan2(selected.position.y - batch.pose!.position.y,
                                         selected.position.x - batch.pose!.position.x)
                     if let confirmed = alignmentConfirmedAfter, confirmed != batch.frameID,
                        abs(normalizeAngle(heading - batch.pose!.yaw)) <= config.alignmentAngularTolerance {
-                        if departureBaseline == nil {
-                            departureBaseline = batch.pose!.position.distance(to: selected.position)
+                        if !readySignalAttempted {
+                            signalReady(generation: token)
+                        } else if readySignalSucceeded {
+                            if departureBaseline == nil {
+                                // The one move finished, but loss preceded its post-stop baseline.
+                                departureBaseline = batch.pose!.position.distance(to: selected.position)
+                            }
+                            state = .waitingForMovement
+                        } else {
+                            _ = await finish(.failed("Ready signal interrupted. Stop and start following again."))
                         }
-                        state = .waitingForMovement
                     } else {
                         align(generation: token)
                     }
@@ -503,6 +530,36 @@ public final class FollowMeCoordinator {
         alignmentCompletionTime = nil
     }
 
+    private func signalReady(generation token: UInt64) {
+        guard generation == token, canScan, !readySignalAttempted else { return }
+        guard let pose = latestBatch?.pose, let locked,
+              pose.position.distance(to: locked.position) >= config.minimumHoldDistance + 0.12 else {
+            Task {
+                guard generation == token else { return }
+                _ = await finish(.failed("Not enough person clearance for the 10 cm ready signal. Step back and start following again."))
+            }
+            return
+        }
+        readySignalAttempted = true
+        state = .signalingReady
+        operation &+= 1
+        let id = operation
+        movementTask = Task { [weak self, motion] in
+            let result = await motion.signalReady()
+            guard let self, self.generation == token, self.operation == id,
+                  self.state == .signalingReady else { return }
+            guard result == .arrived else {
+                _ = await self.finish(.failed("Ready signal could not complete safely. Stop and start following again."))
+                return
+            }
+            guard await self.confirmStop(generation: token), self.state == .signalingReady,
+                  self.canScan else { return }
+            self.readySignalSucceeded = true
+            self.readySignalConfirmedAfter = self.latestFrame
+            self.readySignalCompletionTime = self.clock.now
+        }
+    }
+
     private func confirmStop(generation token: UInt64) async -> Bool {
         guard generation == token, !stopBlocked, stopTask == nil else { return false }
         operation &+= 1
@@ -618,6 +675,7 @@ public final class FollowMeCoordinator {
         // Subsequent unhealthy frames update diagnostics without stopping again.
         guard poseDeadline == nil else { return }
         cancelAlignment()
+        if state == .signalingReady { state = .aligning }
         let deadline = clock.now + config.perceptionRecoverySeconds
         poseDeadline = deadline
         poseTask?.cancel()

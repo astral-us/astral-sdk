@@ -33,6 +33,16 @@ final class FollowPerceptionFake: FollowMePerception {
 
 @MainActor
 final class FollowMotionFake: FollowMeMotion {
+    private(set) var readySignals = 0
+    var suspendReadySignal = false
+    var readySignalResult: NavigationResult = .arrived
+    private var readyWaiter: CheckedContinuation<Void, Never>?
+    func signalReady() async -> NavigationResult {
+        readySignals += 1
+        if suspendReadySignal { await withCheckedContinuation { readyWaiter = $0 } }
+        return readySignalResult
+    }
+    func releaseReadySignal() { readyWaiter?.resume(); readyWaiter = nil }
     private(set) var rotations: [Double] = []
     private(set) var alignments: [Double] = []
     var suspendAlignment = false

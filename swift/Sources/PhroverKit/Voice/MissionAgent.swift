@@ -359,6 +359,13 @@ public final class MissionAgent {
 
     // MARK: - Loop
 
+    /// Async work may outlive acknowledged cancellation and a subsequent mission.
+    /// Fence phase mutation and its UI callback at the source, including idle updates.
+    private func setPhase(_ value: Phase, missionID: Int) {
+        guard missionID == missionGeneration else { return }
+        phase = value
+    }
+
     private func runLoop(firstUtterance: String?, missionID: Int) async {
         var nextUtterance = firstUtterance
         let missionUtterance = firstUtterance ?? ""
@@ -372,7 +379,7 @@ public final class MissionAgent {
 
         for tick in 0..<maxTicksPerUtterance {
             guard isCurrentMission(missionID) else {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return
             }
@@ -386,7 +393,7 @@ public final class MissionAgent {
                 break
             }
 
-            phase = .thinking
+            setPhase(.thinking, missionID: missionID)
             let rememberedCountBefore = memory.rememberedObjects.count
             updateWorldModel()
             let newObjects = memory.rememberedObjects.count - rememberedCountBefore
@@ -406,7 +413,7 @@ public final class MissionAgent {
                 output = try await nextBrainAction(brain, context: ctx)
             } catch is BrainDecisionTimeoutError {
                 guard isCurrentMission(missionID) else {
-                    phase = .idle
+                    setPhase(.idle, missionID: missionID)
                     RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                     return
                 }
@@ -419,7 +426,7 @@ public final class MissionAgent {
                 break
             } catch {
                 guard isCurrentMission(missionID) else {
-                    phase = .idle
+                    setPhase(.idle, missionID: missionID)
                     RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                     return
                 }
@@ -433,7 +440,7 @@ public final class MissionAgent {
                 break
             }
             guard isCurrentMission(missionID) else {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return
             }
@@ -450,7 +457,7 @@ public final class MissionAgent {
                 "decision": decisionDescription(output.decision)
             ])
 
-            phase = .acting
+            setPhase(.acting, missionID: missionID)
             let decision = output.decision
             let poseBefore = perception.pose?.position
             var outcome = ""
@@ -469,7 +476,7 @@ public final class MissionAgent {
                         navigate(to: scannedGoal, for: effectiveTarget)
                         await waitForMotionToSettle()
                         guard isCurrentMission(missionID) else {
-                            phase = .idle
+                            setPhase(.idle, missionID: missionID)
                             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                             return
                         }
@@ -497,26 +504,26 @@ public final class MissionAgent {
                                       poseBefore: poseBefore,
                                       newObjects: newObjects,
                                       outcome: outcome) {
-                            phase = .idle
+                            setPhase(.idle, missionID: missionID)
                             return
                         }
                         continue
                     case .cancelled:
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                         return
                     case .notFound:
                         break
                     }
                     guard isCurrentMission(missionID) else {
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                         return
                     }
                     voice.speak("I couldn't quite figure out where that is.")
                     if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
                                    outcome: "navigate → couldn't resolve target") {
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         return
                     }
                     continue
@@ -550,7 +557,7 @@ public final class MissionAgent {
                     voice.speak("I'm not sure which opening that is anymore.")
                     if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects,
                                    outcome: "explore(\(candidateId)) → unknown opening id") {
-                        phase = .idle
+                        setPhase(.idle, missionID: missionID)
                         return
                     }
                     continue
@@ -572,7 +579,7 @@ public final class MissionAgent {
                     : "pose changed")
 
             case .ask(let question):
-                phase = .waitingForAnswer
+                setPhase(.waitingForAnswer, missionID: missionID)
                 if let reply = await voice.ask(question, timeout: askTimeout) {
                     lastAnswerWasInconclusive = false
                     if let pose = perception.pose { memory.record(utterance: reply, at: pose) }
@@ -600,13 +607,13 @@ public final class MissionAgent {
                 return
 
             case .done:
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_done", fields: ["mission": "\(missionID)"])
                 return
             }
 
             if recordTick(decision: decision, poseBefore: poseBefore, newObjects: newObjects, outcome: outcome) {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 return
             }
         }
@@ -615,7 +622,7 @@ public final class MissionAgent {
             voice.speak("I've used up the time I had for this and want to check in rather than keep going. "
                 + wrapUpFindings())
         }
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_finished", fields: ["mission": "\(missionID)"])
     }
 
@@ -1045,7 +1052,7 @@ public final class MissionAgent {
         guard !Self.hasFollowUpIntent(missionUtterance), !Self.hasFollowUpIntent(plan ?? "") else {
             return false
         }
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_target_navigation_done", fields: [
             "mission": "\(missionID)",
             "target": targetDescription(target)
@@ -1081,7 +1088,7 @@ public final class MissionAgent {
         }
         guard await navigateReturn(to: start.position, missionID: missionID) else { return true }
 
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         plan = "Primary target reached; returned to mission start."
         RuntimeFileLog.append("mission_return_completed", fields: [
             "mission": "\(missionID)",
@@ -1115,7 +1122,7 @@ public final class MissionAgent {
 
         while abs(remaining) > .pi / 180 {
             guard isCurrentMission(missionID) else {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return false
             }
@@ -1156,7 +1163,7 @@ public final class MissionAgent {
             await waitForMotionToSettle()
 
             guard isCurrentMission(missionID) else {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return false
             }
@@ -1198,7 +1205,7 @@ public final class MissionAgent {
     private func failReturnMission(missionID: Int, reason: String) {
         motion.cancel()
         voice.speak(reason)
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_motion_failed", fields: [
             "mission": "\(missionID)",
             "reason": reason
@@ -1240,7 +1247,7 @@ public final class MissionAgent {
             navigate(to: freshGoal, for: target)
             await waitForMotionToSettle()
             guard isCurrentMission(missionID) else {
-                phase = .idle
+                setPhase(.idle, missionID: missionID)
                 RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
                 return true
             }
@@ -1255,7 +1262,7 @@ public final class MissionAgent {
         case .notFound:
             motion.cancel()
             voice.speak("I couldn't find the target after looking around.")
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_target_recovery_exhausted", fields: [
                 "mission": "\(missionID)",
                 "target": query
@@ -1263,7 +1270,7 @@ public final class MissionAgent {
             return true
 
         case .cancelled:
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_cancelled", fields: ["mission": "\(missionID)"])
             return true
         }
@@ -1316,7 +1323,7 @@ public final class MissionAgent {
             await rotateForBlockedHeadingRecovery(missionID: missionID)
             guard case .failed(let recoveryReason) = motion.state else { return false }
             voice.speak(recoveryReason)
-            phase = .idle
+            setPhase(.idle, missionID: missionID)
             RuntimeFileLog.append("mission_motion_failed", fields: [
                 "mission": "\(missionID)",
                 "reason": recoveryReason
@@ -1324,7 +1331,7 @@ public final class MissionAgent {
             return true
         }
         voice.speak(reason)
-        phase = .idle
+        setPhase(.idle, missionID: missionID)
         RuntimeFileLog.append("mission_motion_failed", fields: [
             "mission": "\(missionID)",
             "reason": reason

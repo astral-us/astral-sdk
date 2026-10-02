@@ -3,6 +3,28 @@ import XCTest
 
 @MainActor
 final class OperatorCommandRouterTests: XCTestCase {
+    func testNormalizedLocalStopFencesFollowAndBlocksNewMissionUntilConfirmed() async {
+        let mission = RecordingOperatorMission()
+        let follow = RecordingOperatorFollow()
+        let router = OperatorCommandRouter(mission: mission, follow: follow)
+        _ = await router.submit("follow me")
+        follow.suspendStop = true
+        let stopping = Task { await router.submit("  STOP FOLLOWING ME!  ") }
+        await follow.waitForStop()
+        XCTAssertEqual(follow.inhibitions, 1)
+        XCTAssertFalse(follow.state.isActive, "Fence locally before awaiting motor acknowledgement")
+        let pending = await router.submit("go to the kitchen")
+        XCTAssertNotEqual(pending, .accepted)
+        XCTAssertEqual(mission.events, ["stop"], "Stop must never call the brain/mission.handle")
+        follow.releaseStop()
+        let confirmed = await stopping.value
+        XCTAssertEqual(confirmed, .accepted)
+        let next = await router.submit("go to the kitchen")
+        XCTAssertEqual(next, .accepted)
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(mission.events, ["stop", "handle:go to the kitchen"])
+    }
+
     func testFollowPhraseCancelsMissionBeforeStartingFollow() async {
         let mission = RecordingOperatorMission()
         let follow = RecordingOperatorFollow()
@@ -128,6 +150,8 @@ private final class RecordingOperatorMission: OperatorMission {
 
 @MainActor
 private final class RecordingOperatorFollow: OperatorFollow {
+    var inhibitions = 0
+    func inhibitMotion() { inhibitions += 1; state = .stopped }
     var state: FollowMeState = .idle
     var starts = 0
     var missionStopsAtStart = 1

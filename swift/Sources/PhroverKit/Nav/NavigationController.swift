@@ -21,7 +21,7 @@ public enum NavigationSafetyState: Equatable, Sendable {
 public final class NavigationController {
     public enum State: Equatable, Sendable { case idle, planning, driving, arrived, failed(String) }
     enum VisualTargetApproachDecision: Equatable { case inactive, approach, arrived }
-    private enum RotationMode { case continuous, scan }
+    private enum RotationMode { case continuous, scan, followScan }
 
     public private(set) var state: State = .idle
     public private(set) var path: [Vec2] = []
@@ -30,6 +30,7 @@ public final class NavigationController {
     private let currentPose: () -> Pose2D?
     private let currentForwardClearance: () -> Double
     private let makePlan: (Vec2, Vec2) -> [Vec2]?
+    private let readySignalCostmap: ((Vec2) -> Costmap)?
     private let currentLastAck: () async -> Date?
     private let sendCommand: (WheelCommand) async throws -> Void
     private let stopRover: () async throws -> Void
@@ -69,6 +70,7 @@ public final class NavigationController {
             let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
             return planner.plan(from: start, to: goal, in: costmap)
         }
+        readySignalCostmap = { CostmapBuilder.build(from: ar.meshAnchors, center: $0) }
         currentLastAck = { await control.lastAckAt }
         sendCommand = { try await control.sendNavigation($0) }
         stopRover = { try await control.stop() }
@@ -79,6 +81,7 @@ public final class NavigationController {
     init(currentPose: @escaping () -> Pose2D?,
          forwardClearance: @escaping () -> Double,
          plan: @escaping (Vec2, Vec2) -> [Vec2]?,
+         readySignalCostmap: ((Vec2) -> Costmap)? = nil,
          lastAckAt: @escaping () async -> Date?,
          sendCommand: @escaping (WheelCommand) async throws -> Void,
          stopRover: @escaping () async throws -> Void,
@@ -87,6 +90,7 @@ public final class NavigationController {
         self.currentPose = currentPose
         self.currentForwardClearance = forwardClearance
         self.makePlan = plan
+        self.readySignalCostmap = readySignalCostmap
         self.currentLastAck = lastAckAt
         self.sendCommand = sendCommand
         self.stopRover = stopRover
@@ -136,6 +140,86 @@ public final class NavigationController {
         guard operationGeneration == generation else { return .cancelled }
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
         return result
+    }
+
+    /// A bounded, pose-controlled 10 cm ready signal, independent of pursuit's 20 cm tolerance.
+    public func navigateForFollowReadySignal() async -> NavigationResult {
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
+        operationGeneration &+= 1
+        let reservation = operationGeneration
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        guard operationGeneration == reservation, !Task.isCancelled else { return .cancelled }
+        guard let start = currentPose(), start.position.x.isFinite,
+              start.position.y.isFinite, start.yaw.isFinite else { return .failed(.noPose) }
+        let direction = Vec2(cos(start.yaw), sin(start.yaw))
+        let goal = start.position + direction * 0.10
+        guard let planned = makePlan(start.position, goal), !planned.isEmpty else { return .failed(.noPath) }
+        if let map = readySignalCostmap?(start.position) {
+            // Check the actual swept segment in the inflated grid. Cell-center waypoints
+            // are quantized by 10 cm; they are not measured rover displacement.
+            guard map.isSegmentClear(from: start.position,
+                to: start.position + direction * 0.12, margin: 0.02) else { return .failed(.noPath) }
+        } else {
+            // Exact-path test/custom planning seam without a costmap remains fail-closed.
+            guard planned.allSatisfy({ point in
+                  let delta = point - start.position
+                  let along = delta.x * direction.x + delta.y * direction.y
+                  let lateral = abs(delta.x * direction.y - delta.y * direction.x)
+                  return along.isFinite && lateral.isFinite && along >= -0.02 && along <= 0.12 && lateral <= 0.02
+               }) else { return .failed(.noPath) }
+        }
+        state = .driving
+        publishSafetyState(.moving)
+        let task = Task { await driveReadySignal(from: start, direction: direction) }
+        loop = task
+        let result = await task.value
+        guard operationGeneration == reservation else { return .cancelled }
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        guard operationGeneration == reservation, !Task.isCancelled else { return .cancelled }
+        if case .failed = result { finish(result) }
+        return result
+    }
+
+    private func driveReadySignal(from start: Pose2D, direction: Vec2) async -> NavigationResult {
+        let started = now()
+        var progress = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.01)
+        while !Task.isCancelled {
+            let ack = await currentLastAck()
+            guard !Task.isCancelled else { return .cancelled }
+            // Actor acknowledgement reads can suspend. Sample clock and safety only
+            // after that read so neither fresh acknowledgements nor changed hazards
+            // are evaluated against an older snapshot.
+            let time = now()
+            guard let pose = currentPose(), pose.position.x.isFinite,
+                  pose.position.y.isFinite, pose.yaw.isFinite else { return .failed(.trackingLost) }
+            let delta = pose.position - start.position
+            let along = delta.x * direction.x + delta.y * direction.y
+            let lateral = abs(delta.x * direction.y - delta.y * direction.x)
+            guard delta.distance(to: .zero) <= 0.12, along >= -0.02,
+                  lateral <= 0.02, abs(normalizeAngle(pose.yaw - start.yaw)) <= 0.10 else { return .failed(.stalled) }
+            let clearance = currentForwardClearance()
+            guard clearance.isFinite else { return .failed(.obstacle) }
+            guard let ack, time.timeIntervalSince(ack) >= 0,
+                  time.timeIntervalSince(ack) <= RoverConfig.commsWatchdogTimeout else { return .failed(.commsLost) }
+            let decision = guardLayer.evaluate(forwardClearance: clearance,
+                lastAckAt: ack, now: time, feedback: nil,
+                requireFreshAck: true, checkForwardObstacle: true)
+            switch decision {
+            case .go: break
+            case .stopObstacle: return .failed(.obstacle)
+            case .stopCommsLost: return .failed(.commsLost)
+            case .stopTipping: return .failed(.tipping)
+            }
+            guard !Task.isCancelled else { return .cancelled }
+            if along >= 0.08 { return .arrived }
+            if time.timeIntervalSince(started) >= 5 || progress.observe(
+                distanceToGoal: 0.10 - along, now: time, commanded: true) { return .failed(.stalled) }
+            let speed = min(0.05, (0.10 - along) * 0.8)
+            do { try await sendCommand(WheelCommand(left: speed, right: speed)) }
+            catch { return Task.isCancelled ? .cancelled : .failed(.commandFailed) }
+            await sleep(.seconds(RoverConfig.commandInterval))
+        }
+        return .cancelled
     }
 
     @discardableResult
@@ -240,7 +324,7 @@ public final class NavigationController {
         }
         state = .driving
         publishSafetyState(.moving)
-        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .scan) }
+        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .followScan) }
         loop = task
         let result = await task.value
         guard operationGeneration == reservation + 1 else { return .cancelled }
@@ -533,7 +617,8 @@ public final class NavigationController {
     }
 
     private func performRotate(to targetYaw: Double, mode: RotationMode) async -> NavigationResult {
-        let angularTolerance = mode == .scan ? RoverConfig.scanTurnYawTolerance : 0.05
+        let pulsed = mode == .scan || mode == .followScan
+        let angularTolerance = pulsed ? RoverConfig.scanTurnYawTolerance : 0.05
         var hasSentCommand = false
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
@@ -588,7 +673,15 @@ public final class NavigationController {
                 return result
             }
 
-            let cmd = RotationCommand.command(forYawError: error)
+            let cmd: WheelCommand
+            if mode == .followScan {
+                // Follow-only slow search: deliberately bypass the generic .25 m/s floor.
+                let speed = min(0.10, abs(error) * 0.3)
+                let signed = error > 0 ? speed : -speed
+                cmd = WheelCommand(left: -signed, right: signed)
+            } else {
+                cmd = RotationCommand.command(forYawError: error)
+            }
             if progressWatchdog.observe(distanceToGoal: abs(error), now: now, commanded: true) {
                 try? await stopRover()
                 let result = NavigationResult.failed(.stalled)
@@ -607,7 +700,7 @@ public final class NavigationController {
                 "pose_yaw_deg": Self.formatDegrees(pose.yaw),
                 "target_yaw_deg": Self.formatDegrees(targetYaw),
                 "yaw_error_deg": Self.formatDegrees(error),
-                "mode": mode == .scan ? "scan_pulse" : "continuous",
+                "mode": mode == .followScan ? "follow_scan_pulse" : (pulsed ? "scan_pulse" : "continuous"),
                 "wheel_left": Self.formatMeters(cmd.left),
                 "wheel_right": Self.formatMeters(cmd.right)
             ])
@@ -626,11 +719,14 @@ public final class NavigationController {
                 ])
                 return .failed(.commandFailed)
             }
-            if mode == .scan {
+            if pulsed {
                 await sleep(.seconds(RoverConfig.scanTurnPulseDuration))
                 do {
                     try await stopRover()
                 } catch {
+                    // External stop owns an independent, noncancelled acknowledgement.
+                    // Do not publish success here: confirmStop still fails closed if that fails.
+                    if Task.isCancelled { return .cancelled }
                     stopUnconfirmed = true
                     let result = NavigationResult.failed(.commandFailed)
                     finish(result)

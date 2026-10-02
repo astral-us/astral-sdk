@@ -21,5 +21,9 @@ public final class NavigationFollowMeMotion: FollowMeMotion {
 
     public func stopAndConfirm() async throws { try await navigation.stopAndConfirm() }
 
+    public func signalReady() async -> NavigationResult {
+        await navigation.navigateForFollowReadySignal()
+    }
+
     public func safetyStates() -> AsyncStream<NavigationSafetyState> { navigation.safetyStates() }
 }

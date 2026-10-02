@@ -4,6 +4,48 @@ import RoverNav
 
 @MainActor
 final class NavigationRotationWatchdogTests: XCTestCase {
+    func testCancelledPulseStopIsSafeOnlyAfterIndependentConfirmedStop() async throws {
+        let pulseStop = SuspendedNavigationSend(error: URLError(.cancelled))
+        var stops = 0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] },
+            lastAckAt: { Date() }, sendCommand: { _ in },
+            stopRover: { stops += 1; if stops == 2 { try await pulseStop.send() } },
+            sleep: { _ in })
+        var failures: [NavigationSafetyState] = []
+        let observer = Task {
+            for await state in controller.safetyStates() {
+                if case .failed = state { failures.append(state) }
+            }
+        }
+        let scan = Task { await controller.rotateForFollowScan(by: .pi / 6) }
+        await pulseStop.waitUntilRequested()
+        try await controller.stopAndConfirm()
+        let result = await scan.value
+        for _ in 0..<20 { await Task.yield() }
+        observer.cancel()
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertEqual(controller.safetyState, .idle)
+        XCTAssertTrue(failures.isEmpty, "Intentional pulse cancellation must defer outcome to the independent stop")
+        XCTAssertGreaterThan(stops, 2)
+    }
+
+    func testFollowScanUsesSlowWheelsWithoutGenericMinimumFloor() async {
+        var yaw = 0.0
+        var commands: [WheelCommand] = []
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: yaw) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] },
+            lastAckAt: { Date() }, sendCommand: { commands.append($0) },
+            stopRover: {}, sleep: { _ in yaw += 0.1 })
+        let result = await controller.rotateForFollowScan(by: .pi / 6)
+        XCTAssertEqual(result, .arrived)
+        XCTAssertFalse(commands.isEmpty)
+        XCTAssertTrue(commands.allSatisfy { abs($0.left) <= 0.10 && abs($0.right) <= 0.10 })
+        XCTAssertTrue(commands.allSatisfy { $0.left < 0 && $0.right > 0 })
+    }
+
     func testFollowAlignmentFailsClosedWhenInternalPreturnStopFailsAfterCoordinatorStopSucceeded() async throws {
         var stops = 0
         var commands: [WheelCommand] = []

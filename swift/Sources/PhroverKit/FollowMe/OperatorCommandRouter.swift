@@ -11,6 +11,7 @@ public protocol OperatorFollow: AnyObject {
     var state: FollowMeState { get }
     func start() async -> Bool
     func stop() async -> Bool
+    func inhibitMotion()
 }
 
 extension MissionAgent: OperatorMission {}
@@ -19,6 +20,19 @@ extension FollowMeCoordinator: OperatorFollow {}
 public enum OperatorSubmission: Equatable, Sendable {
     case accepted
     case rejected(String)
+}
+
+public enum OperatorCommandKind: Equatable, Sendable {
+    case localStop, localFollow, mission
+
+    public static func classify(_ text: String) -> Self {
+        let phrase = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".!?"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if ["stop", "stop following", "stop following me"].contains(phrase) { return .localStop }
+        if ["follow me", "start following", "start following me"].contains(phrase) { return .localFollow }
+        return .mission
+    }
 }
 
 /// Reserves motion ownership before suspension so delayed starts cannot outrun stop.
@@ -44,10 +58,9 @@ public final class OperatorCommandRouter {
     public func submit(_ text: String) async -> OperatorSubmission {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .rejected("Enter a request first.") }
-        let phrase = trimmed.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".!?"))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if ["stop", "stop following", "stop following me"].contains(phrase) { return await stop() }
-        if ["follow me", "start following", "start following me"].contains(phrase) {
+        let kind = OperatorCommandKind.classify(text)
+        if kind == .localStop { return await stop() }
+        if kind == .localFollow {
             guard owner != .blocked && owner != .stopping else {
                 return .rejected("Rover stop could not be confirmed.")
             }
@@ -96,6 +109,7 @@ public final class OperatorCommandRouter {
         generation &+= 1
         let previous = owner
         owner = .stopping
+        follow.inhibitMotion()
         missionTask?.cancel()
         let pending = pendingMissionStop
         let task = Task { [mission, follow] () -> OperatorSubmission in

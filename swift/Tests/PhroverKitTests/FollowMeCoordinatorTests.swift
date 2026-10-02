@@ -5,6 +5,146 @@ import XCTest
 
 @MainActor
 final class FollowMeCoordinatorTests: XCTestCase {
+    func testPersonApproachingDuringReadySignalCancelsBeforeHoldClearanceIsCrossed() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        motion.suspendReadySignal = true
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.6)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.6)]))
+        await drain()
+        let stops = motion.stops
+        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5, y: 1.3)]))
+        await drain()
+        XCTAssertGreaterThan(motion.stops, stops)
+        XCTAssertFalse(coordinator.isActive)
+        motion.releaseReadySignal()
+        await drain()
+        XCTAssertNotEqual(coordinator.state, .waitingForMovement)
+        XCTAssertEqual(motion.readySignals, 1)
+    }
+
+    func testTooClosePersonCannotAuthorizeReadySignalAcrossHoldClearance() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
+        await drain()
+        XCTAssertEqual(motion.readySignals, 0)
+        XCTAssertEqual(coordinator.state, .failed("Not enough person clearance for the 10 cm ready signal. Step back and start following again."))
+        XCTAssertTrue(motion.goals.isEmpty)
+    }
+
+    func testLossAfterSignalStopBeforeBaselineReacquiresWithoutSecondMoveAndCanDepart() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        motion.suspendRotation = true
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
+        await drain()
+        perception.send(frame(3, at: 5))
+        await drain()
+        for sequence in UInt64(4)...6 {
+            perception.send(frame(sequence, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(sequence, at: 5)]))
+            await drain()
+        }
+        XCTAssertEqual(coordinator.state, .waitingForMovement)
+        perception.send(frame(7, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(7, at: 5, y: 4.3)]))
+        await drain()
+        XCTAssertEqual(motion.goals.count, 1, "A confirmed signal without its baseline must not leave departure permanently gated")
+        XCTAssertEqual(motion.readySignals, 1)
+        motion.releaseRotation()
+        _ = await coordinator.stop()
+    }
+
+    func testLossDuringReadySignalCannotRepeatMoveOrBecomeReadyAfterReacquisition() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        motion.suspendReadySignal = true
+        motion.suspendRotation = true
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
+        await drain()
+        perception.send(frame(3, at: 5))
+        await drain()
+        motion.releaseReadySignal()
+        perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, at: 5)]))
+        await drain()
+        perception.send(frame(5, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(5, at: 5)]))
+        await drain()
+        XCTAssertEqual(motion.readySignals, 1)
+        XCTAssertEqual(coordinator.state, .failed("Ready signal interrupted. Stop and start following again."))
+        XCTAssertTrue(motion.goals.isEmpty)
+        motion.releaseRotation()
+        _ = await coordinator.stop()
+    }
+
+    func testCancelledUnsafeStaleAndOperatorStoppedReadySignalNeverMarksReady() async {
+        for scenario in 0..<4 {
+            let (coordinator, perception, motion, clock) = productionSetup()
+            motion.suspendReadySignal = true
+            _ = await coordinator.start()
+            await drain()
+            clock.advance(to: 5)
+            perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+            await drain()
+            perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
+            await drain()
+            if scenario == 0 { motion.readySignalResult = .cancelled }
+            if scenario == 1 { motion.readySignalResult = .failed(.obstacle) }
+            if scenario == 2 { clock.advance(to: 5.501); await drain() }
+            if scenario == 3 { coordinator.inhibitMotion(); _ = await coordinator.stop() }
+            motion.releaseReadySignal()
+            await drain()
+            perception.send(frame(3, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: clock.now)]))
+            await drain()
+            XCTAssertNotEqual(coordinator.state, .waitingForMovement)
+            XCTAssertEqual(motion.readySignals, 1)
+            XCTAssertTrue(motion.goals.isEmpty)
+            _ = await coordinator.stop()
+        }
+    }
+
+    func testReadySignalOnceThenFreshPostStopBaselineBeforeWaiting() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        motion.suspendReadySignal = true
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
+        await drain()
+        XCTAssertEqual(motion.readySignals, 1)
+        XCTAssertEqual(String(describing: coordinator.state), "signalingReady")
+        XCTAssertTrue(motion.goals.isEmpty)
+        motion.releaseReadySignal()
+        await drain()
+        XCTAssertEqual(String(describing: coordinator.state), "signalingReady", "Completion needs a new post-stop frame")
+        perception.send(frame(3, at: 5, pose: Pose2D(position: Vec2(0, 0.1), yaw: .pi / 2), people: [person(3, at: 5)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .waitingForMovement)
+        perception.send(frame(4, at: 5, pose: Pose2D(position: Vec2(0, 0.1), yaw: .pi / 2), people: [person(4, at: 5, y: 4.299)]))
+        await drain()
+        XCTAssertTrue(motion.goals.isEmpty)
+        perception.send(frame(5, at: 5, pose: Pose2D(position: Vec2(0, 0.1), yaw: .pi / 2), people: [person(5, at: 5, y: 4.3)]))
+        await drain()
+        XCTAssertEqual(motion.goals.count, 1)
+        XCTAssertEqual(motion.readySignals, 1)
+        _ = await coordinator.stop()
+    }
+
     func testAlignmentProgressesWithNewMatchedFramesDuringEveryStopAcknowledgement() async {
         let (coordinator, perception, motion, clock) = productionSetup()
         motion.suspendStop = true
@@ -49,6 +189,9 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await drain()
         perception.send(frame(7, at: 5.6, pose: Pose2D(position: Vec2(1, 0.6), yaw: .pi / 2),
                               people: [person(7, at: 5.6, x: 1, y: 4.2)]))
+        await drain()
+        perception.send(frame(8, at: 5.6, pose: Pose2D(position: Vec2(1, 0.7), yaw: .pi / 2),
+                              people: [person(8, at: 5.6, x: 1, y: 4.2)]))
         await drain()
         XCTAssertEqual(coordinator.state, .waitingForMovement)
         XCTAssertEqual(motion.alignments.count, 1, "Repeated arrivals across both acknowledgements must allow alignment to complete")
@@ -167,7 +310,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
     func testWaitingTracksSamePersonAndLateralOrTowardMotionDoesNotDepart() async {
         let (coordinator, perception, motion, clock) = productionSetup()
         await acquireWaiting(coordinator, perception, clock)
-        for (sequence, x, y) in [(UInt64(3), 0.5, sqrt(16 - 0.25)), (4, 0.0, 3.5), (5, 0.0, 4.0)] {
+        for (sequence, x, y) in [(UInt64(4), 0.5, sqrt(16 - 0.25)), (5, 0.0, 3.5), (6, 0.0, 4.0)] {
             perception.send(frame(sequence, at: 5,
                                   people: [person(sequence, at: 5, x: x, y: y, screen: 0.65),
                                            person(sequence, at: 5, x: 6, y: 6, screen: 0.5)]))
@@ -182,10 +325,10 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let (coordinator, perception, motion, clock) = productionSetup()
         await acquireWaiting(coordinator, perception, clock)
         let stops = motion.stops
-        perception.send(frame(3, at: 5, depth: false))
+        perception.send(frame(4, at: 5, depth: false))
         await drain()
         clock.advance(to: 6)
-        perception.send(frame(4, at: 6, pose: nil))
+        perception.send(frame(5, at: 6, pose: nil))
         await drain()
         XCTAssertEqual(motion.stops, stops + 1)
         clock.advance(to: 7)
@@ -240,6 +383,9 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(4, at: 5.2, pose: Pose2D(position: .zero, yaw: .pi / 2),
                               people: [person(4, at: 5.2)]))
         await drain()
+        perception.send(frame(5, at: 5.2, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(5, at: 5.2)]))
+        await drain()
         XCTAssertEqual(coordinator.state, .waitingForMovement)
         XCTAssertTrue(motion.goals.isEmpty)
         _ = await coordinator.stop()
@@ -263,6 +409,9 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
                               people: [person(2, at: 5)]))
         await drain()
+        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(3, at: 5)]))
+        await drain()
         XCTAssertEqual(coordinator.state, .waitingForMovement)
     }
 
@@ -270,24 +419,25 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let (coordinator, perception, motion, clock) = productionSetup()
         motion.suspendRotation = true
         await acquireWaiting(coordinator, perception, clock)
-        perception.send(frame(3, at: 5))
+        perception.send(frame(4, at: 5))
         await drain()
         XCTAssertEqual(coordinator.state, .reacquiring)
-        perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(4, at: 5, y: 4.2)]))
-        await drain()
-        XCTAssertEqual(coordinator.state, .aligning)
-        XCTAssertTrue(motion.goals.isEmpty, "Reacquisition cannot bypass departure")
         perception.send(frame(5, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
                               people: [person(5, at: 5, y: 4.2)]))
         await drain()
+        XCTAssertEqual(coordinator.state, .aligning)
+        XCTAssertTrue(motion.goals.isEmpty, "Reacquisition cannot bypass departure")
+        perception.send(frame(6, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(6, at: 5, y: 4.2)]))
+        await drain()
         XCTAssertEqual(coordinator.state, .waitingForMovement)
-        perception.send(frame(6, at: 5, people: [person(6, at: 5, y: 4.299)]))
+        perception.send(frame(7, at: 5, people: [person(7, at: 5, y: 4.299)]))
         await drain()
         XCTAssertTrue(motion.goals.isEmpty)
-        perception.send(frame(7, at: 5, people: [person(7, at: 5, y: 4.3)]))
+        perception.send(frame(8, at: 5, people: [person(8, at: 5, y: 4.3)]))
         await drain()
         XCTAssertEqual(motion.goals.count, 1, "The original baseline survives reacquisition")
+        XCTAssertEqual(motion.readySignals, 1, "Reacquisition cannot repeat the ready move")
         _ = await coordinator.stop()
         motion.releaseRotation()
     }
@@ -336,16 +486,19 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
                               people: [person(3, at: 5, y: 4.5)]))
         await drain()
+        perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(4, at: 5, y: 4.5)]))
+        await drain()
         XCTAssertEqual(String(describing: coordinator.state), "waitingForMovement")
-        XCTAssertEqual(motion.stops, 2, "Alignment is bracketed by confirmed stops")
-        for (sequence, distance) in [(UInt64(4), 4.5), (5, 4.3), (6, 4.799)] {
+        XCTAssertEqual(motion.stops, 3, "Alignment and ready signal end with confirmed stops")
+        for (sequence, distance) in [(UInt64(5), 4.5), (6, 4.3), (7, 4.799)] {
             perception.send(frame(sequence, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
                                   people: [person(sequence, at: 5, y: distance)]))
             await drain()
             XCTAssertTrue(motion.goals.isEmpty, "Stationary, toward, and .299-away observations must hold")
         }
-        perception.send(frame(7, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(7, at: 5, y: 4.8)]))
+        perception.send(frame(8, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(8, at: 5, y: 4.8)]))
         await drain()
         XCTAssertEqual(coordinator.state, .following)
         XCTAssertEqual(motion.goals.count, 1)

@@ -5,6 +5,9 @@ import PhroverKit
 @MainActor
 final class ConversationViewModel {
     private(set) var errorMessage: String?
+    private(set) var missionPhase: MissionAgent.Phase = .idle
+    private var acceptsMissionPhase = true
+    private var submissionGeneration: UInt64 = 0
     private var submit: (String) async -> OperatorSubmission
     private var stop: () async -> OperatorSubmission
     private var followState: () -> FollowMeState
@@ -40,6 +43,7 @@ final class ConversationViewModel {
         case .idle: return ""
         case .pausing: return "Pausing — five seconds"
         case .aligning: return "Aligning toward you…"
+        case .signalingReady: return "Signaling ready — moving 10 cm…"
         case .waitingForMovement: return "Ready — walk away to begin following"
         case .searching: return "Searching for you…"
         case .following: return "Following — 1.5 m"
@@ -51,11 +55,38 @@ final class ConversationViewModel {
     }
 
     func submitFinalSpeech(_ text: String) async {
-        if case .rejected(let message) = await submit(text) { errorMessage = message }
+        submissionGeneration &+= 1
+        let generation = submissionGeneration
+        let kind = OperatorCommandKind.classify(text)
+        acceptsMissionPhase = kind == .mission
+        missionPhase = kind == .mission ? .thinking : .idle
+        if kind == .localStop { inhibit() }
+        let result = await submit(text)
+        guard generation == submissionGeneration else { return }
+        switch result {
+        case .accepted:
+            errorMessage = nil
+            if kind != .mission { missionPhase = .idle }
+        case .rejected(let message):
+            errorMessage = message
+            missionPhase = .idle
+            acceptsMissionPhase = false
+        }
     }
 
     func stopFollowing() async {
-        if case .rejected(let message) = await stop() { errorMessage = message }
+        submissionGeneration &+= 1
+        acceptsMissionPhase = false
+        missionPhase = .idle
+        inhibit()
+        switch await stop() {
+        case .accepted: errorMessage = nil
+        case .rejected(let message): errorMessage = message
+        }
+    }
+
+    func receiveMissionPhase(_ phase: MissionAgent.Phase) {
+        if acceptsMissionPhase { missionPhase = phase }
     }
 
     func prepareToLeave() { inhibit() }
