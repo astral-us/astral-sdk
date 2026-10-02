@@ -5,6 +5,332 @@ import XCTest
 
 @MainActor
 final class FollowMeCoordinatorTests: XCTestCase {
+    func testHealthyFrameAndAssociationUseOneSessionBudgetAndPreferCombinedSummary() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = FollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0.5
+        config.departureRangeIncrease = 0
+        var records: [(String, Double, [String: Any])] = []
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config) { name, fields in
+            if name == "follow_frame" || name == "follow_person.association" {
+                let payload = fields["payload"].flatMap { $0.data(using: .utf8) }
+                let record = payload.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                records.append((name, clock.now, record))
+            }
+        }
+        _ = await coordinator.start()
+        await drain()
+        let times = [0.0, 0.499, 0.5, 0.6, 0.7, 1.0, 1.499, 1.5, 1.6, 2.499, 2.5]
+        for (index, time) in times.enumerated() {
+            clock.advance(to: time, wakeSleepers: false)
+            // Resume the pause at its exact boundary; later sleeps cannot create an outage.
+            if time == 0.5 { clock.advance(to: time); await drain() }
+            let sequence = UInt64(index + 1)
+            perception.send(frame(sequence, at: time, people: [person(sequence, at: time, y: 1.5)]))
+            await drain()
+        }
+        XCTAssertEqual(records.filter { $0.0 == "follow_frame" }.map { $0.1 }, [0])
+        // Pause completion revalidates its latest frame, selecting initially;
+        // the new boundary frame then transitions to continued at the same time.
+        XCTAssertEqual(records.filter { $0.0 == "follow_person.association" }.map { $0.1 }, [0.5, 0.5, 1.5, 2.5])
+        let periodic = try XCTUnwrap(records.first { $0.1 == 1.5 }?.2)
+        XCTAssertEqual(periodic["tracking_state"] as? String, "normal")
+        XCTAssertEqual(periodic["observation_age_s"] as? Double, 0)
+        XCTAssertEqual(periodic["depth_available"] as? Bool, true)
+        _ = await coordinator.stop()
+        _ = await coordinator.start()
+        await drain()
+        perception.send(frame(20, at: 2.5))
+        await drain()
+        XCTAssertEqual(records.last?.0, "follow_frame")
+        XCTAssertEqual(records.last?.2["session_generation"] as? Int, 3)
+        _ = await coordinator.stop()
+    }
+
+    func testAssociationTransitionsEmitImmediatelyAndIdenticalLostAmbiguousRepeatOnlyOnce() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = FollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        config.departureRangeIncrease = 0
+        motion.suspendRotation = true
+        var records: [[String: Any]] = []
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config) { name, fields in
+            if name == "follow_person.association", let data = fields["payload"]?.data(using: .utf8),
+               let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { records.append(record) }
+        }
+        _ = await coordinator.start()
+        await drain()
+        for sequence: UInt64 in 1...8 {
+            let people: [FollowPersonObservation]
+            switch sequence {
+            case 1, 2, 7, 8: people = [person(sequence, y: 1.5)]
+            case 5, 6: people = [person(sequence, y: 1.5), person(sequence, y: 1.6)]
+            default: people = []
+            }
+            perception.send(frame(sequence, people: people))
+            await drain()
+        }
+        XCTAssertEqual(records.compactMap { $0["association_outcome"] as? String },
+                       ["initial", "continued", "lost", "ambiguous", "reacquired", "continued"])
+        XCTAssertEqual(records.compactMap { $0["previous_outcome"] as? String },
+                       ["initial", "continued", "lost", "ambiguous", "reacquired"])
+        XCTAssertTrue(records.allSatisfy { $0["schema_version"] as? Int == 1 && $0["session_generation"] as? Int == 1 })
+        XCTAssertEqual(records.first?["phase"] as? String, "searching")
+        XCTAssertEqual(records.first?["operation_id"] is NSNull, true)
+        motion.releaseRotation()
+        _ = await coordinator.stop()
+    }
+
+    func testCapturedFailedStopCannotBeDowngradedByCleanupSuccessOrAuthorizeRestart() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        motion.legacy.suspendRotation = true
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config)
+        _ = await coordinator.start()
+        await drain()
+        perception.send(frame(1))
+        await drain()
+        let context = FollowMotionOperationContext(request: try XCTUnwrap(motion.contexts.first),
+            controllerOperationID: 91, purpose: .followScan, profile: nil)
+        motion.sendFailure(.init(context: context, reason: .stalled, stopOutcome: .failed, source: .stream))
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Motor stop could not be confirmed. Motion is blocked."))
+        let restarted = await coordinator.start()
+        XCTAssertFalse(restarted)
+        // An explicit operator retry ends this terminal delivery window. A late result
+        // cannot resurrect its blocked UI even if it did not mark itself stale.
+        let recovered = await coordinator.stop()
+        XCTAssertTrue(recovered)
+        XCTAssertEqual(coordinator.state, .stopped)
+        motion.resultOverride = .init(result: .cancelled, context: context,
+            failure: .init(context: context, reason: .commandFailed, stopOutcome: .confirmed,
+                source: .result))
+        motion.legacy.releaseRotation()
+        await drain()
+        XCTAssertEqual(coordinator.state, .stopped)
+    }
+
+    func testCapturedSearchFailureSurvivesDetectionPhaseChangeAndOnePendingStopOwner() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        motion.legacy.suspendRotation = true
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config)
+        _ = await coordinator.start()
+        await drain()
+        perception.send(frame(1))
+        await drain()
+        let request = try XCTUnwrap(motion.contexts.first)
+        let context = FollowMotionOperationContext(request: request, controllerOperationID: 123,
+            purpose: .followScan, profile: RoverConfig.followScanRotationProfile)
+        motion.legacy.suspendStop = true
+        perception.send(frame(2, people: [person(2)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .aligning)
+        motion.sendFailure(.init(context: context, reason: .stalled, stopOutcome: .pending, source: .stream))
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Search rotation stopped: insufficient measured yaw progress. Confirming motor stop…"))
+        motion.resultOverride = .init(result: .cancelled, context: context,
+            failure: .init(context: context, reason: .cancelled, stopOutcome: .pending, source: .result, stale: true))
+        motion.legacy.releaseRotation()
+        await drain()
+        XCTAssertEqual(motion.legacy.stops, 1)
+        motion.legacy.suspendStop = false
+        motion.legacy.releaseStop()
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Search rotation stopped: insufficient measured yaw progress. Stop confirmed. Restart following to try again."))
+        XCTAssertEqual(motion.legacy.stops, 2, "Detection confirmation drains before the single terminal cleanup")
+        XCTAssertTrue(motion.legacy.alignments.isEmpty)
+    }
+
+    func testOldSessionStreamAndSuspendedResultAfterRestartOnlyLogStaleEvidence() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        motion.legacy.suspendRotation = true
+        var events: [[String: Any]] = []
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: { name, fields in
+                if name == "follow_motion.failure_resolution", let data = fields["payload"]?.data(using: .utf8),
+                   let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { events.append(event) }
+            })
+        _ = await coordinator.start()
+        await drain()
+        perception.send(frame(1))
+        await drain()
+        let request = try XCTUnwrap(motion.contexts.first)
+        let context = FollowMotionOperationContext(request: request, controllerOperationID: 91,
+            purpose: .followScan, profile: nil)
+        motion.sendFailure(.init(context: context, reason: .stalled, stopOutcome: .pending, source: .stream))
+        await drain()
+        let restarted = await coordinator.start()
+        XCTAssertTrue(restarted)
+        await drain()
+        motion.resultOverride = .init(result: .failed(.stalled), context: context,
+            failure: .init(context: context, reason: .stalled, stopOutcome: .failed, source: .result))
+        motion.legacy.releaseRotation()
+        motion.sendFailure(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .stream))
+        await drain()
+        XCTAssertEqual(coordinator.state, .searching)
+        XCTAssertEqual(motion.legacy.stops, 1)
+        XCTAssertTrue(events.suffix(2).allSatisfy { $0["stale"] as? Bool == true })
+        XCTAssertTrue(events.suffix(2).allSatisfy { $0["session_generation"] as? Int == 1 })
+        _ = await coordinator.stop()
+    }
+
+    func testLegacyStallDoesNotInventControllerPurposeOrNoYawProgress() async {
+        let (coordinator, perception, motion, _) = setup()
+        motion.suspendRotation = true
+        _ = await coordinator.start()
+        perception.send(frame(1))
+        await drain()
+        motion.safety(.failed(.stalled))
+        await drain()
+        XCTAssertEqual(coordinator.state, .failed("Navigation stopped: insufficient measured progress."))
+        XCTAssertEqual(motion.stops, 1)
+        motion.releaseRotation()
+        await drain()
+    }
+
+    func testCorrelatedFailureOrdersPublishPendingThenOnlyAcknowledgedStopAndRetainFailedStop() async throws {
+        for streamFirst in [true, false] {
+            for stopFails in [false, true] {
+                let perception = FollowPerceptionFake()
+                let motion = ContextualFollowMotionFake()
+                let clock = ManualFollowClock()
+                var config = FollowMeConfiguration()
+                config.stationaryPauseSeconds = 0
+                motion.legacy.suspendRotation = true
+                motion.legacy.suspendStop = true
+                motion.legacy.stopError = stopFails
+                var events: [[String: Any]] = []
+                let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+                    configuration: config, eventSink: { name, fields in
+                        if name == "follow_motion.failure_resolution", let json = fields["payload"],
+                           let data = json.data(using: .utf8),
+                           let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                            events.append(event)
+                        }
+                    })
+                _ = await coordinator.start()
+                await drain()
+                perception.send(frame(1))
+                await drain()
+                let request = try XCTUnwrap(motion.contexts.first)
+                let context = FollowMotionOperationContext(request: request, controllerOperationID: 91,
+                    purpose: .followScan, profile: RoverConfig.followScanRotationProfile)
+                let stream = FollowMotionFailureDelivery(context: context, reason: .stalled,
+                    stopOutcome: .pending, source: .stream)
+                let resultFailure = FollowMotionFailureDelivery(context: context, reason: .stalled,
+                    stopOutcome: .pending, source: .result)
+                motion.resultOverride = .init(result: .failed(.commandFailed), context: context, failure: resultFailure)
+                if streamFirst { motion.sendFailure(stream) } else { motion.legacy.releaseRotation() }
+                await drain()
+                XCTAssertEqual(coordinator.state, .failed("Search rotation stopped: insufficient measured yaw progress. Confirming motor stop…"))
+                XCTAssertEqual(motion.legacy.stops, 1)
+                if streamFirst { motion.legacy.releaseRotation() } else { motion.sendFailure(stream) }
+                await drain()
+                XCTAssertEqual(motion.legacy.stops, 1, "The second delivery cannot own cleanup")
+                let concurrentStop = Task { await coordinator.stop() }
+                await drain()
+                motion.legacy.releaseStop()
+                _ = await concurrentStop.value
+                await drain()
+                let expected = stopFails ? "Motor stop could not be confirmed. Motion is blocked."
+                    : "Search rotation stopped: insufficient measured yaw progress. Stop confirmed. Restart following to try again."
+                XCTAssertEqual(coordinator.state, .failed(expected))
+                XCTAssertEqual(events.filter { $0["source"] as? String == "stream" }.count, 1)
+                XCTAssertEqual(events.filter { $0["source"] as? String == "result" }.count, 1)
+                XCTAssertTrue(events.contains { $0["deduplicated"] as? Bool == true })
+                XCTAssertTrue(events.allSatisfy { $0["operation_id"] as? Int == 91 })
+                XCTAssertEqual(events.last?["reason"] as? String, "no_yaw_progress")
+                motion.sendFailure(.init(context: context, reason: .commandFailed, stopOutcome: .confirmed,
+                    source: .stream, stale: true))
+                await drain()
+                XCTAssertEqual(coordinator.state, .failed(expected))
+                XCTAssertEqual(motion.legacy.stops, 1)
+                XCTAssertEqual(events.last?["stale"] as? Bool, true)
+                XCTAssertEqual(events.last?["deduplicated"] as? Bool, false,
+                    "After both deliveries and cleanup drain, stale telemetry must not retain a historical reducer record")
+                if stopFails {
+                    let started = await coordinator.start()
+                    XCTAssertFalse(started)
+                }
+            }
+        }
+    }
+
+    func testContextualRuntimeCapturesSearchFollowAndReacquisitionAndUsesOneFailureChannel() async {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        config.departureRangeIncrease = 0
+        motion.legacy.suspendRotation = true
+        motion.legacy.suspendNavigation = true
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config)
+        _ = await coordinator.start()
+        await drain()
+        perception.send(frame(1))
+        await drain()
+        XCTAssertEqual(motion.contextualSubscriptions, 1)
+        XCTAssertEqual(motion.legacySubscriptions, 0)
+        XCTAssertEqual(motion.contexts.first?.phase, "searching")
+        XCTAssertEqual(motion.contexts.first?.sessionGeneration, 1)
+        XCTAssertEqual(motion.contexts.first?.scanUsed ?? 0, .pi / 6, accuracy: 1e-12)
+        XCTAssertEqual(motion.contexts.first?.scanRemaining ?? 0, 2 * .pi - .pi / 6, accuracy: 1e-12)
+        perception.send(frame(2, people: [person(2)]))
+        await drain()
+        motion.legacy.releaseRotation()
+        await drain()
+        perception.send(frame(3))
+        await drain()
+        XCTAssertEqual(motion.contexts.map(\.phase), ["searching", "following", "reacquiring"])
+        XCTAssertEqual(motion.requests.map(\.purpose), [.followScan, .followGoal, .followScan])
+        XCTAssertNil(motion.contexts.last?.scanRemaining, "Reacquisition has a time bound, not an invented angle budget")
+        XCTAssertEqual(Set(motion.contexts.map(\.requestToken)).count, 3)
+        _ = await coordinator.stop()
+        motion.legacy.releaseRotation()
+        motion.legacy.releaseNavigation()
+        await drain()
+    }
+
+    func testContextualRuntimeCapturesAlignmentReadyAndDepartureRequests() async {
+        let perception = FollowPerceptionFake()
+        let motion = ContextualFollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config)
+        _ = await coordinator.start()
+        await drain()
+        perception.send(frame(1, people: [person(1)]))
+        await drain()
+        for sequence in UInt64(2)...3 {
+            perception.send(frame(sequence, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(sequence)]))
+            await drain()
+        }
+        perception.send(frame(4, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, y: 4.3)]))
+        await drain()
+        XCTAssertEqual(motion.requests.map(\.purpose), [.followAlignment, .followReady, .followGoal])
+        XCTAssertEqual(motion.contexts.map(\.phase), ["aligning", "signalingReady", "following"])
+        XCTAssertEqual(Set(motion.contexts.map(\.sessionGeneration)), [1])
+        XCTAssertEqual(Set(motion.contexts.map(\.requestToken)).count, 3)
+        _ = await coordinator.stop()
+    }
+
     func testPersonApproachingDuringReadySignalCancelsBeforeHoldClearanceIsCrossed() async {
         let (coordinator, perception, motion, clock) = productionSetup()
         motion.suspendReadySignal = true
@@ -353,6 +679,15 @@ final class FollowMeCoordinatorTests: XCTestCase {
             for _ in 0..<20 { await drain() }
             XCTAssertEqual(coordinator.state, .failed("No person found."))
             XCTAssertEqual(motion.rotations.reduce(0, +), 2 * .pi, accuracy: 0.00001)
+            var requested = 0.0
+            for angle in motion.rotations {
+                requested += angle
+                XCTAssertLessThanOrEqual(requested, 2 * .pi + 1e-12)
+            }
+            if increment == 0.7 {
+                XCTAssertEqual(motion.rotations.count, 9)
+                XCTAssertEqual(motion.rotations.last!, 0.6831853071795862, accuracy: 1e-12)
+            }
             XCTAssertTrue(motion.goals.isEmpty)
             XCTAssertGreaterThan(motion.stops, 0)
         }
@@ -527,6 +862,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertEqual(String(describing: coordinator.state), "aligning")
         XCTAssertTrue(motion.goals.isEmpty)
         XCTAssertGreaterThanOrEqual(motion.stops, 1)
+        XCTAssertTrue(motion.stopOrigins.contains(.detection), "Detection attribution is captured before the stop suspension")
         perception.send(frame(3, at: 5, depth: false))
         await drain()
         XCTAssertEqual(coordinator.perceptionIssue, .depthUnavailable, "Alignment cannot block perception")
@@ -773,12 +1109,21 @@ final class FollowMeCoordinatorTests: XCTestCase {
         clock.advance(to: 9.999)
         await drain()
         XCTAssertEqual(coordinator.state, .reacquiring)
+        let rotationsBeforeDeadline = motion.rotations.count
+        let stopsBeforeDeadline = motion.stops
         clock.advance(to: 10)
         perception.send(frame(22, at: 10, people: [person(22, at: 10)]))
         await drain()
         XCTAssertFalse(coordinator.isActive)
         XCTAssertTrue(motion.goals.count == 1)
+        XCTAssertEqual(motion.stops, stopsBeforeDeadline + 1)
         motion.releaseRotation()
+        await drain()
+        clock.advance(to: 10.5)
+        perception.send(frame(23, at: 10.5, people: [person(23, at: 10.5)]))
+        await drain()
+        XCTAssertEqual(motion.rotations.count, rotationsBeforeDeadline, "Late scan completion cannot extend the deadline")
+        XCTAssertEqual(motion.goals.count, 1)
     }
 
     func testReacquisitionScansRequireFreshPerceptionAfterStopAndCompletion() async {
@@ -1449,12 +1794,12 @@ final class FollowMeCoordinatorTests: XCTestCase {
         motion.safety(.failed(.cancelled))
         perception.send(frame(3, at: 0.334, people: [person(3, at: 0.334, y: 5)]))
         await drain()
-        XCTAssertEqual(coordinator.state, .failed("Navigation safety failure."))
+        XCTAssertEqual(coordinator.state, .failed("Navigation cancelled."))
         XCTAssertEqual(motion.goals.count, 1)
         motion.suspendStop = false
         motion.releaseStop()
         await drain()
-        XCTAssertEqual(coordinator.state, .failed("Navigation safety failure."))
+        XCTAssertEqual(coordinator.state, .failed("Navigation cancelled."))
         XCTAssertGreaterThanOrEqual(motion.stops, 3)
     }
 
@@ -1482,5 +1827,195 @@ final class FollowMeCoordinatorTests: XCTestCase {
             }
             _ = await coordinator.stop()
         }
+    }
+
+    func testInvalidAndFutureObservationTimestampsCannotBeRescuedByDiagnostics() async {
+        for timestamp in [Double.nan, Double.infinity, -Double.infinity, 0.001] {
+            let perception = FollowPerceptionFake()
+            let motion = FollowMotionFake()
+            let clock = ManualFollowClock()
+            var config = FollowMeConfiguration()
+            config.stationaryPauseSeconds = 0
+            config.departureRangeIncrease = 0
+            let sink = FollowDiagnosticRecordingSink()
+            let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+                configuration: config, eventSink: sink.append)
+            _ = await coordinator.start()
+            await drain()
+            perception.send(frame(1, at: timestamp, people: [person(1, at: timestamp)]))
+            await drain()
+            XCTAssertEqual(coordinator.perceptionIssue, .staleFrame)
+            XCTAssertTrue(motion.rotations.isEmpty)
+            XCTAssertTrue(motion.alignments.isEmpty)
+            XCTAssertTrue(motion.goals.isEmpty)
+            XCTAssertTrue(sink.records.contains { $0.event == "follow_frame" }, "Exercise enabled telemetry too")
+            _ = await coordinator.stop()
+        }
+    }
+
+    func testTenSecondReacquisitionDeadlineFencesRealSuspendedPulseWithoutExtension() async throws {
+        let perception = FollowPerceptionFake()
+        let clock = ManualFollowClock()
+        let sink = FollowDiagnosticRecordingSink()
+        let pulseGate = FollowDiagnosticSuspension()
+        let emitter = FollowDiagnosticEmitter(streamID: "reacquisition-deadline", monotonic: { clock.now },
+            utc: { Date(timeIntervalSince1970: clock.now) }, sink: sink.append)
+        var sends = 0
+        let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil },
+            sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { duration in
+                if duration == .milliseconds(200) { await pulseGate.suspend() }
+            }, diagnosticEmitter: emitter)
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        config.departureRangeIncrease = 0
+        let coordinator = FollowMeCoordinator(perception: perception,
+            motion: NavigationFollowMeMotion(navigation: controller), clock: clock,
+            configuration: config, eventSink: sink.append)
+        _ = await coordinator.start()
+        perception.send(frame(1, people: [person(1, y: 1.5)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .holdingDistance)
+        perception.send(frame(2))
+        await pulseGate.waitUntilEntered()
+        XCTAssertEqual(sends, 1)
+        for step in 1...19 {
+            let time = Double(step) / 2
+            clock.advance(to: time)
+            perception.send(frame(UInt64(step + 2), at: time))
+            await drain()
+        }
+        clock.advance(to: 9.999)
+        perception.send(frame(22, at: 9.999))
+        await drain()
+        XCTAssertEqual(coordinator.state, .reacquiring)
+        clock.advance(to: 10)
+        perception.send(frame(23, at: 10, people: [person(23, at: 10, y: 1.5)]))
+        await drain()
+        XCTAssertFalse(coordinator.isActive, "Deadline enforcement does not wait for the pulse")
+        XCTAssertTrue(sink.records.contains { $0.event == "follow_scan.cancel" })
+        XCTAssertEqual(sends, 1)
+        pulseGate.release()
+        await drain()
+        _ = await coordinator.stop()
+        clock.advance(to: 11)
+        perception.send(frame(24, at: 11, people: [person(24, at: 11, y: 1.5)]))
+        await drain()
+        let events = try sink.records.filter { $0.fields["payload"] != nil }.map {
+            try JSONSerialization.jsonObject(with: Data($0.fields["payload"]!.utf8)) as! [String: Any]
+        }
+        XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.operation_begin" }.count, 1)
+        XCTAssertEqual(events.first { $0["event"] as? String == "follow_scan.operation_begin" }?["phase"] as? String, "reacquiring")
+        XCTAssertEqual(events.first { $0["event"] as? String == "follow_scan.pulse_wait_end" }?["outcome"] as? String, "interrupted")
+        XCTAssertFalse(events.contains { $0["event"] as? String == "follow_scan.settle_begin" })
+        XCTAssertEqual(sends, 1, "Neither deadline nor stale completion permits another send")
+        XCTAssertEqual(controller.safetyState, .idle)
+    }
+
+    func testDetectionAtRealControllerSuspensionsFencesScanBeforeConfirmedAlignment() async throws {
+        for boundary in ["send", "pulse", "stop", "settle"] {
+            let perception = FollowPerceptionFake()
+            let clock = ManualFollowClock()
+            let sink = FollowDiagnosticRecordingSink()
+            let gate = FollowDiagnosticSuspension()
+            let alignmentGate = FollowDiagnosticSuspension()
+            let emitter = FollowDiagnosticEmitter(streamID: boundary, monotonic: { clock.now },
+                utc: { Date(timeIntervalSince1970: clock.now) }, sink: sink.append)
+            var sends = 0
+            var stops = 0
+            var waits: [Double] = []
+            let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
+                forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil },
+                sendCommand: { _ in
+                    sends += 1
+                    if sends == 1, boundary == "send" { await gate.suspend() }
+                    if sends == 2 { await alignmentGate.suspend() }
+                }, stopRover: {
+                    stops += 1
+                    if stops == 2, boundary == "stop" { await gate.suspend() }
+                }, sleep: { duration in
+                    let parts = duration.components
+                    let seconds = Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+                    waits.append(seconds)
+                    if (boundary == "pulse" && seconds == 0.2) || (boundary == "settle" && seconds == 0.3) {
+                        await gate.suspend()
+                    }
+                }, diagnosticEmitter: emitter)
+            let coordinator = FollowMeCoordinator(perception: perception,
+                motion: NavigationFollowMeMotion(navigation: controller), clock: clock, eventSink: sink.append)
+            _ = await coordinator.start()
+            await drain()
+            clock.advance(to: 5)
+            perception.send(frame(1, at: 5))
+            await gate.waitUntilEntered()
+            perception.send(frame(2, at: 5, people: [person(2, at: 5)]))
+            await drain()
+            XCTAssertEqual(coordinator.state, .aligning, boundary)
+            let captured = try sink.records.filter { $0.event == "follow_scan.cancel" }.map {
+                try JSONSerialization.jsonObject(with: Data($0.fields["payload"]!.utf8)) as! [String: Any]
+            }
+            XCTAssertEqual(captured.count, 1, boundary)
+            XCTAssertEqual(captured.first?["cancel_origin"] as? String, "detection", boundary)
+            XCTAssertEqual(captured.first?["fenced"] as? Bool, true, boundary)
+            XCTAssertEqual(sends, 1, "No alignment send before the suspended scan drains: \(boundary)")
+            gate.release()
+            await alignmentGate.waitUntilEntered()
+            let events = try sink.records.filter { $0.fields["payload"] != nil }.map {
+                try JSONSerialization.jsonObject(with: Data($0.fields["payload"]!.utf8)) as! [String: Any]
+            }
+            XCTAssertTrue(events.contains {
+                $0["event"] as? String == "follow_scan.stop_response"
+                    && $0["stop_origin"] as? String == "detection"
+                    && $0["stop_outcome"] as? String == "confirmed"
+            }, "Controller confirmation must precede continuous alignment: \(boundary)")
+            XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.operation_begin" }.count, 1)
+            XCTAssertEqual(sends, 2, "One scan send, then one continuous alignment send")
+            if boundary == "send" { XCTAssertTrue(waits.isEmpty) }
+            if boundary == "pulse" || boundary == "stop" { XCTAssertEqual(waits, [0.2]) }
+            if boundary == "settle" { XCTAssertEqual(waits, [0.2, 0.3]) }
+            coordinator.inhibitMotion()
+            let terminalStop = Task { await coordinator.stop() }
+            await drain()
+            alignmentGate.release()
+            _ = await terminalStop.value
+            await drain()
+            XCTAssertEqual(sends, 2, "Old scan/alignment cannot authorize another command")
+            XCTAssertEqual(controller.safetyState, .idle)
+        }
+    }
+
+    func testDetectionFencesSuspendedAckBeforeQueuedAlignmentTaskCanRun() async {
+        let perception = FollowPerceptionFake()
+        let clock = ManualFollowClock()
+        let ackGate = FollowDiagnosticSuspension()
+        let sink = FollowDiagnosticRecordingSink()
+        var scanSends = 0
+        let emitter = FollowDiagnosticEmitter(streamID: "detection-ack-race", monotonic: { clock.now },
+            utc: { Date(timeIntervalSince1970: clock.now) }, sink: { event, fields in
+                sink.append(event, fields: fields)
+                if event == "follow_scan.send_begin" { scanSends += 1 }
+            })
+        let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
+                if !ackGate.entered { await ackGate.suspend() }
+                return nil
+            }, sendCommand: { _ in }, stopRover: {}, sleep: { _ in await Task.yield() },
+            diagnosticEmitter: emitter)
+        let coordinator = FollowMeCoordinator(perception: perception,
+            motion: NavigationFollowMeMotion(navigation: controller), clock: clock, eventSink: { event, fields in
+                sink.append(event, fields: fields)
+                // Queue the controller's ack return at the observed detection transition,
+                // before the asynchronously scheduled alignment/confirmation owners run.
+                if event == "follow_state", fields["state"] == "aligning" { ackGate.release() }
+            })
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5))
+        await ackGate.waitUntilEntered()
+        perception.send(frame(2, at: 5, people: [person(2, at: 5, x: 4, y: 0)]))
+        await drain()
+        XCTAssertEqual(scanSends, 0, "An eligible detection cannot authorize a queued scan acknowledgement to send")
+        _ = await coordinator.stop()
     }
 }

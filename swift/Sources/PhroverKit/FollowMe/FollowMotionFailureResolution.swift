@@ -1,0 +1,94 @@
+import Foundation
+
+/// A value-only record. The coordinator owns retention and motor-stop authority.
+struct FollowMotionFailureResolution {
+    struct Key: Hashable {
+        let generation: UInt64
+        let operationID: UInt64
+    }
+    private(set) var context: FollowMotionOperationContext
+    private(set) var primaryReason: NavigationFailure
+    private(set) var stopOutcome: FollowMotionStopOutcome = .unknown
+    private(set) var deduplicated = false
+    private var sources: Set<String> = []
+    var deliveriesDrained: Bool {
+        sources.contains(FollowMotionDeliverySource.stream.rawValue)
+            && sources.contains(FollowMotionDeliverySource.result.rawValue)
+            && sources.contains(FollowMotionDeliverySource.confirmation.rawValue)
+    }
+    var key: Key? {
+        guard let generation = context.request?.sessionGeneration,
+              let operationID = context.controllerOperationID else { return nil }
+        return Key(generation: generation, operationID: operationID)
+    }
+
+    init(_ delivery: FollowMotionFailureDelivery) {
+        context = delivery.context
+        primaryReason = delivery.reason
+        consume(delivery)
+    }
+    mutating func consume(_ delivery: FollowMotionFailureDelivery) {
+        if let key {
+            guard delivery.context.request?.sessionGeneration == key.generation,
+                  delivery.context.controllerOperationID == key.operationID else { return }
+        }
+        guard delivery.context.request?.sessionGeneration == context.request?.sessionGeneration,
+              delivery.context.controllerOperationID == context.controllerOperationID else { return }
+        if key == nil {
+            guard delivery.context.request?.requestToken == context.request?.requestToken else { return }
+        }
+        let previousReason = primaryReason
+        let previousStop = stopOutcome
+        let seen = !sources.isEmpty
+        if primaryReason == .commandFailed || primaryReason == .cancelled {
+            if delivery.reason != .cancelled { primaryReason = delivery.reason }
+        }
+        // Pending/cancellation/unknown cannot revoke an acknowledgement. Failed is sticky.
+        if stopOutcome != .failed {
+            switch delivery.stopOutcome {
+            case .failed: stopOutcome = .failed
+            case .confirmed where !delivery.stale: stopOutcome = .confirmed
+            case .pending where stopOutcome == .unknown: stopOutcome = .pending
+            default: break
+            }
+        }
+        deduplicated = seen && previousReason == primaryReason && previousStop == stopOutcome
+        sources.insert(delivery.source.rawValue)
+    }
+    var diagnosticReason: String {
+        if primaryReason == .stalled, context.purpose == .followScan { return "no_yaw_progress" }
+        switch primaryReason {
+        case .noPose: return "no_pose"
+        case .noPath: return "no_path"
+        case .pathRejected: return "path_rejected"
+        case .obstacle: return "obstacle"
+        case .commsLost: return "comms_lost"
+        case .tipping: return "tipping"
+        case .stalled: return "stalled"
+        case .commandFailed: return "transport_failed"
+        case .trackingLost: return "tracking_lost"
+        case .cancelled: return "cancelled"
+        }
+    }
+    var priority: Int { stopOutcome == .failed ? 3 : (diagnosticReason == "no_yaw_progress" ? 2 : 1) }
+    var message: String {
+        if stopOutcome == .failed { return "Motor stop could not be confirmed. Motion is blocked." }
+        if diagnosticReason == "no_yaw_progress" {
+            return stopOutcome == .confirmed
+                ? "Search rotation stopped: insufficient measured yaw progress. Stop confirmed. Restart following to try again."
+                : "Search rotation stopped: insufficient measured yaw progress. Confirming motor stop…"
+        }
+        switch primaryReason {
+        case .noPose: return "Rover pose unavailable. Wait for AR tracking to recover."
+        case .trackingLost: return "AR tracking lost. Wait for tracking to recover."
+        case .obstacle: return "Obstacle detected. Motion stopped."
+        case .commsLost: return "Rover communication lost. Motion stopped."
+        case .tipping: return "Rover tipping detected. Motion stopped."
+        case .stalled: return "Navigation stopped: insufficient measured progress."
+        case .noPath: return "No navigation path available."
+        case .pathRejected: return "Navigation path rejected."
+        case .commandFailed: return "Navigation command failed."
+        case .cancelled: return "Navigation cancelled."
+        }
+    }
+}

@@ -355,6 +355,7 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
 
     func testThirdAcceptedSampleEmitsContextualProgressBeforeAcceptance() async {
         let manager = ARSessionManager()
+        let processed = (1...3).map { expectation(description: "Sample \($0) processed") }
         let snapshot = makeSnapshot(generation: 0, sequence: 1)
         let corners = OrientedMarkerCorners(
             topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
@@ -372,21 +373,27 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
             var events: [SilentSearchCalibrationEvent] = []
             for await event in stream {
                 events.append(event)
+                if case let .progress(_, count) = event {
+                    processed[count - 1].fulfill()
+                }
             }
             return events
         }
         await Task.yield()
 
-        for timestamp in [1.0, 1.1, 1.2] {
+        for (index, timestamp) in [1.0, 1.1, 1.2].enumerated() {
             manager.ingestForTesting(
                 image: snapshot.image, timestamp: timestamp,
                 cameraTransform: snapshot.cameraTransform,
                 intrinsics: snapshot.cameraIntrinsics, imageResolution: snapshot.imageResolution,
                 depthMap: snapshot.depthMap, trackingQuality: .normal
             )
-            await Task.yield()
+            // The source intentionally coalesces frames while grounding yields.
+            // Progress acknowledges processing; a scheduler yield does not.
+            await fulfillment(of: [processed[index]], timeout: 1)
         }
 
+        calibrator.cancel()
         let events = await received.value
         let context = SilentSearchCalibrationFrameContext(
             frameID: ARFrameID(generation: 0, sequence: 3), monotonicTimestamp: 1.2
@@ -402,6 +409,83 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
             .progress(context: context, acceptedFrameCount: 3),
             .accepted(frame),
         ])
+    }
+
+    func testFramesCoalesceWhileGroundingAndOnlyProcessedSamplesCount() async {
+        let manager = ARSessionManager()
+        let snapshot = makeSnapshot(generation: 0, sequence: 1)
+        let processed = (1...3).map { expectation(description: "Sample \($0) processed") }
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            grounder: { observation, frame, markerID, generation in
+                if frame.id.sequence == 1 {
+                    // Keep processing frame 1 while two newer snapshots arrive.
+                    // bufferingNewest(1) must replace frame 2 with frame 3.
+                    for timestamp in [1.1, 1.2] {
+                        manager.ingestForTesting(
+                            image: snapshot.image, timestamp: timestamp,
+                            cameraTransform: snapshot.cameraTransform,
+                            intrinsics: snapshot.cameraIntrinsics,
+                            imageResolution: snapshot.imageResolution,
+                            depthMap: snapshot.depthMap, trackingQuality: .normal
+                        )
+                    }
+                }
+                return ARSharedMissionFrameCalibrator.ground(
+                    observation: observation, in: frame,
+                    expectedMarkerID: markerID, sessionGeneration: generation
+                )
+            },
+            scanner: { frame in
+                [OpticalObservation(
+                    payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                    frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                    corners: corners
+                )]
+            }
+        )
+        let collector = CalibrationEventCollector()
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream {
+                collector.append(event)
+                if case let .progress(_, count) = event { processed[count - 1].fulfill() }
+            }
+        }
+        await Task.yield()
+        manager.ingestForTesting(
+            image: snapshot.image, timestamp: 1,
+            cameraTransform: snapshot.cameraTransform, intrinsics: snapshot.cameraIntrinsics,
+            imageResolution: snapshot.imageResolution, depthMap: snapshot.depthMap,
+            trackingQuality: .normal
+        )
+        await fulfillment(of: Array(processed.prefix(2)), timeout: 1)
+        XCTAssertEqual(collector.events.compactMap { event -> UInt64? in
+            guard case let .progress(context, _) = event else { return nil }
+            return context.frameID.sequence
+        }, [1, 3])
+        XCTAssertFalse(collector.events.contains { if case .accepted = $0 { true } else { false } })
+
+        manager.ingestForTesting(
+            image: snapshot.image, timestamp: 1.3,
+            cameraTransform: snapshot.cameraTransform, intrinsics: snapshot.cameraIntrinsics,
+            imageResolution: snapshot.imageResolution, depthMap: snapshot.depthMap,
+            trackingQuality: .normal
+        )
+        await fulfillment(of: [processed[2]], timeout: 1)
+        calibrator.cancel()
+        await consumer.value
+        XCTAssertEqual(collector.events.compactMap { event -> UInt64? in
+            guard case let .progress(context, _) = event else { return nil }
+            return context.frameID.sequence
+        }, [1, 3, 4])
+        guard case .accepted = collector.events.last else {
+            return XCTFail("Expected acceptance only after a third processed sample")
+        }
     }
 
     func testScannerFailuresAreExplicitAndConsecutiveFailuresAreDeduplicated() async {
@@ -452,8 +536,10 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         enum ScannerFailure: Error { case failed }
         let manager = ARSessionManager()
         let scans = ScanCounter()
+        let processed = (1...3).map { expectation(description: "Scan \($0) processed") }
         let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { _ in
             scans.increment()
+            processed[scans.value - 1].fulfill()
             if scans.value == 1 { throw ScannerFailure.failed }
             return []
         }
@@ -464,7 +550,7 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         }
         await Task.yield()
 
-        for timestamp in [1.0, 2.0, 3.0] {
+        for (index, timestamp) in [1.0, 2.0, 3.0].enumerated() {
             manager.ingestForTesting(
                 image: makeImage(), timestamp: timestamp,
                 cameraTransform: matrix_identity_float4x4,
@@ -472,11 +558,12 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
                 imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
                 trackingQuality: .normal
             )
-            await Task.yield()
+            await fulfillment(of: [processed[index]], timeout: 1)
         }
 
-        await eventually { scans.value == 3 }
-        await eventually { collector.events.count == 2 }
+        // Drain the stream so the assertion includes every third-frame event.
+        calibrator.cancel()
+        await consumer.value
         XCTAssertEqual(collector.events, [
             .feedback(.scannerFailed(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
@@ -485,7 +572,57 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
                 frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
             ))),
         ])
-        consumer.cancel()
+    }
+
+    func testCleanEmptyScansOnlyCompletePendingBackendDiagnosticCycle() async {
+        let manager = ARSessionManager()
+        let scans = ScanCounter()
+        let processed = (1...4).map { expectation(description: "Scan \($0) processed") }
+        let diagnostic = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .right,
+            errorDomain: "VisionStableDomain", errorCode: 17
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            detailedScanner: { _ in
+                scans.increment()
+                processed[scans.value - 1].fulfill()
+                return OpticalScanOutcome(
+                    observations: [], diagnostics: scans.value == 1 || scans.value == 4 ? [diagnostic] : []
+                )
+            }
+        )
+        let collector = CalibrationEventCollector()
+        let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
+        let consumer = Task {
+            for await event in stream { collector.append(event) }
+        }
+        await Task.yield()
+
+        for index in 0..<4 {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: Double(index + 1),
+                cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
+                trackingQuality: .normal
+            )
+            await fulfillment(of: [processed[index]], timeout: 1)
+        }
+        calibrator.cancel()
+        await consumer.value
+
+        XCTAssertEqual(collector.events, [
+            .feedback(.scannerBackendFailed(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
+            ), diagnostic: diagnostic)),
+            .feedback(.scanCompleted(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
+            ))),
+            .feedback(.scannerBackendFailed(context: .init(
+                frameID: ARFrameID(generation: 0, sequence: 4), monotonicTimestamp: 4
+            ), diagnostic: diagnostic)),
+        ])
     }
 
     func testEmptyDetailedFallbackRestoresWaitingGuidanceAfterScannerFailure() async {
@@ -539,11 +676,13 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
 
     func testSuccessfulEmptyScanClearsWrongMarkerFailureOnce() async {
         let manager = ARSessionManager()
+        let processed = (1...3).map { expectation(description: "Scan \($0) processed") }
         let corners = OrientedMarkerCorners(
             topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
             bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
         )
         let calibrator = ARSharedMissionFrameCalibrator(sessionManager: manager) { frame in
+            processed[Int(frame.monotonicTimestamp) - 1].fulfill()
             guard frame.monotonicTimestamp == 1 else { return [] }
             return [OpticalObservation(
                 payload: Data("PHROVER-CAL|1|OTHER".utf8), frameID: frame.frameID,
@@ -557,7 +696,7 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         }
         await Task.yield()
 
-        for timestamp in [1.0, 2.0, 3.0] {
+        for (index, timestamp) in [1.0, 2.0, 3.0].enumerated() {
             manager.ingestForTesting(
                 image: makeImage(), timestamp: timestamp,
                 cameraTransform: matrix_identity_float4x4,
@@ -565,10 +704,11 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
                 imageResolution: CGSize(width: 100, height: 100), depthMap: nil,
                 trackingQuality: .normal
             )
-            await Task.yield()
+            await fulfillment(of: [processed[index]], timeout: 1)
         }
 
-        await eventually { collector.events.count == 2 }
+        calibrator.cancel()
+        await consumer.value
         XCTAssertEqual(collector.events, [
             .feedback(.groundingFailed(context: .init(
                 frameID: ARFrameID(generation: 0, sequence: 1), monotonicTimestamp: 1
@@ -577,7 +717,6 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
                 frameID: ARFrameID(generation: 0, sequence: 2), monotonicTimestamp: 2
             ))),
         ])
-        consumer.cancel()
     }
 
     func testQRLossEmitsAfterHalfASecondWithoutAnotherSnapshotAndDetectionCanResume() async {

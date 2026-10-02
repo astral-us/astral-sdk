@@ -2,9 +2,78 @@ import XCTest
 @testable import PhroverKit
 
 final class RoverControlTests: XCTestCase {
+    func testUnknownReceiptDoesNotClaimTransportFacts() {
+        XCTAssertNil(RoverCommandDiagnosticReceipt.unknown.httpStatus)
+        XCTAssertNil(RoverCommandDiagnosticReceipt.unknown.acknowledged)
+        XCTAssertNil(RoverCommandDiagnosticReceipt.unknown.acknowledgementUTC)
+        XCTAssertNil(RoverCommandDiagnosticReceipt.unknown.attempts)
+        XCTAssertEqual(RoverCommandDiagnosticReceipt.unknown.outcome, "unknown")
+    }
+
+    func testReceiptsPreserveRealAcceptedStatusAndAckClock() async throws {
+        for status in [200, 204, 299] {
+            StubURLProtocol.reset()
+            StubURLProtocol.results = [.success((Data(), HTTPURLResponse(
+                url: URL(string: "http://192.168.4.1/js")!, statusCode: status,
+                httpVersion: nil, headerFields: nil)!))]
+            let control = RoverControl(session: URLSession(configuration: .stubbed))
+            let result = await control.sendNavigationWithReceipt(.init(left: -0.1, right: 0.1))
+            XCTAssertNil(result.failure)
+            XCTAssertEqual(result.receipt.httpStatus, status)
+            XCTAssertEqual(result.receipt.acknowledged, true)
+            XCTAssertEqual(result.receipt.attempts, 1)
+            let ack = await control.lastAckAt
+            XCTAssertEqual(result.receipt.acknowledgementUTC, ack)
+            XCTAssertNotNil(ack)
+        }
+    }
+
     override func tearDown() {
         StubURLProtocol.reset()
         super.tearDown()
+    }
+
+    func testFailureReceiptsKeepActualStatusAttemptsAndOriginalErrors() async throws {
+        let url = URL(string: "http://192.168.4.1/js")!
+        let cases: [(Result<(Data, URLResponse), Error>, Int?, Int, String)] = [
+            (.success((Data(), HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: nil)!)), 503, 1, "failed"),
+            (.success((Data(), URLResponse(url: url, mimeType: nil, expectedContentLength: 0, textEncodingName: nil))), nil, 1, "failed"),
+            (.failure(URLError(.timedOut)), nil, 3, "failed"),
+            (.failure(URLError(.cancelled)), nil, 1, "cancelled")
+        ]
+        for (response, status, attempts, outcome) in cases {
+            StubURLProtocol.reset()
+            StubURLProtocol.results = Array(repeating: response, count: attempts)
+            let control = RoverControl(session: URLSession(configuration: .stubbed))
+            let result = await control.sendNavigationWithReceipt(.init(left: -0.1, right: 0.1))
+            XCTAssertNotNil(result.failure)
+            XCTAssertThrowsError(try result.get())
+            XCTAssertEqual(result.receipt.httpStatus, status)
+            XCTAssertEqual(result.receipt.attempts, attempts)
+            XCTAssertEqual(result.receipt.outcome, outcome)
+            XCTAssertEqual(result.receipt.acknowledged, false)
+            XCTAssertNil(result.receipt.acknowledgementUTC)
+            XCTAssertEqual(StubURLProtocol.requestCount, attempts)
+            let ack = await control.lastAckAt
+            XCTAssertNil(ack)
+        }
+    }
+
+    func testStopAndRetryReceiptsDescribeTheirOwnAcknowledgement() async throws {
+        StubURLProtocol.results = [.failure(URLError(.timedOut)), .success((Data(), HTTPURLResponse(
+            url: URL(string: "http://192.168.4.1/js")!, statusCode: 204, httpVersion: nil, headerFields: nil)!))]
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let result = await control.stopWithReceipt()
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.receipt.httpStatus, 204)
+        XCTAssertEqual(result.receipt.attempts, 2)
+        XCTAssertEqual(result.receipt.acknowledged, true)
+        XCTAssertEqual(result.receipt.outcome, "acknowledged")
+        let url = try XCTUnwrap(StubURLProtocol.lastRequest?.url)
+        let json = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["T"] as? Int, 0)
+        XCTAssertNil(payload["L"])
     }
 
     func testRetriesTransientCommandTimeoutBeforeFailingNavigationLink() async throws {
@@ -169,7 +238,7 @@ private extension URLSessionConfiguration {
 }
 
 private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var results: [Result<(Data, HTTPURLResponse), Error>] = []
+    nonisolated(unsafe) static var results: [Result<(Data, URLResponse), Error>] = []
     nonisolated(unsafe) static var requestCount = 0
     nonisolated(unsafe) static var lastRequest: URLRequest?
 

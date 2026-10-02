@@ -24,6 +24,14 @@ public actor RoverControl {
 
     // MARK: - Motion
 
+    func sendNavigationWithReceipt(_ cmd: WheelCommand) async -> RoverCommandDiagnosticResult {
+        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left])
+    }
+
+    func stopWithReceipt() async -> RoverCommandDiagnosticResult {
+        await sendJSONDiagnostic(["T": RoverConfig.Opcode.emergencyStop])
+    }
+
     /// Stream a differential-drive command. The single source of motion for autonomy.
     public func send(_ cmd: WheelCommand) async throws {
         try await sendJSON(["T": RoverConfig.Opcode.speedControl,
@@ -37,14 +45,12 @@ public actor RoverControl {
         // RoverNav uses mathematical CCW-positive yaw. ARKit's x/world-z ground plane
         // reports the opposite physical turn sign, so swap wheel channels only at the
         // WAVE ROVER boundary. Forward/reverse commands are unchanged by the swap.
-        try await sendJSON(["T": RoverConfig.Opcode.speedControl,
-                            "L": cmd.right,
-                            "R": cmd.left])
+        _ = try await sendNavigationWithReceipt(cmd).get()
     }
 
     /// Hard stop. Safe to call repeatedly; used by e-stop and the watchdog.
     public func stop() async throws {
-        try await sendJSON(["T": RoverConfig.Opcode.emergencyStop])
+        _ = try await stopWithReceipt().get()
     }
 
     /// Ask the base to stream continuous chassis + IMU feedback (parsed by `RoverFeedback`).
@@ -83,14 +89,20 @@ public actor RoverControl {
     // MARK: - Transport
 
     private func sendJSON(_ payload: [String: Any]) async throws {
-        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        _ = try await sendJSONDiagnostic(payload).get()
+    }
+
+    private func sendJSONDiagnostic(_ payload: [String: Any]) async -> RoverCommandDiagnosticResult {
+        let data: Data
+        do { data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) }
+        catch { return .init(receipt: .unknown, failure: error) }
         guard let json = String(data: data, encoding: .utf8) else {
-            throw RoverControlError.encodingFailed
+            return .init(receipt: .unknown, failure: RoverControlError.encodingFailed)
         }
         var comps = URLComponents(url: baseURL.appendingPathComponent(RoverConfig.jsonCommandPath),
                                   resolvingAgainstBaseURL: false)!
         comps.queryItems = [URLQueryItem(name: "json", value: json)]
-        guard let url = comps.url else { throw RoverControlError.encodingFailed }
+        guard let url = comps.url else { return .init(receipt: .unknown, failure: RoverControlError.encodingFailed) }
 
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
@@ -104,6 +116,7 @@ public actor RoverControl {
 
         for attempt in 1...attempts {
             var didLogResponse = false
+            var statusCode: Int?
             do {
                 let (_, response) = try await session.data(for: req)
                 guard let http = response as? HTTPURLResponse else {
@@ -121,11 +134,13 @@ public actor RoverControl {
                                                                                               statusCode: http.statusCode,
                                                                                               error: nil))
                 didLogResponse = true
+                statusCode = http.statusCode
                 guard (200...299).contains(http.statusCode) else {
                     throw RoverControlError.serverError(http.statusCode)
                 }
                 lastAckAt = Date()
-                return
+                return .init(receipt: .init(httpStatus: http.statusCode, acknowledged: true,
+                    acknowledgementUTC: lastAckAt, attempts: attempt, outcome: "acknowledged"), failure: nil)
             } catch {
                 lastError = error
                 if !didLogResponse {
@@ -136,7 +151,10 @@ public actor RoverControl {
                                                                                                   error: error))
                 }
                 guard attempt < attempts, Self.isRetryableTransportError(error) else {
-                    throw error
+                    let cancelled = error is CancellationError || (error as? URLError)?.code == .cancelled
+                    return .init(receipt: .init(httpStatus: statusCode, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: attempt,
+                        outcome: cancelled ? "cancelled" : "failed"), failure: error)
                 }
 
                 RuntimeFileLog.append("rover_command_retry", fields: [
@@ -148,7 +166,7 @@ public actor RoverControl {
             }
         }
 
-        throw lastError ?? RoverControlError.invalidResponse
+        return .init(receipt: .unknown, failure: lastError ?? RoverControlError.invalidResponse)
     }
 
     static func requestLogFields(url: URL,

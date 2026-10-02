@@ -12,6 +12,7 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
     @MainActor
     private final class CalibrationAttemptState {
         var lastFailure: SilentSearchCalibrationIssue?
+        var hasPendingScannerDiagnostics = false
 
         func markerExpired() {
             switch lastFailure {
@@ -105,17 +106,27 @@ public final class ARSharedMissionFrameCalibrator: SilentSearchCalibrating {
                     let scans: [OpticalObservation]
                     do {
                         let outcome = try scanner(opticalFrame)
+                        let completesDiagnosticCycle = attempt.hasPendingScannerDiagnostics
                         for diagnostic in outcome.diagnostics {
                             continuation.yield(.feedback(.scannerBackendFailed(
                                 context: context, diagnostic: diagnostic
                             )))
                         }
                         scans = outcome.observations
+                        // Same-frame guidance/marker feedback cannot clear diagnostics
+                        // in the consumer. Retain the obligation until a later clean scan.
+                        if !outcome.diagnostics.isEmpty {
+                            attempt.hasPendingScannerDiagnostics = true
+                        }
                         if scans.isEmpty, attempt.lastFailure != nil {
                             continuation.yield(.feedback(.waitingForMarker(context: context)))
                             attempt.lastFailure = nil
-                        } else if scans.isEmpty, outcome.diagnostics.isEmpty {
+                            if outcome.diagnostics.isEmpty {
+                                attempt.hasPendingScannerDiagnostics = false
+                            }
+                        } else if scans.isEmpty, outcome.diagnostics.isEmpty, completesDiagnosticCycle {
                             continuation.yield(.feedback(.scanCompleted(context: context)))
+                            attempt.hasPendingScannerDiagnostics = false
                         }
                     } catch {
                         if attempt.lastFailure != .scannerFailure {

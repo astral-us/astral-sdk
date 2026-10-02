@@ -61,6 +61,7 @@ final class FollowMotionFake: FollowMeMotion {
     private(set) var goals: [Vec2] = []
     private(set) var clearances: [Double] = []
     private(set) var stops = 0
+    private(set) var stopOrigins: [FollowMotionStopOrigin] = []
     var stopError = false
     var suspendStop = false
     var suspendRotation = false
@@ -82,6 +83,7 @@ final class FollowMotionFake: FollowMeMotion {
         return .arrived
     }
     func stopAndConfirm() async throws {
+        stopOrigins.append(FollowMotionTaskScope.stopOrigin)
         stops += 1
         if suspendStop { await withCheckedContinuation { stopWaiter = $0 } }
         if stopError { throw StopError.unconfirmed }
@@ -94,4 +96,39 @@ final class FollowMotionFake: FollowMeMotion {
     }
     func safety(_ state: NavigationSafetyState) { safetyContinuation?.yield(state) }
     private enum StopError: Error { case unconfirmed }
+}
+
+/// A contextual companion over the legacy fake; controller facts remain unknown.
+@MainActor
+final class ContextualFollowMotionFake: FollowMeContextualMotion {
+    let legacy = FollowMotionFake()
+    private(set) var requests: [FollowMotionRequest] = []
+    private(set) var contexts: [FollowMotionRequestContext] = []
+    private(set) var legacySubscriptions = 0
+    private(set) var contextualSubscriptions = 0
+    private var failureContinuation: AsyncStream<FollowMotionFailureDelivery>.Continuation?
+    var resultOverride: FollowMotionResult?
+
+    func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
+        requests.append(request)
+        contexts.append(context)
+        let result = await legacy.performContextual(request, context: context)
+        return resultOverride ?? result
+    }
+    func motionFailures() -> AsyncStream<FollowMotionFailureDelivery> {
+        contextualSubscriptions += 1
+        return AsyncStream { failureContinuation = $0 }
+    }
+    func sendFailure(_ failure: FollowMotionFailureDelivery) { failureContinuation?.yield(failure) }
+    func safetyStates() -> AsyncStream<NavigationSafetyState> {
+        legacySubscriptions += 1
+        return legacy.safetyStates()
+    }
+    func rotateForScan(by angle: Double) async -> NavigationResult { await legacy.rotateForScan(by: angle) }
+    func alignTowardPerson(by angle: Double) async -> NavigationResult { await legacy.alignTowardPerson(by: angle) }
+    func signalReady() async -> NavigationResult { await legacy.signalReady() }
+    func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) async -> NavigationResult {
+        await legacy.navigate(to: goal, stoppingAtForwardClearance: clearance)
+    }
+    func stopAndConfirm() async throws { try await legacy.stopAndConfirm() }
 }

@@ -80,6 +80,60 @@ public protocol FollowMeMotion {
     func safetyStates() -> AsyncStream<NavigationSafetyState>
 }
 
+/// Optional internal companion. Original public conformers acquire no requirements.
+@MainActor
+protocol FollowMeContextualMotion: FollowMeMotion {
+    func inhibitScanContinuation(origin: FollowMotionStopOrigin)
+    func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult
+    func motionFailures() -> AsyncStream<FollowMotionFailureDelivery>
+}
+
+extension FollowMeMotion {
+    func performContextual(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
+        if let contextual = self as? any FollowMeContextualMotion { return await contextual.perform(request, context: context) }
+        return await performLegacy(request, context: context)
+    }
+
+    fileprivate func performLegacy(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
+        let result: NavigationResult
+        switch request {
+        case .scan(let angle): result = await rotateForScan(by: angle)
+        case .alignment(let angle): result = await alignTowardPerson(by: angle)
+        case .ready: result = await signalReady()
+        case .following(let goal, let clearance): result = await navigate(to: goal, stoppingAtForwardClearance: clearance)
+        }
+        let operation = FollowMotionOperationContext(request: context, controllerOperationID: nil, purpose: nil,
+            profile: nil, requestedRotation: request.requestedRotation)
+        let failure: FollowMotionFailureDelivery?
+        if case .failed(let reason) = result {
+            failure = .init(context: operation, reason: reason, stopOutcome: .unknown, source: .result)
+        } else { failure = nil }
+        return .init(result: result, context: operation, failure: failure)
+    }
+}
+
+extension FollowMeContextualMotion {
+    func inhibitScanContinuation(origin: FollowMotionStopOrigin) {}
+
+    func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
+        await performLegacy(request, context: context)
+    }
+    func motionFailures() -> AsyncStream<FollowMotionFailureDelivery> {
+        let states = safetyStates()
+        return AsyncStream { continuation in
+            let observer = Task { @MainActor in
+                for await state in states {
+                    if case .failed(let reason) = state {
+                        continuation.yield(.init(context: .unknown, reason: reason, stopOutcome: .unknown, source: .stream))
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in observer.cancel() }
+        }
+    }
+}
+
 @MainActor
 public protocol FollowMeClock {
     var now: TimeInterval { get }

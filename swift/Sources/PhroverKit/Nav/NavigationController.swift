@@ -50,6 +50,114 @@ public final class NavigationController {
     private var replanCounter = 0
     private var activePolicy: (any PathAdmissibilityPolicy)?
     private var safetyStateContinuations: [UUID: AsyncStream<NavigationSafetyState>.Continuation] = [:]
+    private var nextFollowOperationID: UInt64 = 0
+    private var activeFollowEvidence: FollowMotionOperationEvidence?
+    private var terminalFollowEvidence: FollowMotionOperationEvidence?
+    private var followFailureContinuations: [UUID: AsyncStream<FollowMotionFailureDelivery>.Continuation] = [:]
+    private var diagnosticEmitter: FollowDiagnosticEmitter?
+
+    func followMotionFailures() -> AsyncStream<FollowMotionFailureDelivery> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            followFailureContinuations[id] = continuation
+            if case .failed(let reason) = safetyState {
+                // Current safety snapshot, not an inferred historical follow operation.
+                continuation.yield(.init(context: .unknown, reason: reason,
+                    stopOutcome: stopUnconfirmed ? .failed : .unknown, source: .stream))
+            }
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { @MainActor in self?.followFailureContinuations[id] = nil }
+            }
+        }
+    }
+
+    func performFollowMotion(_ request: FollowMotionRequest, context: FollowMotionRequestContext?) async -> FollowMotionResult {
+        nextFollowOperationID &+= 1 // Controller-owned identity reserved before the first suspension.
+        let captured = FollowMotionOperationContext(request: context, controllerOperationID: nextFollowOperationID,
+            purpose: request.purpose, profile: request.purpose == .followScan ? RoverConfig.followScanRotationProfile : nil,
+            requestedRotation: request.requestedRotation)
+        let evidence = FollowMotionOperationEvidence(context: captured)
+        if request.purpose == .followScan, let diagnosticEmitter {
+            evidence.scanTrace = FollowScanDiagnosticTrace(emitter: diagnosticEmitter)
+        }
+        if stopUnconfirmed { evidence.recordStop(.failed) }
+        if let previous = activeFollowEvidence {
+            previous.fenced = true
+            previous.scanTrace?.cancel(origin: "replacement", evidence: previous, latch: stopUnconfirmed)
+        }
+        terminalFollowEvidence = nil
+        activeFollowEvidence = evidence
+        evidence.scanTrace?.emit("operation_begin", evidence: evidence, latch: stopUnconfirmed)
+        return await withTaskCancellationHandler {
+            await FollowMotionTaskScope.$evidence.withValue(evidence) {
+                var result: NavigationResult
+                switch request {
+                case .scan(let angle): result = await rotateForFollowScan(by: angle)
+                case .alignment(let angle): result = await rotateForFollowAlignment(by: angle)
+                case .ready: result = await navigateForFollowReadySignal()
+                case .following(let goal, let clearance): result = await navigateForFollow(to: goal, stoppingAtForwardClearance: clearance)
+                }
+                if Task.isCancelled, let confirmation = beginCallerCancellation(for: evidence) {
+                    // Cancellation is inhibition, not acknowledgement. Freeze terminal
+                    // evidence only after the independently executing confirmation drains.
+                    let confirmed = await confirmation.value
+                    result = confirmed == false ? .failed(.commandFailed) : .cancelled
+                }
+                if result == .cancelled {
+                    evidence.fenced = true
+                    evidence.scanTrace?.cancel(origin: "task_cancellation", evidence: evidence, latch: stopUnconfirmed)
+                }
+                if case .failed(let reason) = result {
+                    evidence.recordFailure(reason)
+                    if !evidence.emittedFailure, let failure = evidence.failure(source: .stream) {
+                        evidence.scanTrace?.failure(reason, evidence: evidence, latch: stopUnconfirmed)
+                        deliverFollowFailure(failure)
+                        evidence.emittedFailure = true
+                    }
+                }
+                let terminal = evidence.result(result) // Freeze before clearing ownership or returning.
+                evidence.scanTrace?.emit("operation_complete", evidence: evidence, latch: stopUnconfirmed,
+                    outcome: result == .arrived ? "completed" : (result == .cancelled ? "cancelled" : "failed"))
+                if activeFollowEvidence === evidence {
+                    activeFollowEvidence = nil
+                    terminalFollowEvidence = evidence
+                }
+                return terminal
+            }
+        } onCancel: {
+            // onCancel is Sendable and can run off actor. One bounded actor hop
+            // requests controller-owned cleanup; it never sends motor commands.
+            Task { @MainActor [weak self] in
+                _ = self?.beginCallerCancellation(for: evidence)
+            }
+        }
+    }
+
+    private func beginCallerCancellation(for evidence: FollowMotionOperationEvidence) -> Task<Bool?, Never>? {
+        if let confirmation = evidence.callerCancellationStop { return confirmation }
+        guard activeFollowEvidence === evidence, evidence.ownedGeneration == operationGeneration,
+              !evidence.fenced else { return nil }
+        evidence.fenced = true
+        evidence.scanTrace?.cancel(origin: "task_cancellation", evidence: evidence, latch: stopUnconfirmed)
+        operationGeneration &+= 1
+        let reservation = operationGeneration
+        loop?.cancel()
+        let confirmation = Task { @MainActor () -> Bool? in
+            // A replacement may reserve the controller before this actor task runs.
+            // Stale cancellation must not cancel its loop or append another motor stop.
+            guard activeFollowEvidence === evidence, operationGeneration == reservation else { return nil }
+            do {
+                try await confirmStop(retryingFailedStop: true, evidence: evidence, origin: "independent")
+                return true
+            } catch { return false }
+        }
+        evidence.callerCancellationStop = confirmation
+        return confirmation
+    }
+
+    private func deliverFollowFailure(_ failure: FollowMotionFailureDelivery) {
+        for continuation in followFailureContinuations.values { continuation.yield(failure) }
+    }
 
     public func safetyStates() -> AsyncStream<NavigationSafetyState> {
         let id = UUID()
@@ -72,10 +180,13 @@ public final class NavigationController {
         }
         readySignalCostmap = { CostmapBuilder.build(from: ar.meshAnchors, center: $0) }
         currentLastAck = { await control.lastAckAt }
-        sendCommand = { try await control.sendNavigation($0) }
-        stopRover = { try await control.stop() }
+        sendCommand = Self.diagnosticSender(legacy: { try await control.sendNavigation($0) },
+            receipt: { await control.sendNavigationWithReceipt($0) })
+        stopRover = Self.diagnosticStopper(legacy: { try await control.stop() },
+            receipt: { await control.stopWithReceipt() })
         sleep = { try? await Task.sleep(for: $0) }
         now = Date.init
+        diagnosticEmitter = Self.runtimeDiagnosticEmitter()
     }
 
     init(currentPose: @escaping () -> Pose2D?,
@@ -86,16 +197,68 @@ public final class NavigationController {
          sendCommand: @escaping (WheelCommand) async throws -> Void,
          stopRover: @escaping () async throws -> Void,
          sleep: @escaping (Duration) async -> Void,
-         now: @escaping () -> Date = Date.init) {
+         now: @escaping () -> Date = Date.init,
+         sendCommandReceipt: ((WheelCommand) async -> RoverCommandDiagnosticResult)? = nil,
+         stopRoverReceipt: (() async -> RoverCommandDiagnosticResult)? = nil,
+         diagnosticEmitter: FollowDiagnosticEmitter? = nil) {
         self.currentPose = currentPose
         self.currentForwardClearance = forwardClearance
         self.makePlan = plan
         self.readySignalCostmap = readySignalCostmap
         self.currentLastAck = lastAckAt
-        self.sendCommand = sendCommand
-        self.stopRover = stopRover
+        self.sendCommand = Self.diagnosticSender(legacy: sendCommand, receipt: sendCommandReceipt)
+        self.stopRover = Self.diagnosticStopper(legacy: stopRover, receipt: stopRoverReceipt)
         self.sleep = sleep
         self.now = now
+        self.diagnosticEmitter = diagnosticEmitter ?? Self.runtimeDiagnosticEmitter()
+    }
+
+    private static func runtimeDiagnosticEmitter() -> FollowDiagnosticEmitter {
+        .init(streamID: UUID().uuidString, monotonic: { ProcessInfo.processInfo.systemUptime },
+            utc: Date.init, sink: { RuntimeFileLog.append($0, fields: $1) })
+    }
+
+    private static func diagnosticSender(
+        legacy: @escaping (WheelCommand) async throws -> Void,
+        receipt: ((WheelCommand) async -> RoverCommandDiagnosticResult)?
+    ) -> (WheelCommand) async throws -> Void {
+        { command in
+            let captured = FollowMotionTaskScope.evidence
+            if command.left != 0 || command.right != 0 { captured?.recordStop(.pending) }
+            if let receipt {
+                let response = await receipt(command)
+                captured?.recordCommandReceipt(response.receipt)
+                _ = try response.get()
+            } else {
+                do { try await legacy(command) }
+                catch { captured?.recordCommandReceipt(.unknown); throw error }
+                captured?.recordCommandReceipt(.unknown)
+            }
+        }
+    }
+
+    private static func diagnosticStopper(
+        legacy: @escaping () async throws -> Void,
+        receipt: (() async -> RoverCommandDiagnosticResult)?
+    ) -> () async throws -> Void {
+        {
+            let captured = FollowMotionTaskScope.evidence
+            if let receipt {
+                let response = await receipt()
+                FollowMotionTaskScope.stopReceiptCapture?.receipt = response.receipt
+                captured?.recordStopReceipt(response.receipt)
+                _ = try response.get()
+            } else {
+                do { try await legacy() }
+                catch {
+                    FollowMotionTaskScope.stopReceiptCapture?.receipt = .unknown
+                    captured?.recordStopReceipt(.unknown)
+                    throw error
+                }
+                FollowMotionTaskScope.stopReceiptCapture?.receipt = .unknown
+                captured?.recordStopReceipt(.unknown)
+            }
+        }
     }
 
     /// Begin autonomously driving to a nav-plane goal.
@@ -115,8 +278,15 @@ public final class NavigationController {
     ) async -> NavigationResult {
         operationGeneration &+= 1
         let reservation = operationGeneration
-        await cancelAndWait()
+        if stopConfirmation != nil {
+            // A follow caller may already be draining an independent stop.
+            // Do not bypass it through the legacy direct-stop cancellation path.
+            do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        } else {
+            await cancelAndWait()
+        }
         guard operationGeneration == reservation else { return .cancelled }
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
         return await startNavigation(
             to: goal, stoppingAtForwardClearance: clearance, policy: policy, cancellingCurrent: false
         ).value
@@ -126,8 +296,10 @@ public final class NavigationController {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
         operationGeneration &+= 1
         let reservation = operationGeneration
+        FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
-        guard operationGeneration == reservation else { return .cancelled }
+        guard operationGeneration == reservation, !Task.isCancelled,
+              FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
         let task = startNavigation(
             // This goal already stands off from the person. LiDAR clearance alone
             // cannot tell the person from a cart crossing in front of the rover;
@@ -136,6 +308,7 @@ public final class NavigationController {
             cancellingCurrent: false, isFollowGoal: true
         )
         let generation = operationGeneration
+        FollowMotionTaskScope.evidence?.ownedGeneration = generation
         let result = await task.value
         guard operationGeneration == generation else { return .cancelled }
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
@@ -147,6 +320,7 @@ public final class NavigationController {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
         operationGeneration &+= 1
         let reservation = operationGeneration
+        FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
         guard operationGeneration == reservation, !Task.isCancelled else { return .cancelled }
         guard let start = currentPose(), start.position.x.isFinite,
@@ -275,8 +449,13 @@ public final class NavigationController {
     public func rotateAndWait(by angle: Double) async -> NavigationResult {
         operationGeneration &+= 1
         let reservation = operationGeneration
-        await cancelAndWait()
+        if stopConfirmation != nil {
+            do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        } else {
+            await cancelAndWait()
+        }
         guard operationGeneration == reservation else { return .cancelled }
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
         operationGeneration &+= 1
         guard let startYaw = currentPose()?.yaw else {
             let result = NavigationResult.failed(.noPose)
@@ -311,12 +490,19 @@ public final class NavigationController {
     }
 
     public func rotateForFollowScan(by angle: Double) async -> NavigationResult {
+        if FollowMotionTaskScope.evidence == nil {
+            return await performFollowMotion(.scan(angle), context: nil).result
+        }
+        let profile = FollowMotionTaskScope.evidence?.initialContext.profile ?? RoverConfig.followScanRotationProfile
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
         operationGeneration &+= 1
         let reservation = operationGeneration
-        do { try await confirmStop() } catch { return .failed(.commandFailed) }
-        guard operationGeneration == reservation else { return .cancelled }
+        FollowMotionTaskScope.evidence?.ownedGeneration = reservation
+        do { try await confirmStop(origin: "independent") } catch { return .failed(.commandFailed) }
+        guard operationGeneration == reservation, !Task.isCancelled,
+              FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
         operationGeneration &+= 1
+        FollowMotionTaskScope.evidence?.ownedGeneration = operationGeneration
         guard let startYaw = currentPose()?.yaw else {
             let result = NavigationResult.failed(.noPose)
             finish(result)
@@ -324,12 +510,14 @@ public final class NavigationController {
         }
         state = .driving
         publishSafetyState(.moving)
-        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .followScan) }
+        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .followScan, followProfile: profile) }
         loop = task
         let result = await task.value
         guard operationGeneration == reservation + 1 else { return .cancelled }
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
-        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        do { try await confirmStop(origin: "final") } catch { return .failed(.commandFailed) }
+        guard operationGeneration == reservation + 1, !Task.isCancelled,
+              FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
         return result
     }
 
@@ -340,9 +528,12 @@ public final class NavigationController {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
         operationGeneration &+= 1
         let reservation = operationGeneration
+        FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
-        guard operationGeneration == reservation else { return .cancelled }
+        guard operationGeneration == reservation, !Task.isCancelled,
+              FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
         operationGeneration &+= 1
+        FollowMotionTaskScope.evidence?.ownedGeneration = operationGeneration
         guard let startYaw = currentPose()?.yaw else {
             let result = NavigationResult.failed(.noPose)
             finish(result)
@@ -360,16 +551,36 @@ public final class NavigationController {
     }
 
     /// Invalidate motion before waiting for the loop and an acknowledged motor stop.
-    public func stopAndConfirm() async throws {
+    /// Detection uses this synchronous fence before scheduling serialized confirmation.
+    /// Retain the loop so confirmation still drains all suspended transport work.
+    func inhibitFollowScanContinuation(origin: FollowMotionStopOrigin) {
+        guard let evidence = activeFollowEvidence, evidence.context.purpose == .followScan else { return }
+        evidence.fenced = true
+        evidence.scanTrace?.cancel(origin: origin.rawValue, evidence: evidence, latch: stopUnconfirmed)
         operationGeneration &+= 1
-        try await confirmStop(retryingFailedStop: true)
+        loop?.cancel()
     }
 
-    private func confirmStop(retryingFailedStop: Bool = false) async throws {
+    public func stopAndConfirm() async throws {
+        let evidence = activeFollowEvidence ?? terminalFollowEvidence
+        let origin = FollowMotionTaskScope.stopOrigin.rawValue
+        evidence?.fenced = true
+        if let evidence { evidence.scanTrace?.cancel(origin: origin, evidence: evidence, latch: stopUnconfirmed) }
+        operationGeneration &+= 1
+        try await confirmStop(retryingFailedStop: true, evidence: evidence, origin: origin)
+    }
+
+    private func confirmStop(retryingFailedStop: Bool = false, evidence: FollowMotionOperationEvidence? = nil,
+                             origin: String = "independent") async throws {
+        let captured = evidence ?? FollowMotionTaskScope.evidence
+        let trace = captured?.scanTrace
+        let token = captured.flatMap { trace?.beginStop(origin: origin, evidence: $0, latch: stopUnconfirmed) }
+        captured?.recordStop(.pending)
         let generation = operationGeneration
         let previousStop = stopConfirmation
         let previousLoop = loop
         previousLoop?.cancel()
+        let receiptCapture = FollowMotionStopReceiptCapture()
         let confirmation = Task { @MainActor in
             // Serialize stops so an older stop cannot race a newer motion command.
             if retryingFailedStop {
@@ -378,30 +589,77 @@ public final class NavigationController {
                 try await previousStop?.value
             }
             _ = await previousLoop?.value
-            try await stopRover()
+            try await FollowMotionTaskScope.$evidence.withValue(captured) {
+                try await FollowMotionTaskScope.$stopReceiptCapture.withValue(receiptCapture) { try await stopRover() }
+            }
         }
         stopConfirmation = confirmation
         do {
             try await confirmation.value
         } catch {
+            captured?.recordStop(.failed)
             stopUnconfirmed = true
             if operationGeneration == generation {
                 state = .failed("Rover stop could not be confirmed.")
-                publishSafetyState(.failed(.commandFailed))
+                publishSafetyState(.failed(.commandFailed), evidence: captured)
+            }
+            if let captured, let token {
+                trace?.endStop(token, origin: origin, evidence: captured, receipt: receiptCapture.receipt,
+                    latch: stopUnconfirmed, outcome: "failed")
             }
             throw error
         }
-        guard operationGeneration == generation else { return }
+        guard operationGeneration == generation else {
+            if let captured, let token {
+                trace?.endStop(token, origin: origin, evidence: captured, receipt: receiptCapture.receipt,
+                    latch: stopUnconfirmed, outcome: "acknowledged")
+            }
+            return
+        }
+        captured?.recordStop(.confirmed)
         stopUnconfirmed = false
         loop = nil
         activePolicy = nil
         path = []
         state = .idle
         publishSafetyState(.idle)
+        if let captured, let token {
+            trace?.endStop(token, origin: origin, evidence: captured, receipt: receiptCapture.receipt,
+                latch: stopUnconfirmed, outcome: "acknowledged")
+        }
+    }
+
+    private func rotationStop(origin: String) async throws {
+        let evidence = FollowMotionTaskScope.evidence
+        let token = evidence.flatMap { $0.scanTrace?.beginStop(origin: origin, evidence: $0, latch: stopUnconfirmed) }
+        let receiptCapture = FollowMotionStopReceiptCapture()
+        do {
+            try await FollowMotionTaskScope.$stopReceiptCapture.withValue(receiptCapture) { try await stopRover() }
+            if let evidence, let token {
+                evidence.scanTrace?.endStop(token, origin: origin, evidence: evidence, receipt: receiptCapture.receipt,
+                    latch: stopUnconfirmed, outcome: "acknowledged")
+            }
+        } catch {
+            if origin == "pulse", !Task.isCancelled {
+                // Same pulse-stop latch rule; capture before emitting the response.
+                stopUnconfirmed = true
+                evidence?.recordStop(.failed)
+            }
+            if let evidence, let token {
+                evidence.scanTrace?.endStop(token, origin: origin, evidence: evidence, receipt: receiptCapture.receipt, latch: stopUnconfirmed,
+                    outcome: Task.isCancelled ? "cancelled" : "failed")
+            }
+            throw error
+        }
     }
 
     /// Stop and clear the current goal.
     public func cancel() {
+        let captured = activeFollowEvidence
+        if let evidence = captured {
+            evidence.fenced = true
+            evidence.scanTrace?.cancel(origin: "cancel", evidence: evidence, latch: stopUnconfirmed)
+        }
         operationGeneration &+= 1
         loop?.cancel()
         loop = nil
@@ -410,7 +668,9 @@ public final class NavigationController {
         let previousStop = stopConfirmation
         stopConfirmation = Task { @MainActor in
             _ = try? await previousStop?.value
-            try await stopRover()
+            try await FollowMotionTaskScope.$evidence.withValue(captured) {
+                try await rotationStop(origin: "independent")
+            }
         }
         // Without this, an external cancel (e.g. a hard-stop bypassing the brain) leaves
         // `state` at `.driving` forever, so anything polling `state == .driving` to know
@@ -484,6 +744,8 @@ public final class NavigationController {
 
             // Safety gate.
             let lastAck = await currentLastAck()
+            if FollowMotionTaskScope.evidence != nil,
+               Task.isCancelled || FollowMotionTaskScope.evidence?.fenced == true { break }
             let now = Date()
             let decision = guardLayer.evaluate(forwardClearance: currentForwardClearance(),
                                                lastAckAt: lastAck,
@@ -616,27 +878,43 @@ public final class NavigationController {
         return nil
     }
 
-    private func performRotate(to targetYaw: Double, mode: RotationMode) async -> NavigationResult {
+    private func performRotate(to targetYaw: Double, mode: RotationMode,
+                               followProfile: FollowScanRotationProfile? = nil) async -> NavigationResult {
+        FollowMotionTaskScope.evidence?.targetYaw = targetYaw
         let pulsed = mode == .scan || mode == .followScan
-        let angularTolerance = pulsed ? RoverConfig.scanTurnYawTolerance : 0.05
+        let profile = mode == .followScan ? followProfile : nil
+        let angularTolerance = profile?.angularTolerance ?? (pulsed ? RoverConfig.scanTurnYawTolerance : 0.05)
         var hasSentCommand = false
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
             guard let pose = currentPose() else {
-                try? await stopRover()
+                if let evidence = FollowMotionTaskScope.evidence {
+                    evidence.scanTrace?.unavailablePost(evidence: evidence, latch: stopUnconfirmed)
+                }
+                try? await rotationStop(origin: "cleanup")
                 let result = NavigationResult.failed(.trackingLost)
                 finish(result)
                 return result
             }
             let error = normalizeAngle(targetYaw - pose.yaw)
+            let evidence = FollowMotionTaskScope.evidence
+            let trace = evidence?.scanTrace
+            let sample = trace?.sample(yaw: pose.yaw)
+            if let evidence, let sample {
+                trace?.evaluation(sample, snapshot: progressWatchdog.diagnosticSnapshot(distanceToGoal: abs(error), now: now()),
+                    evidence: evidence, latch: stopUnconfirmed)
+            }
             if abs(error) <= angularTolerance {
-                try? await stopRover()
+                try? await rotationStop(origin: "final")
+                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { return .cancelled }
                 let result = NavigationResult.arrived
                 finish(result)
                 return result
             }
 
+            trace?.enter("ack_read")
             let lastAck = await currentLastAck()
+            if evidence != nil && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
             let now = now()
             let decision = guardLayer.evaluate(forwardClearance: currentForwardClearance(),
                                                lastAckAt: lastAck,
@@ -648,7 +926,7 @@ public final class NavigationController {
             case .go:
                 break
             case .stopObstacle(let clearance):
-                try? await stopRover()
+                try? await rotationStop(origin: "cleanup")
                 state = .failed(Self.obstacleMessage(clearance: clearance))
                 publishSafetyState(.failed(.obstacle))
                 RuntimeFileLog.append("nav_safety_stop", fields: [
@@ -657,7 +935,7 @@ public final class NavigationController {
                 ])
                 return .failed(.obstacle)
             case .stopCommsLost:
-                try? await stopRover()
+                try? await rotationStop(origin: "cleanup")
                 let result = NavigationResult.failed(.commsLost)
                 finish(result)
                 RuntimeFileLog.append("nav_safety_stop", fields: [
@@ -666,7 +944,7 @@ public final class NavigationController {
                 ])
                 return result
             case .stopTipping:
-                try? await stopRover()
+                try? await rotationStop(origin: "cleanup")
                 let result = NavigationResult.failed(.tipping)
                 finish(result)
                 RuntimeFileLog.append("nav_safety_stop", fields: ["reason": "tipping_while_rotating"])
@@ -674,16 +952,22 @@ public final class NavigationController {
             }
 
             let cmd: WheelCommand
-            if mode == .followScan {
+            if let profile {
                 // Follow-only slow search: deliberately bypass the generic .25 m/s floor.
-                let speed = min(0.10, abs(error) * 0.3)
+                let speed = min(profile.wheelCap, abs(error) * profile.yawGain)
                 let signed = error > 0 ? speed : -speed
                 cmd = WheelCommand(left: -signed, right: signed)
             } else {
                 cmd = RotationCommand.command(forYawError: error)
             }
-            if progressWatchdog.observe(distanceToGoal: abs(error), now: now, commanded: true) {
-                try? await stopRover()
+            let before = progressWatchdog.diagnosticSnapshot(distanceToGoal: abs(error), now: now)
+            let stalled = progressWatchdog.observe(distanceToGoal: abs(error), now: now, commanded: true)
+            if let sample {
+                trace?.observed(progressWatchdog.diagnosticSnapshot(distanceToGoal: abs(error), now: now), previous: before, sample: sample)
+            }
+            if stalled {
+                trace?.enter("watchdog")
+                try? await rotationStop(origin: "cleanup")
                 let result = NavigationResult.failed(.stalled)
                 finish(result)
                 RuntimeFileLog.append("nav_safety_stop", fields: [
@@ -704,13 +988,20 @@ public final class NavigationController {
                 "wheel_left": Self.formatMeters(cmd.left),
                 "wheel_right": Self.formatMeters(cmd.right)
             ])
+            if let evidence, let sample {
+                trace?.pulse(sample, command: cmd, evidence: evidence, latch: stopUnconfirmed)
+                trace?.beginSend(cmd, evidence: evidence, latch: stopUnconfirmed)
+            }
             do {
                 try await sendCommand(cmd)
+                if let evidence { trace?.endSend(evidence: evidence, latch: stopUnconfirmed, outcome: "acknowledged") }
                 hasSentCommand = true
             } catch {
+                if let evidence { trace?.endSend(evidence: evidence, latch: stopUnconfirmed,
+                    outcome: Task.isCancelled ? "cancelled" : "failed") }
                 // A cancelled motion send is not a failed motor-stop confirmation.
                 if Task.isCancelled { break }
-                try? await stopRover()
+                try? await rotationStop(origin: "cleanup")
                 state = Self.stateAfterCommandFailure(error)
                 publishSafetyState(.failed(.commandFailed))
                 RuntimeFileLog.append("nav_command_failed", fields: [
@@ -719,28 +1010,42 @@ public final class NavigationController {
                 ])
                 return .failed(.commandFailed)
             }
+            if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
             if pulsed {
-                await sleep(.seconds(RoverConfig.scanTurnPulseDuration))
+                if let evidence { trace?.beginWait("pulse_wait", duration: profile?.pulseWait ?? RoverConfig.scanTurnPulseDuration,
+                    evidence: evidence, latch: stopUnconfirmed) }
+                await sleep(.seconds(profile?.pulseWait ?? RoverConfig.scanTurnPulseDuration))
+                if let evidence { trace?.endWait("pulse_wait", evidence: evidence, latch: stopUnconfirmed, interrupted: Task.isCancelled) }
+                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
                 do {
-                    try await stopRover()
+                    try await rotationStop(origin: "pulse")
                 } catch {
                     // External stop owns an independent, noncancelled acknowledgement.
                     // Do not publish success here: confirmStop still fails closed if that fails.
                     if Task.isCancelled { return .cancelled }
                     stopUnconfirmed = true
+                    FollowMotionTaskScope.evidence?.recordStop(.failed)
                     let result = NavigationResult.failed(.commandFailed)
                     finish(result)
                     return result
                 }
+                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
                 RuntimeFileLog.append("nav_scan_turn_settle", fields: [
                     "settle_seconds": String(format: "%.2f", RoverConfig.scanTurnSettleDuration)
                 ])
-                await sleep(.seconds(RoverConfig.scanTurnSettleDuration))
+                if let evidence { trace?.beginWait("settle", duration: profile?.settleWait ?? RoverConfig.scanTurnSettleDuration,
+                    evidence: evidence, latch: stopUnconfirmed) }
+                await sleep(.seconds(profile?.settleWait ?? RoverConfig.scanTurnSettleDuration))
+                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) {
+                    if let evidence { trace?.endWait("settle", evidence: evidence, latch: stopUnconfirmed, interrupted: true) }
+                    break
+                }
+                trace?.settled()
             } else {
                 await sleep(.seconds(RoverConfig.commandInterval))
             }
         }
-        try? await stopRover()
+        try? await rotationStop(origin: "cleanup")
         return .cancelled
     }
 
@@ -759,7 +1064,19 @@ public final class NavigationController {
         }
     }
 
-    private func publishSafetyState(_ newState: NavigationSafetyState) {
+    private func publishSafetyState(_ newState: NavigationSafetyState, evidence captured: FollowMotionOperationEvidence? = nil) {
+        if case .failed(let reason) = newState {
+            if let evidence = captured ?? FollowMotionTaskScope.evidence {
+                evidence.recordFailure(reason)
+                evidence.scanTrace?.failure(reason, evidence: evidence, latch: stopUnconfirmed)
+                if let failure = evidence.failure(source: .stream) {
+                    deliverFollowFailure(failure)
+                    evidence.emittedFailure = true
+                }
+            } else {
+                deliverFollowFailure(.init(context: .unknown, reason: reason, stopOutcome: .unknown, source: .stream))
+            }
+        }
         guard safetyState != newState else { return }
         safetyState = newState
         for continuation in safetyStateContinuations.values { continuation.yield(newState) }

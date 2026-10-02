@@ -9,36 +9,73 @@ public struct FollowTargetTracker {
         self.configuration = configuration
     }
 
-    public func selectInitial(_ people: [FollowPersonObservation], now: TimeInterval) -> FollowPersonObservation? {
-        people.filter { eligible($0, now: now) }.min { a, b in
-            let ax = a.boundingBox.midX - 0.5
-            let ay = a.boundingBox.midY - 0.5
-            let bx = b.boundingBox.midX - 0.5
-            let by = b.boundingBox.midY - 0.5
+    func selectInitialEvaluated(_ people: [FollowPersonObservation], now: TimeInterval)
+        -> (decision: FollowPersonObservation?, evaluation: FollowAssociationEvaluation) {
+        var evidence: [FollowCandidateEvidence] = []
+        let indices = people.indices.filter { index in
+            var candidate = FollowCandidateEvidence()
+            let accepted = eligible(people[index], now: now, evidence: &candidate)
+            evidence.append(candidate)
+            return accepted
+        }
+        let selected = indices.min { a, b in
+            let ax = people[a].boundingBox.midX - 0.5
+            let ay = people[a].boundingBox.midY - 0.5
+            let bx = people[b].boundingBox.midX - 0.5
+            let by = people[b].boundingBox.midY - 0.5
             return ax * ax + ay * ay < bx * bx + by * by
         }
+        return (selected.map { people[$0] }, evaluation(people, evidence: evidence, mode: "initial",
+            outcome: selected == nil ? "lost" : "initial", selected: selected, matchedCount: nil))
+    }
+
+    public func selectInitial(_ people: [FollowPersonObservation], now: TimeInterval) -> FollowPersonObservation? {
+        selectInitialEvaluated(people, now: now).decision
     }
 
     public func continueTrack(_ people: [FollowPersonObservation], previous: FollowPersonObservation,
                               predictedPosition: Vec2, now: TimeInterval) -> FollowTrackMatch {
-        let matches = people.filter { candidate in
-            guard eligible(candidate, now: now),
-                  candidate.position.distance(to: predictedPosition) <= configuration.maximumWorldDistance else {
-                return false
+        continueTrackEvaluated(people, previous: previous, predictedPosition: predictedPosition, now: now).decision
+    }
+
+    func continueTrackEvaluated(_ people: [FollowPersonObservation], previous: FollowPersonObservation,
+                                predictedPosition: Vec2, now: TimeInterval)
+        -> (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation) {
+        evaluateMatches(people, now: now, mode: "continuity") { candidate, evidence in
+            let distance = candidate.position.distance(to: predictedPosition)
+            evidence.record("world_distance_m", distance)
+            guard distance <= configuration.maximumWorldDistance else {
+                evidence.rejection = "world_distance_exceeded"; return false
             }
+            let iou = boxIoU(candidate.boundingBox, previous.boundingBox)
+            evidence.record("box_iou", Double(iou))
+            if iou >= configuration.minimumBoxIoU { return true }
             let dx = candidate.boundingBox.midX - previous.boundingBox.midX
             let dy = candidate.boundingBox.midY - previous.boundingBox.midY
-            return boxIoU(candidate.boundingBox, previous.boundingBox) >= configuration.minimumBoxIoU ||
-                hypot(dx, dy) <= configuration.maximumScreenCenterDistance
+            let displacement = hypot(dx, dy)
+            evidence.record("screen_displacement", Double(displacement))
+            guard displacement <= configuration.maximumScreenCenterDistance else {
+                evidence.rejection = "screen_association_rejected"; return false
+            }
+            return true
         }
-        return match(matches)
+    }
+
+    func reacquireEvaluated(_ people: [FollowPersonObservation], lastPosition: Vec2, now: TimeInterval)
+        -> (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation) {
+        evaluateMatches(people, now: now, mode: "reacquisition") { candidate, evidence in
+            let distance = candidate.position.distance(to: lastPosition)
+            evidence.record("reacquisition_distance_m", distance)
+            guard distance <= configuration.reacquisitionDistance else {
+                evidence.rejection = "reacquisition_distance_exceeded"; return false
+            }
+            return true
+        }
     }
 
     public func reacquire(_ people: [FollowPersonObservation], lastPosition: Vec2,
                           now: TimeInterval) -> FollowTrackMatch {
-        match(people.filter {
-            eligible($0, now: now) && $0.position.distance(to: lastPosition) <= configuration.reacquisitionDistance
-        })
+        reacquireEvaluated(people, lastPosition: lastPosition, now: now).decision
     }
 
     public func standOffGoal(rover: Vec2, person: Vec2) -> Vec2? {
@@ -50,16 +87,62 @@ public struct FollowTargetTracker {
         return Vec2(rover.x + dx / distance * travel, rover.y + dy / distance * travel)
     }
 
-    private func eligible(_ observation: FollowPersonObservation, now: TimeInterval) -> Bool {
+    private func evaluateMatches(_ people: [FollowPersonObservation], now: TimeInterval, mode: String,
+                                 gate: (FollowPersonObservation, inout FollowCandidateEvidence) -> Bool)
+        -> (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation) {
+        var evidence: [FollowCandidateEvidence] = []
+        var matches: [Int] = []
+        for index in people.indices {
+            var candidate = FollowCandidateEvidence()
+            if eligible(people[index], now: now, evidence: &candidate) {
+                candidate.matched = gate(people[index], &candidate)
+                if candidate.matched == true { matches.append(index) }
+            }
+            evidence.append(candidate)
+        }
+        let selected = matches.count == 1 ? matches[0] : nil
+        let outcome = matches.isEmpty ? "lost" : matches.count > 1 ? "ambiguous" :
+            mode == "continuity" ? "continued" : "reacquired"
+        return (match(matches.map { people[$0] }), evaluation(people, evidence: evidence, mode: mode,
+            outcome: outcome, selected: selected, matchedCount: matches.count))
+    }
+
+    private func eligible(_ observation: FollowPersonObservation, now: TimeInterval,
+                          evidence: inout FollowCandidateEvidence) -> Bool {
         let box = observation.boundingBox
+        evidence.record("confidence", Double(observation.confidence))
+        guard observation.confidence.isFinite else { evidence.rejection = "confidence_nonfinite"; return false }
+        guard observation.confidence >= configuration.minimumConfidence else {
+            evidence.rejection = "confidence_below_minimum"; return false
+        }
         let age = now - observation.timestamp
-        return observation.confidence.isFinite && observation.confidence >= configuration.minimumConfidence &&
-            age.isFinite && age >= 0 && age <= configuration.maximumObservationAge &&
-            observation.position.x.isFinite && observation.position.y.isFinite &&
+        evidence.record("observation_age_s", age)
+        guard age.isFinite else { evidence.rejection = "observation_age_nonfinite"; return false }
+        guard age >= 0 else { evidence.rejection = "observation_from_future"; return false }
+        guard age <= configuration.maximumObservationAge else { evidence.rejection = "observation_stale"; return false }
+        let finite = observation.position.x.isFinite && observation.position.y.isFinite &&
             observation.pose.position.x.isFinite && observation.pose.position.y.isFinite &&
             observation.pose.yaw.isFinite &&
             box.minX.isFinite && box.minY.isFinite && box.maxX.isFinite && box.maxY.isFinite &&
             box.width > 0 && box.height > 0
+        evidence.metrics["finite_geometry"] = .bool(finite)
+        evidence.metrics["finite_geometry_availability"] = .string("available")
+        guard finite else { evidence.rejection = "invalid_geometry"; return false }
+        evidence.eligible = true
+        return true
+    }
+
+    private func evaluation(_ people: [FollowPersonObservation], evidence: [FollowCandidateEvidence],
+                            mode: String, outcome: String, selected: Int?, matchedCount: Int?) -> FollowAssociationEvaluation {
+        .init(mode: mode, outcome: outcome,
+              candidates: people.indices.map { evidence[$0].payload(people[$0], index: $0) },
+              selectedIndex: selected, eligibleCount: evidence.filter(\.eligible).count, matchedCount: matchedCount,
+              thresholds: ["minimum_confidence": .number(Double(configuration.minimumConfidence)),
+                "maximum_observation_age_s": .number(configuration.maximumObservationAge),
+                "maximum_world_distance_m": .number(configuration.maximumWorldDistance),
+                "minimum_box_iou": .number(Double(configuration.minimumBoxIoU)),
+                "maximum_screen_center_distance": .number(Double(configuration.maximumScreenCenterDistance)),
+                "reacquisition_distance_m": .number(configuration.reacquisitionDistance)])
     }
 
     private func boxIoU(_ a: CGRect, _ b: CGRect) -> CGFloat {

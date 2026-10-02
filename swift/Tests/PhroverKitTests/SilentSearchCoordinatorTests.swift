@@ -1250,6 +1250,97 @@ final class SilentSearchCoordinatorTests: XCTestCase {
         XCTAssertNil(coordinator.calibrationVisualState.currentIssue)
     }
 
+    func testCleanScanAfterSameFrameBackendDiagnosticAndWaitingRecordsRecurrence() async throws {
+        try await assertBackendDiagnosticRecursAfterSameFrameFeedback(markerDetected: false)
+    }
+
+    func testCleanScanAfterSameFrameBackendDiagnosticAndMarkerRecordsRecurrence() async throws {
+        try await assertBackendDiagnosticRecursAfterSameFrameFeedback(markerDetected: true)
+    }
+
+    private func assertBackendDiagnosticRecursAfterSameFrameFeedback(markerDetected: Bool) async throws {
+        enum ScannerFailure: Error { case failed }
+        let manager = ARSessionManager()
+        let scanned = (1...4).map { expectation(description: "Frame \($0) scanned") }
+        let drained = expectation(description: "Coordinator consumed final tracking frame")
+        let events = CalibrationCycleEventSink(drained: drained)
+        let diagnostic = OpticalScannerBackendDiagnostic(
+            backend: .vision, orientation: .right,
+            errorDomain: "VisionStableDomain", errorCode: 17
+        )
+        let corners = OrientedMarkerCorners(
+            topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
+            bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
+        )
+        let calibrator = ARSharedMissionFrameCalibrator(
+            sessionManager: manager,
+            detailedScanner: { frame in
+                scanned[Int(frame.frameID) - 1].fulfill()
+                if frame.frameID == 1 { throw ScannerFailure.failed }
+                let observations = markerDetected && frame.frameID == 2 ? [OpticalObservation(
+                    payload: Data("PHROVER-CAL|1|SILENT_SEARCH_01".utf8),
+                    frameID: frame.frameID, monotonicTimestamp: frame.monotonicTimestamp,
+                    corners: corners
+                )] : []
+                return OpticalScanOutcome(
+                    observations: observations,
+                    diagnostics: frame.frameID == 2 || frame.frameID == 4 ? [diagnostic] : []
+                )
+            }
+        )
+        let harness = SilentSearchTestHarness()
+        harness.readiness.snapshot = .ready(sessionGeneration: 0)
+        let coordinator = SilentSearchCoordinator(dependencies: SilentSearchDependencies(
+            clock: harness.clock, readiness: harness.readiness, calibration: calibrator,
+            opticalExchange: harness.optical, explorer: harness.explorer,
+            targetObserver: harness.targetObserver, motion: harness.motion,
+            safety: harness.safety, events: events
+        ))
+        coordinator.configure(try mission())
+        XCTAssertTrue(coordinator.startCalibration())
+        await Task.yield()
+
+        // Real depth grounding succeeds for the marker variant, producing one sample.
+        var depth: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 10, 10, kCVPixelFormatType_DepthFloat32, nil, &depth)
+        let depthMap = try XCTUnwrap(depth)
+        CVPixelBufferLockBaseAddress(depthMap, [])
+        let stride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float>.size
+        let values = CVPixelBufferGetBaseAddress(depthMap)!.assumingMemoryBound(to: Float.self)
+        for y in 0..<10 {
+            for x in 0..<10 { values[y * stride + x] = y < 5 ? 2 : 2.2 }
+        }
+        CVPixelBufferUnlockBaseAddress(depthMap, [])
+        let intrinsics = simd_float3x3(columns: (
+            SIMD3<Float>(200, 0, 0), SIMD3<Float>(0, 200, 0), SIMD3<Float>(50, 50, 1)
+        ))
+
+        for index in 0..<4 {
+            manager.ingestForTesting(
+                image: makeImage(), timestamp: Double(index + 1),
+                cameraTransform: matrix_identity_float4x4, intrinsics: intrinsics,
+                imageResolution: CGSize(width: 100, height: 100), depthMap: depthMap,
+                trackingQuality: .normal
+            )
+            await fulfillment(of: [scanned[index]], timeout: 1)
+        }
+        // Actual frame-5 feedback is a FIFO consumer barrier, even when frame 4
+        // is incorrectly deduplicated. No test calibration events are synthesized.
+        manager.ingestForTesting(
+            image: makeImage(), timestamp: 5,
+            cameraTransform: matrix_identity_float4x4, intrinsics: intrinsics,
+            imageResolution: CGSize(width: 100, height: 100), depthMap: depthMap,
+            trackingQuality: .limited
+        )
+        await fulfillment(of: [drained], timeout: 1)
+        let backendEvents = events.entries.filter { $0.event == "silent_search_scanner_backend_failed" }
+        XCTAssertEqual(backendEvents.map { $0.fields["frame_sequence"] }, ["2", "4"])
+        XCTAssertEqual(backendEvents.map { $0.fields["error_domain"] }, ["VisionStableDomain", "VisionStableDomain"])
+        XCTAssertEqual(coordinator.calibrationProgress, markerDetected ? 1 : 0)
+        XCTAssertEqual(coordinator.calibrationVisualState.cornersGrounded, markerDetected)
+        await coordinator.stop()
+    }
+
     func testCalibrationRejectionTelemetryRecordsTransitionsOnly() async throws {
         let harness = SilentSearchTestHarness()
         harness.readiness.snapshot = .ready(sessionGeneration: 4)
@@ -1591,6 +1682,24 @@ final class SilentSearchCoordinatorTests: XCTestCase {
 
     private func eventually(_ condition: @escaping @MainActor () -> Bool) async {
         for _ in 0..<100 where !condition() { await Task.yield() }
+    }
+}
+
+private final class CalibrationCycleEventSink: SilentSearchEventSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [RecordingSilentSearchEventSink.Entry] = []
+    private let drained: XCTestExpectation
+
+    init(drained: XCTestExpectation) { self.drained = drained }
+
+    var entries: [RecordingSilentSearchEventSink.Entry] { lock.withLock { recorded } }
+
+    func record(event: String, fields: [String: String]) {
+        lock.withLock { recorded.append(.init(event: event, fields: fields)) }
+        if event == "silent_search_grounding_failed",
+           fields["frame_sequence"] == "5", fields["reason"] == "tracking_not_normal" {
+            drained.fulfill()
+        }
     }
 }
 
