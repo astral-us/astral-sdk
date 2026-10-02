@@ -4,6 +4,19 @@ import PhroverKit
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testStationaryAcquisitionPhasesExplainBehaviorAndKeepStopAvailable() async {
+        for (state, label) in [(FollowMeState.pausing, "Pausing — five seconds"),
+                               (.aligning, "Aligning toward you…"),
+                               (.waitingForMovement, "Ready — walk away to begin following")] {
+            var stops = 0
+            let model = ConversationViewModel(stop: { stops += 1; return .accepted }, followState: { state })
+            XCTAssertEqual(model.status, label)
+            XCTAssertTrue(model.showsStopFollowing)
+            await model.stopFollowing()
+            XCTAssertEqual(stops, 1)
+        }
+    }
+
     func testFinalSpeechRoutesFollowMeWithoutTextEntry() async {
         var received: [String] = []
         let model = ConversationViewModel(submit: { text in

@@ -4,6 +4,40 @@ import RoverNav
 
 @MainActor
 final class NavigationRotationWatchdogTests: XCTestCase {
+    func testFollowAlignmentFailsClosedWhenInternalPreturnStopFailsAfterCoordinatorStopSucceeded() async throws {
+        var stops = 0
+        var commands: [WheelCommand] = []
+        var yaw = 0.0
+        let controller = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: yaw) },
+            forwardClearance: { 2 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { Date() },
+            sendCommand: { commands.append($0) },
+            stopRover: {
+                stops += 1
+                if stops > 1 { throw RotationStopError.failed }
+            },
+            sleep: { _ in yaw = .pi / 2 }
+        )
+        let motion = NavigationFollowMeMotion(navigation: controller)
+
+        // The coordinator's pre-stop is successful. Navigation must still honor
+        // a newer internal preturn stop failure rather than silently rotate.
+        try await motion.stopAndConfirm()
+        XCTAssertEqual(stops, 1)
+        let result = await motion.alignTowardPerson(by: .pi / 2)
+
+        XCTAssertEqual(result, .failed(.commandFailed))
+        XCTAssertTrue(commands.allSatisfy { $0.left == 0 && $0.right == 0 }, "No nonzero wheel command after unconfirmed stop")
+        XCTAssertEqual(controller.state, .failed("Rover stop could not be confirmed."))
+        XCTAssertEqual(controller.safetyState, .failed(.commandFailed))
+        let retry = await motion.alignTowardPerson(by: .pi / 2)
+        XCTAssertEqual(retry, .failed(.commandFailed), "Failure remains latched until an explicit confirmed-stop retry")
+        XCTAssertEqual(stops, 2, "Blocked alignment must not retry or bypass the failed serialized stop")
+        XCTAssertTrue(commands.isEmpty)
+    }
+
     func testStopAndConfirmCancelsSuspendedRotationSendsWithoutPublishingFailure() async throws {
         for scan in [false, true] {
             for error: Error in [CancellationError(), URLError(.cancelled)] {

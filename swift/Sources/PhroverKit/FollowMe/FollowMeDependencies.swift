@@ -73,6 +73,7 @@ public protocol FollowMePerception {
 @MainActor
 public protocol FollowMeMotion {
     func rotateForScan(by angle: Double) async -> NavigationResult
+    func alignTowardPerson(by angle: Double) async -> NavigationResult
     func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) async -> NavigationResult
     func stopAndConfirm() async throws
     func safetyStates() -> AsyncStream<NavigationSafetyState>

@@ -11,8 +11,9 @@ final class ManualFollowClock: FollowMeClock {
         await withCheckedContinuation { sleepers.append((now + seconds, $0)) }
     }
 
-    func advance(to time: TimeInterval) {
+    func advance(to time: TimeInterval, wakeSleepers: Bool = true) {
         now = time
+        guard wakeSleepers else { return }
         let ready = sleepers.filter { $0.0 <= time }
         sleepers.removeAll { $0.0 <= time }
         for (_, continuation) in ready { continuation.resume() }
@@ -33,6 +34,20 @@ final class FollowPerceptionFake: FollowMePerception {
 @MainActor
 final class FollowMotionFake: FollowMeMotion {
     private(set) var rotations: [Double] = []
+    private(set) var alignments: [Double] = []
+    var suspendAlignment = false
+    var alignmentResult: NavigationResult = .arrived
+    private var alignmentWaiters: [CheckedContinuation<Void, Never>] = []
+    func alignTowardPerson(by angle: Double) async -> NavigationResult {
+        alignments.append(angle)
+        if suspendAlignment { await withCheckedContinuation { alignmentWaiters.append($0) } }
+        return alignmentResult
+    }
+    func releaseAlignment() {
+        let waiters = alignmentWaiters
+        alignmentWaiters = []
+        for waiter in waiters { waiter.resume() }
+    }
     private(set) var goals: [Vec2] = []
     private(set) var clearances: [Double] = []
     private(set) var stops = 0

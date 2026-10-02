@@ -38,6 +38,9 @@ final class ConversationViewModel {
     var status: String {
         switch followState() {
         case .idle: return ""
+        case .pausing: return "Pausing — five seconds"
+        case .aligning: return "Aligning toward you…"
+        case .waitingForMovement: return "Ready — walk away to begin following"
         case .searching: return "Searching for you…"
         case .following: return "Following — 1.5 m"
         case .holdingDistance: return "Holding distance"

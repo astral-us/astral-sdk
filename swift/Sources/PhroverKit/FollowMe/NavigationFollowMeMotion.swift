@@ -15,6 +15,10 @@ public final class NavigationFollowMeMotion: FollowMeMotion {
         await navigation.navigateForFollow(to: goal, stoppingAtForwardClearance: clearance)
     }
 
+    public func alignTowardPerson(by angle: Double) async -> NavigationResult {
+        await navigation.rotateForFollowAlignment(by: angle)
+    }
+
     public func stopAndConfirm() async throws { try await navigation.stopAndConfirm() }
 
     public func safetyStates() -> AsyncStream<NavigationSafetyState> { navigation.safetyStates() }

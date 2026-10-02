@@ -249,6 +249,32 @@ public final class NavigationController {
         return result
     }
 
+    /// Continuous follow alignment with the same serialized, throwing stop latch
+    /// as follow scanning. A successful external pre-stop cannot authorize motion
+    /// after a newer internal stop fails.
+    public func rotateForFollowAlignment(by angle: Double) async -> NavigationResult {
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
+        operationGeneration &+= 1
+        let reservation = operationGeneration
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        guard operationGeneration == reservation else { return .cancelled }
+        operationGeneration &+= 1
+        guard let startYaw = currentPose()?.yaw else {
+            let result = NavigationResult.failed(.noPose)
+            finish(result)
+            return result
+        }
+        state = .driving
+        publishSafetyState(.moving)
+        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .continuous) }
+        loop = task
+        let result = await task.value
+        guard operationGeneration == reservation + 1 else { return .cancelled }
+        guard !stopUnconfirmed else { return .failed(.commandFailed) }
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        return result
+    }
+
     /// Invalidate motion before waiting for the loop and an acknowledged motor stop.
     public func stopAndConfirm() async throws {
         operationGeneration &+= 1

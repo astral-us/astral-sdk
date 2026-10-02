@@ -2,12 +2,12 @@ import Foundation
 import RoverNav
 
 public enum FollowMeState: Equatable {
-    case idle, searching, following, holdingDistance, reacquiring, stopped
+    case idle, pausing, searching, aligning, waitingForMovement, following, holdingDistance, reacquiring, stopped
     case failed(String)
 
     public var isActive: Bool {
         switch self {
-        case .searching, .following, .holdingDistance, .reacquiring: true
+        case .pausing, .searching, .aligning, .waitingForMovement, .following, .holdingDistance, .reacquiring: true
         default: false
         }
     }
@@ -36,20 +36,32 @@ public final class FollowMeCoordinator {
     private var generation: UInt64 = 0
     private var operation: UInt64 = 0
     private var framesTask: Task<Void, Never>?
+    private var frameProcessorTask: Task<Void, Never>?
+    private var pendingFrame: FollowFrameBatch?
     private var safetyTask: Task<Void, Never>?
     private var movementTask: Task<Void, Never>?
     private var deadlineTask: Task<Void, Never>?
     private var poseTask: Task<Void, Never>?
     private var frameWatchdogTask: Task<Void, Never>?
     private var startupTask: Task<Void, Never>?
+    private var pauseTask: Task<Void, Never>?
+    private var alignmentTask: Task<Void, Never>?
+    private var alignmentSerial: UInt64 = 0
+    private var alignmentConfirmedAfter: ARFrameID?
+    private var alignmentCompletionTime: TimeInterval?
+    private var departureBaseline: Double?
+    private var departurePending = true
+    private var perceptionReady = false
+    private var readinessDeadline: TimeInterval?
     private var stopTask: Task<Bool, Never>?
     private var confirmationTask: Task<Bool, Never>?
+    private var confirmationID: UInt64 = 0
     private var stopBlocked = false
     private var locked: FollowPersonObservation?
     private var lastPosition: Vec2?
     private var reacquireDeadline: TimeInterval?
     private var poseDeadline: TimeInterval?
-    private var scanCount = 0
+    private var scanRotation: Double = 0
     private var scanning = false
     private var lastGoal: Vec2?
     private var lastGoalTime: TimeInterval?
@@ -57,7 +69,7 @@ public final class FollowMeCoordinator {
     private var latestBatch: FollowFrameBatch?
 
     private var perceptionFailureMessage: String {
-        let issue = perceptionIssue ?? .poseUnavailable
+        let issue = perceptionIssue ?? .noFrames
         if issue == .trackingLimited, let reason = latestBatch?.trackingReason {
             return "AR tracking limited (\(reason.rawValue)). \(reason.action)"
         }
@@ -87,10 +99,14 @@ public final class FollowMeCoordinator {
         generation &+= 1
         let token = generation
         locked = nil
+        alignmentConfirmedAfter = nil
+        departureBaseline = nil
+        departurePending = config.departureRangeIncrease > 0
         lastPosition = nil
         reacquireDeadline = nil
         poseDeadline = nil
-        scanCount = 0
+        perceptionReady = false
+        scanRotation = 0
         scanning = false
         lastGoal = nil
         lastGoalTime = nil
@@ -100,16 +116,18 @@ public final class FollowMeCoordinator {
         loggedIssue = nil
         loggedTrackingReason = nil
         perceptionIssue = .noFrames
-        state = .searching
+        state = config.stationaryPauseSeconds > 0 ? .pausing : .searching
         updatePerceptionIssue(.noFrames)
         let events = perception.events()
         let safety = motion.safetyStates()
         framesTask = Task { [weak self] in
             for await event in events {
-                guard let self, self.generation == token else { break }
+                guard !Task.isCancelled, let self, self.generation == token, self.isActive else { break }
                 await self.receive(event, generation: token)
             }
-            if let self, self.generation == token { _ = await self.finish(.failed("Perception ended.")) }
+            if !Task.isCancelled, let self, self.generation == token, self.isActive {
+                _ = await self.finish(.failed("Perception ended."))
+            }
         }
         safetyTask = Task { [weak self] in
             for await value in safety {
@@ -117,10 +135,26 @@ public final class FollowMeCoordinator {
                 if case .failed = value { _ = await self.finish(.failed("Navigation safety failure.")); break }
             }
         }
-        startupTask = Task { [weak self, clock, config] in
-            await clock.sleep(seconds: config.perceptionRecoverySeconds)
-            guard let self, self.generation == token, self.latestFrame == nil else { return }
-            _ = await self.finish(.failed((self.perceptionIssue ?? .noFrames).message))
+        let pauseDeadline = clock.now + config.stationaryPauseSeconds
+        let startupDeadline = pauseDeadline + config.startupReadinessSeconds
+        readinessDeadline = startupDeadline
+        startupTask = Task { [weak self, clock] in
+            await clock.sleep(seconds: max(0, startupDeadline - clock.now))
+            guard !Task.isCancelled, let self, self.generation == token, !self.perceptionReady else { return }
+            _ = await self.finish(.failed(self.perceptionFailureMessage))
+        }
+        if state == .pausing {
+            pauseTask = Task { [weak self, clock] in
+                await clock.sleep(seconds: max(0, pauseDeadline - clock.now))
+                guard !Task.isCancelled, let self, self.generation == token, self.state == .pausing else { return }
+                self.state = .searching
+                self.perceptionReady = false
+                // Revalidate the latest pause frame against the clock at pause completion.
+                if let batch = self.latestBatch {
+                    self.latestFrame = nil
+                    await self.receive(batch, generation: token)
+                }
+            }
         }
         return true
     }
@@ -136,12 +170,17 @@ public final class FollowMeCoordinator {
         operation &+= 1
         state = .stopped
         framesTask?.cancel()
+        frameProcessorTask?.cancel()
+        frameProcessorTask = nil
+        pendingFrame = nil
         safetyTask?.cancel()
         movementTask?.cancel()
         deadlineTask?.cancel()
         poseTask?.cancel()
         frameWatchdogTask?.cancel()
         startupTask?.cancel()
+        pauseTask?.cancel()
+        cancelAlignment()
         let pending = confirmationTask
         stopTask = Task { [motion] in
             if let pending, !(await pending.value) { return false }
@@ -179,12 +218,17 @@ public final class FollowMeCoordinator {
         operation &+= 1
         state = result
         framesTask?.cancel()
+        frameProcessorTask?.cancel()
+        frameProcessorTask = nil
+        pendingFrame = nil
         safetyTask?.cancel()
         movementTask?.cancel()
         deadlineTask?.cancel()
         poseTask?.cancel()
         frameWatchdogTask?.cancel()
         startupTask?.cancel()
+        pauseTask?.cancel()
+        cancelAlignment()
         framesTask = nil
         safetyTask = nil
         movementTask = nil
@@ -212,32 +256,50 @@ public final class FollowMeCoordinator {
         switch event {
         case .interrupted: _ = await finish(.failed("AR session interrupted."))
         case .failed(let message): _ = await finish(.failed(message))
-        case .frame(let batch): await receive(batch, generation: token)
+        case .frame(let batch):
+            guard generation == token, isActive, !stopBlocked else { return }
+            if let previous = pendingFrame?.frameID ?? latestFrame,
+               batch.frameID.generation == previous.generation,
+               batch.frameID.sequence <= previous.sequence { return }
+            pendingFrame = batch
+            guard frameProcessorTask == nil else { return }
+            frameProcessorTask = Task { [weak self] in
+                guard let self else { return }
+                defer {
+                    // An old processor must never clear a newer generation's task.
+                    if self.generation == token { self.frameProcessorTask = nil }
+                }
+                while !Task.isCancelled, self.generation == token, self.isActive,
+                      let frame = self.pendingFrame {
+                    self.pendingFrame = nil
+                    await self.receive(frame, generation: token)
+                }
+            }
         }
     }
 
     private func receive(_ batch: FollowFrameBatch, generation token: UInt64) async {
         guard generation == token, isActive, !stopBlocked else { return }
+        if state != .pausing, !perceptionReady, let deadline = readinessDeadline, clock.now >= deadline {
+            _ = await finish(.failed(perceptionFailureMessage))
+            return
+        }
+        // A timer and frame processor can resume in either order at the boundary.
+        // Never let a late frame clear an outage whose recovery window has ended.
+        if let deadline = poseDeadline, clock.now >= deadline {
+            _ = await finish(.failed(perceptionFailureMessage))
+            return
+        }
         if let latestFrame, batch.frameID.generation == latestFrame.generation,
            batch.frameID.sequence <= latestFrame.sequence { return }
         latestFrame = batch.frameID
         latestBatch = batch
-        startupTask?.cancel()
-        startupTask = nil
         let now = clock.now
         frameWatchdogTask?.cancel()
-        let frameID = batch.frameID
-        frameWatchdogTask = Task { [weak self, clock, config] in
-            await clock.sleep(seconds: config.maximumObservationAge + 0.001)
-            guard !Task.isCancelled, let self, self.generation == token, self.latestFrame == frameID,
-                   self.state != .reacquiring,
-                   self.clock.now - batch.timestamp > config.maximumObservationAge else { return }
-            await self.perceptionUnavailable(self.perceptionIssue ?? .staleFrame, generation: token)
-        }
         let issue: FollowPerceptionIssue?
         if !batch.timestamp.isFinite || now - batch.timestamp < 0 || now - batch.timestamp > config.maximumObservationAge {
             issue = .staleFrame
-        } else if batch.trackingQuality == .unavailable {
+        } else if batch.trackingQuality == .unavailable || (!perceptionReady && batch.trackingQuality == nil) {
             issue = .trackingUnavailable
         } else if batch.trackingQuality == .limited {
             issue = .trackingLimited
@@ -253,6 +315,25 @@ public final class FollowMeCoordinator {
             lastFrameLogTime = clock.now
             log("follow_frame")
         }
+        // Observe diagnostics throughout the mandatory stationary interval. Readiness
+        // and the post-readiness outage watchdog begin only after that interval.
+        if state == .pausing { return }
+        if !perceptionReady {
+            guard issue == nil else { return }
+            perceptionReady = true
+            startupTask?.cancel()
+            pauseTask?.cancel()
+            startupTask = nil
+        }
+        let frameID = batch.frameID
+        frameWatchdogTask = Task { [weak self, clock, config] in
+            guard batch.timestamp.isFinite else { return }
+            let expiry = batch.timestamp + config.maximumObservationAge + 0.001
+            await clock.sleep(seconds: max(0, expiry - clock.now))
+            guard !Task.isCancelled, let self, self.generation == token, self.latestFrame == frameID,
+                   self.clock.now - batch.timestamp > config.maximumObservationAge else { return }
+            await self.perceptionUnavailable(self.perceptionIssue ?? .staleFrame, generation: token)
+        }
         if let issue {
             await perceptionUnavailable(issue, generation: token)
             return
@@ -260,14 +341,57 @@ public final class FollowMeCoordinator {
         poseDeadline = nil
         poseTask?.cancel()
         poseTask = nil
+        // Alignment owns its pre/post-stop waits. Keep healthy frame association
+        // flowing during those acknowledgements without launching other motion.
+        if confirmationTask != nil, !(state == .aligning && alignmentTask != nil) {
+            guard await confirmStop(generation: token) else { return }
+            scanning = false
+            lastGoal = nil
+            guard clock.now - batch.timestamp <= config.maximumObservationAge else {
+                await perceptionUnavailable(.staleFrame, generation: token)
+                return
+            }
+        }
         switch state {
         case .searching:
             if let selected = tracker.selectInitial(batch.people, now: now) {
                 locked = selected
                 lastPosition = selected.position
-                if scanning { guard await confirmStop(generation: token) else { return }; scanning = false }
-                await follow(selected, rover: batch.pose!.position, generation: token)
+                if config.departureRangeIncrease > 0 {
+                    state = .aligning
+                    align(generation: token)
+                } else {
+                    if scanning { guard await confirmStop(generation: token) else { return }; scanning = false }
+                    await follow(selected, rover: batch.pose!.position, generation: token)
+                }
             } else if !scanning { scan(generation: token) }
+        case .aligning, .waitingForMovement:
+            guard let locked else { return }
+            switch tracker.continueTrack(batch.people, previous: locked, predictedPosition: locked.position, now: now) {
+            case .matched(let selected):
+                self.locked = selected
+                lastPosition = selected.position
+                if state == .waitingForMovement {
+                    if let baseline = departureBaseline,
+                       batch.pose!.position.distance(to: selected.position) >= baseline + config.departureRangeIncrease {
+                        await follow(selected, rover: batch.pose!.position, generation: token)
+                    }
+                } else if alignmentTask == nil {
+                    if let completed = alignmentCompletionTime, batch.timestamp < completed { return }
+                    let heading = atan2(selected.position.y - batch.pose!.position.y,
+                                        selected.position.x - batch.pose!.position.x)
+                    if let confirmed = alignmentConfirmedAfter, confirmed != batch.frameID,
+                       abs(normalizeAngle(heading - batch.pose!.yaw)) <= config.alignmentAngularTolerance {
+                        if departureBaseline == nil {
+                            departureBaseline = batch.pose!.position.distance(to: selected.position)
+                        }
+                        state = .waitingForMovement
+                    } else {
+                        align(generation: token)
+                    }
+                }
+            case .lost, .ambiguous: await loseTarget(generation: token)
+            }
         case .following, .holdingDistance:
             guard let locked else { return }
             switch tracker.continueTrack(batch.people, previous: locked,
@@ -287,7 +411,12 @@ public final class FollowMeCoordinator {
                 deadlineTask?.cancel()
                 locked = selected
                 self.lastPosition = selected.position
-                await follow(selected, rover: batch.pose!.position, generation: token)
+                if departurePending {
+                    state = .aligning
+                    align(generation: token)
+                } else {
+                    await follow(selected, rover: batch.pose!.position, generation: token)
+                }
             } else if !scanning { scan(generation: token) }
         default: break
         }
@@ -295,6 +424,7 @@ public final class FollowMeCoordinator {
 
     private func follow(_ selected: FollowPersonObservation, rover: Vec2, generation token: UInt64) async {
         guard generation == token else { return }
+        departurePending = false
         let distance = rover.distance(to: selected.position)
         guard distance.isFinite else { await loseTarget(generation: token); return }
         guard distance > config.maximumHoldDistance else {
@@ -324,32 +454,92 @@ public final class FollowMeCoordinator {
         }
     }
 
+    private func align(generation token: UInt64) {
+        guard alignmentTask == nil else { return }
+        alignmentSerial &+= 1
+        let serial = alignmentSerial
+        alignmentConfirmedAfter = nil
+        alignmentTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.generation == token, self.alignmentSerial == serial { self.alignmentTask = nil }
+            }
+            guard await self.confirmStop(generation: token), self.alignmentSerial == serial,
+                  self.state == .aligning else { return }
+            self.scanning = false
+            // A frame already ingested but not yet processed is newer than the
+            // last batch. Run it through the normal health/association gates first.
+            if let pending = self.pendingFrame {
+                self.pendingFrame = nil
+                await self.receive(pending, generation: token)
+            }
+            guard self.generation == token, self.alignmentSerial == serial,
+                  self.state == .aligning, self.canScan,
+                  let batch = self.latestBatch, let pose = batch.pose, let locked = self.locked,
+                  case .matched(let selected) = self.tracker.continueTrack(
+                    batch.people, previous: locked, predictedPosition: locked.position, now: self.clock.now)
+            else { return }
+            let heading = atan2(selected.position.y - pose.position.y, selected.position.x - pose.position.x)
+            let angle = normalizeAngle(heading - pose.yaw)
+            guard angle.isFinite else { return }
+            let id = self.operation
+            let result = await self.motion.alignTowardPerson(by: angle)
+            guard self.generation == token, self.operation == id, self.alignmentSerial == serial,
+                  self.state == .aligning else { return }
+            if case .failed = result { _ = await self.finish(.failed("Navigation failed.")); return }
+            guard await self.confirmStop(generation: token), self.alignmentSerial == serial,
+                  self.state == .aligning, self.canScan else { return }
+            guard result == .arrived else { return }
+            self.alignmentConfirmedAfter = self.latestFrame
+            self.alignmentCompletionTime = self.clock.now
+        }
+    }
+
+    private func cancelAlignment() {
+        alignmentSerial &+= 1
+        alignmentTask?.cancel()
+        alignmentTask = nil
+        alignmentConfirmedAfter = nil
+        alignmentCompletionTime = nil
+    }
+
     private func confirmStop(generation token: UInt64) async -> Bool {
         guard generation == token, !stopBlocked, stopTask == nil else { return false }
         operation &+= 1
         movementTask?.cancel()
         movementTask = nil
         if let confirmationTask {
+            let id = confirmationID
             let confirmed = await confirmationTask.value
+            if confirmed, confirmationID == id { self.confirmationTask = nil }
             return confirmed && generation == token && !stopBlocked && stopTask == nil
         }
+        confirmationID &+= 1
+        let id = confirmationID
         let task = Task { [motion] in
             do { try await motion.stopAndConfirm(); return true }
             catch { return false }
         }
         confirmationTask = task
         let confirmed = await task.value
-        confirmationTask = nil
+        if confirmationID == id { confirmationTask = nil }
         if !confirmed {
             generation &+= 1
             operation &+= 1
             stopBlocked = true
             state = .failed("Rover stop could not be confirmed.")
             framesTask?.cancel()
+            frameProcessorTask?.cancel()
+            frameProcessorTask = nil
+            pendingFrame = nil
             safetyTask?.cancel()
             movementTask?.cancel()
             deadlineTask?.cancel()
             poseTask?.cancel()
+            frameWatchdogTask?.cancel()
+            startupTask?.cancel()
+            pauseTask?.cancel()
+            cancelAlignment()
             return false
         }
         return generation == token && !stopBlocked && stopTask == nil
@@ -366,17 +556,30 @@ public final class FollowMeCoordinator {
         }
     }
 
+    private var canScan: Bool {
+        guard isActive, perceptionReady, !stopBlocked, stopTask == nil, confirmationTask == nil,
+              perceptionIssue == nil, poseDeadline == nil, let batch = latestBatch,
+              batch.pose != nil, batch.depthAvailable,
+              batch.trackingQuality != .limited, batch.trackingQuality != .unavailable,
+              batch.timestamp.isFinite else { return false }
+        let age = clock.now - batch.timestamp
+        return age >= 0 && age <= config.maximumObservationAge
+    }
+
     private func scan(generation token: UInt64) {
-        guard generation == token, !scanning, !stopBlocked else { return }
-        if state == .searching && Double(scanCount) * config.scanIncrement >= config.maximumScanRotation - 0.0001 {
+        guard generation == token, !scanning, canScan else { return }
+        let limit = min(2 * .pi, config.maximumScanRotation)
+        if state == .searching && scanRotation >= limit - 0.0001 {
             Task { _ = await finish(.failed("No person found.")) }
             return
         }
         if state == .reacquiring, let deadline = reacquireDeadline, clock.now >= deadline { return }
         scanning = true
-        scanCount += 1
-        launchMovement(generation: token) { [motion, config] in
-            await motion.rotateForScan(by: config.scanIncrement)
+        let angle = state == .searching ? min(config.scanIncrement, limit - scanRotation) : config.scanIncrement
+        scanRotation += angle
+        launchMovement(generation: token) { [motion] in
+            guard self.generation == token, self.canScan else { return .cancelled }
+            return await motion.rotateForScan(by: angle)
         }
         // The scan completion schedules the next increment only after this one has finished.
         let id = operation
@@ -391,6 +594,7 @@ public final class FollowMeCoordinator {
 
     private func loseTarget(generation token: UInt64) async {
         guard generation == token, state != .reacquiring else { return }
+        cancelAlignment()
         state = .reacquiring
         reacquireDeadline = clock.now + config.reacquisitionSeconds
         guard await confirmStop(generation: token) else { return }
@@ -410,14 +614,12 @@ public final class FollowMeCoordinator {
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
         guard generation == token else { return }
         updatePerceptionIssue(issue)
-        if poseDeadline == nil { poseDeadline = clock.now + config.perceptionRecoverySeconds }
-        guard await confirmStop(generation: token) else { return }
-        // A fresh frame or terminal stop can arrive while motor acknowledgement is
-        // pending. Never resurrect a cleared deadline from a cancelled watchdog.
-        guard !Task.isCancelled, generation == token, let deadline = poseDeadline,
-              perceptionIssue != nil else { return }
-        lastGoal = nil
-        scanning = false
+        // The deadline also marks an outage whose stop has already been requested.
+        // Subsequent unhealthy frames update diagnostics without stopping again.
+        guard poseDeadline == nil else { return }
+        cancelAlignment()
+        let deadline = clock.now + config.perceptionRecoverySeconds
+        poseDeadline = deadline
         poseTask?.cancel()
         poseTask = Task { [weak self, clock] in
             await clock.sleep(seconds: max(0, deadline - clock.now))
@@ -425,6 +627,12 @@ public final class FollowMeCoordinator {
                   self.clock.now >= deadline else { return }
             _ = await self.finish(.failed(self.perceptionFailureMessage))
         }
+        // Enforce recovery independently of the duration of motor acknowledgement.
+        guard await confirmStop(generation: token) else { return }
+        guard generation == token, poseDeadline == deadline,
+              perceptionIssue != nil else { return }
+        lastGoal = nil
+        scanning = false
     }
 
     private func updatePerceptionIssue(_ issue: FollowPerceptionIssue?) {

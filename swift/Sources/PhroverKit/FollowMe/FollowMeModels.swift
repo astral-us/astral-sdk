@@ -44,6 +44,11 @@ public struct FollowMeConfiguration {
     public var minimumGoalChange: Double = 0.30
     public var maximumGoalUpdatesPerSecond: Double = 3
     public var perceptionRecoverySeconds: TimeInterval = 2
+    public var startupReadinessSeconds: TimeInterval = 5
+    public var stationaryPauseSeconds: TimeInterval = 5
+    public var departureRangeIncrease: Double = 0.30
+    /// Matches NavigationController's continuous rotation tolerance (radians).
+    public var alignmentAngularTolerance: Double = 0.05
     public var reacquisitionSeconds: TimeInterval = 10
 
     public init() {}
