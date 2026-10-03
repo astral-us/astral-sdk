@@ -15,7 +15,13 @@ public protocol OperatorFollow: AnyObject {
 }
 
 extension MissionAgent: OperatorMission {}
-extension FollowMeCoordinator: OperatorFollow {}
+extension FollowMeCoordinator: OperatorFollow, OperatorFollowTimedStart {}
+
+/// Optional timing companion; existing public follow conformers remain compatible.
+@MainActor
+protocol OperatorFollowTimedStart: OperatorFollow {
+    func start(commandReceivedAt: TimeInterval) async -> Bool
+}
 
 public enum OperatorSubmission: Equatable, Sendable {
     case accepted
@@ -42,23 +48,36 @@ public final class OperatorCommandRouter {
     private let mission: any OperatorMission
     private let follow: any OperatorFollow
     private let mayStartFollow: @MainActor () -> Bool
+    private let clock: any FollowMeClock
+    private let diagnosticEmitter: FollowDiagnosticEmitter
     private var owner: Owner = .idle
     private var generation: UInt64 = 0
     private var missionTask: Task<Void, Never>?
     private var pendingMissionStop: Task<Bool, Never>?
     private var stopTask: Task<OperatorSubmission, Never>?
+    private var commandSequence: UInt64 = 0
 
     public init(mission: any OperatorMission, follow: any OperatorFollow,
-                mayStartFollow: @escaping @MainActor () -> Bool = { true }) {
+                mayStartFollow: @escaping @MainActor () -> Bool = { true },
+                clock: any FollowMeClock = SystemFollowClock(),
+                eventSink: @escaping @MainActor (String, [String: String]) -> Void = { RuntimeFileLog.append($0, fields: $1) }) {
         self.mission = mission
         self.follow = follow
         self.mayStartFollow = mayStartFollow
+        self.clock = clock
+        self.diagnosticEmitter = FollowDiagnosticEmitter(streamID: "operator-router-\(UUID().uuidString)",
+            monotonic: { clock.now }, utc: { Date() }, sink: eventSink)
     }
 
-    public func submit(_ text: String) async -> OperatorSubmission {
+    public func submit(_ text: String, finalizedTextReceivedAt: TimeInterval? = nil) async -> OperatorSubmission {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .rejected("Enter a request first.") }
         let kind = OperatorCommandKind.classify(text)
+        commandSequence &+= 1
+        let commandID = commandSequence
+        let receivedAt = finalizedTextReceivedAt ?? clock.now
+        let origin = finalizedTextReceivedAt == nil ? "submitted_text_receipt" : "finalized_text_receipt"
+        emitCommand("operator_command.received", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
         if kind == .localStop { return await stop() }
         if kind == .localFollow {
             guard owner != .blocked && owner != .stopping else {
@@ -71,6 +90,7 @@ public final class OperatorCommandRouter {
             generation &+= 1
             let token = generation
             owner = .transitioning
+            emitCommand("operator_command.ownership_stop_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
             missionTask?.cancel()
             let stopping = Task { [mission] in
                 do { try await mission.cancelCurrentMissionAndWait(); return true }
@@ -82,9 +102,15 @@ public final class OperatorCommandRouter {
             pendingMissionStop = nil
             guard confirmed else {
                 owner = .blocked
+                emitCommand("operator_command.ownership_stop_failed", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
                 return .rejected("Rover stop could not be confirmed.")
             }
-            guard await follow.start(), generation == token else {
+            emitCommand("operator_command.ownership_stop_confirmed", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
+            emitCommand("operator_command.follow_start_requested", kind: kind, commandID: commandID, receivedAt: receivedAt, origin: origin)
+            let started: Bool
+            if let timed = follow as? any OperatorFollowTimedStart { started = await timed.start(commandReceivedAt: receivedAt) }
+            else { started = await follow.start() }
+            guard started, generation == token else {
                 owner = .idle
                 return .rejected("Could not start following.")
             }
@@ -102,6 +128,18 @@ public final class OperatorCommandRouter {
             if let self, self.generation == token, self.owner == .mission { self.owner = .idle }
         }
         return .accepted
+    }
+
+    private func emitCommand(_ event: String, kind: OperatorCommandKind, commandID: UInt64,
+                             receivedAt: TimeInterval, origin: String) {
+        let now = clock.now
+        let valid = receivedAt.isFinite && now.isFinite && receivedAt <= now
+        diagnosticEmitter.emit(.init(event: event, context: .init(sessionGeneration: generation,
+            phase: String(describing: owner)), payload: [
+                "command_id": .number(Double(commandID)), "command_kind": .string(String(describing: kind)),
+                "command_received_at_s": .number(receivedAt), "command_elapsed_s": valid ? .number(now - receivedAt) : .null,
+                "receipt_origin": .string(origin), "receipt_time_availability": .string(valid ? "available" : "invalid"),
+                "physical_utterance_time_availability": .string("not_measured"), "timing_clock": .string("system_uptime")]))
     }
 
     public func stop() async -> OperatorSubmission {

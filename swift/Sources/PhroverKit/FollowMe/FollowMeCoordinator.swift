@@ -19,7 +19,15 @@ public final class FollowMeCoordinator {
     public private(set) var state: FollowMeState = .idle {
         didSet {
             if state != oldValue {
+                let changedAt = clock.now
+                let previousPhaseElapsed = phaseStartedAt.map { changedAt - $0 }
+                phaseStartedAt = changedAt
                 log("follow_state")
+                var phasePayload = sessionTimingPayload
+                phasePayload["previous_phase"] = .string(String(describing: oldValue))
+                phasePayload["previous_phase_elapsed_s"] = previousPhaseElapsed.map { .number($0) } ?? .null
+                failureEmitter.emit(.init(event: "follow_phase", context: .init(sessionGeneration: generation,
+                    phase: String(describing: state)), payload: phasePayload))
                 if state == .waitingForClearance {
                     emitReadiness("follow_ready.clearance_entered", reason: "too_close_before_send")
                 } else if oldValue == .waitingForClearance {
@@ -52,6 +60,7 @@ public final class FollowMeCoordinator {
     private var framesTask: Task<Void, Never>?
     private var frameProcessorTask: Task<Void, Never>?
     private var pendingFrame: FollowFrameBatch?
+    private var evaluatedPendingSnapshot: FollowAdmissionSnapshot?
     private var safetyTask: Task<Void, Never>?
     private var movementTask: Task<Void, Never>?
     private var deadlineTask: Task<Void, Never>?
@@ -86,6 +95,9 @@ public final class FollowMeCoordinator {
     private var lastGoalTime: TimeInterval?
     private var latestFrame: ARFrameID?
     private var latestBatch: FollowFrameBatch?
+    private var commandReceivedAt: TimeInterval?
+    private var sessionStartedAt: TimeInterval?
+    private var phaseStartedAt: TimeInterval?
 
     private var perceptionFailureMessage: String {
         let issue = perceptionIssue ?? .noFrames
@@ -112,12 +124,23 @@ public final class FollowMeCoordinator {
 
     @discardableResult
     public func start() async -> Bool {
+        await startSession(commandReceivedAt: nil)
+    }
+
+    func start(commandReceivedAt: TimeInterval) async -> Bool {
+        await startSession(commandReceivedAt: commandReceivedAt)
+    }
+
+    private func startSession(commandReceivedAt: TimeInterval?) async -> Bool {
         guard !isActive, stopTask == nil, !stopBlocked else { return isActive }
         guard perception.detectorReady, perception.personLabelAvailable else {
             state = .failed("Person detector unavailable.")
             return false
         }
         generation &+= 1
+        self.commandReceivedAt = commandReceivedAt
+        sessionStartedAt = clock.now
+        phaseStartedAt = nil
         safetyTask?.cancel()
         failureResolution = nil
         activeRequest = nil
@@ -141,6 +164,7 @@ public final class FollowMeCoordinator {
         lastGoalTime = nil
         latestFrame = nil
         latestBatch = nil
+        evaluatedPendingSnapshot = nil
         summaryBudget = FollowSummaryBudget()
         diagnosticStopState = "unknown"
         readinessStopPending = false
@@ -148,6 +172,8 @@ public final class FollowMeCoordinator {
         loggedTrackingReason = nil
         perceptionIssue = .noFrames
         state = config.stationaryPauseSeconds > 0 ? .pausing : .searching
+        failureEmitter.emit(.init(event: "follow_session.started", context: .init(sessionGeneration: token,
+            phase: String(describing: state)), payload: sessionTimingPayload))
         updatePerceptionIssue(.noFrames)
         let events = perception.events()
         framesTask = Task { [weak self] in
@@ -179,7 +205,8 @@ public final class FollowMeCoordinator {
                 }
             }
         }
-        let pauseDeadline = clock.now + config.stationaryPauseSeconds
+        let pauseStartedAt = clock.now
+        let pauseDeadline = pauseStartedAt + config.stationaryPauseSeconds
         let startupDeadline = pauseDeadline + config.startupReadinessSeconds
         readinessDeadline = startupDeadline
         startupTask = Task { [weak self, clock] in
@@ -188,9 +215,20 @@ public final class FollowMeCoordinator {
             _ = await self.finish(.failed(self.perceptionFailureMessage))
         }
         if state == .pausing {
+            var payload = sessionTimingPayload
+            payload["pause_started_at_s"] = .number(pauseStartedAt)
+            payload["pause_deadline_s"] = .number(pauseDeadline)
+            failureEmitter.emit(.init(event: "follow_pause.started", context: .init(sessionGeneration: token,
+                phase: "pausing"), payload: payload))
             pauseTask = Task { [weak self, clock] in
                 await clock.sleep(seconds: max(0, pauseDeadline - clock.now))
                 guard !Task.isCancelled, let self, self.generation == token, self.state == .pausing else { return }
+                var payload = self.sessionTimingPayload
+                payload["pause_started_at_s"] = .number(pauseStartedAt)
+                payload["pause_deadline_s"] = .number(pauseDeadline)
+                payload["pause_elapsed_s"] = .number(clock.now - pauseStartedAt)
+                self.failureEmitter.emit(.init(event: "follow_pause.completed", context: .init(sessionGeneration: token,
+                    phase: "pausing"), payload: payload))
                 self.state = .searching
                 self.perceptionReady = false
                 // Revalidate the latest pause frame against the clock at pause completion.
@@ -218,6 +256,7 @@ public final class FollowMeCoordinator {
         frameProcessorTask?.cancel()
         frameProcessorTask = nil
         pendingFrame = nil
+        evaluatedPendingSnapshot = nil
         safetyTask?.cancel()
         movementTask?.cancel()
         deadlineTask?.cancel()
@@ -271,6 +310,7 @@ public final class FollowMeCoordinator {
         frameProcessorTask?.cancel()
         frameProcessorTask = nil
         pendingFrame = nil
+        evaluatedPendingSnapshot = nil
         if !resolvingFailure { safetyTask?.cancel() }
         movementTask?.cancel()
         deadlineTask?.cancel()
@@ -434,26 +474,15 @@ public final class FollowMeCoordinator {
             _ = await finish(.failed(perceptionFailureMessage))
             return
         }
+        let evaluatedPending = evaluatedPendingSnapshot?.batch.frameID == batch.frameID ? evaluatedPendingSnapshot : nil
         if let latestFrame, batch.frameID.generation == latestFrame.generation,
-           batch.frameID.sequence <= latestFrame.sequence { return }
+           batch.frameID.sequence <= latestFrame.sequence, evaluatedPending == nil { return }
+        evaluatedPendingSnapshot = nil
         latestFrame = batch.frameID
         latestBatch = batch
         let now = clock.now
         frameWatchdogTask?.cancel()
-        let issue: FollowPerceptionIssue?
-        if !batch.timestamp.isFinite || now - batch.timestamp < 0 || now - batch.timestamp > config.maximumObservationAge {
-            issue = .staleFrame
-        } else if batch.trackingQuality == .unavailable || (!perceptionReady && batch.trackingQuality == nil) {
-            issue = .trackingUnavailable
-        } else if batch.trackingQuality == .limited {
-            issue = .trackingLimited
-        } else if batch.pose == nil {
-            issue = .poseUnavailable
-        } else if !batch.depthAvailable {
-            issue = .depthUnavailable
-        } else {
-            issue = nil
-        }
+        let issue = FollowFrameHealth.issue(batch, now: now, configuration: config)
         updatePerceptionIssue(issue)
         var associationAvailable = false
         let frameContext = FollowDiagnosticContext(sessionGeneration: token, phase: String(describing: state),
@@ -528,7 +557,8 @@ public final class FollowMeCoordinator {
             } else if !scanning { scan(generation: token) }
         case .aligning, .waitingForClearance, .signalingReady, .waitingForMovement:
             guard let locked else { return }
-            let evaluated = tracker.continueTrackEvaluated(batch.people, previous: locked, predictedPosition: locked.position, now: now)
+            let evaluated = evaluatedPending?.association ?? tracker.continueTrackEvaluated(
+                batch.people, previous: locked, predictedPosition: locked.position, now: now, frameID: batch.frameID)
             associationAvailable = true
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             switch evaluated.decision {
@@ -579,7 +609,7 @@ public final class FollowMeCoordinator {
         case .following, .holdingDistance:
             guard let locked else { return }
             let evaluated = tracker.continueTrackEvaluated(batch.people, previous: locked,
-                                                           predictedPosition: locked.position, now: now)
+                predictedPosition: locked.position, now: now, frameID: batch.frameID)
             associationAvailable = true
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             switch evaluated.decision {
@@ -719,28 +749,57 @@ public final class FollowMeCoordinator {
         activeRequest = context
         emitReadiness("follow_ready.admission_pending", reason: "eligible_preflight")
         let admission = FollowReadyAdmission(validating: { [weak self] sample, readUptime in
-            guard let self, self.generation == token, self.operation == id,
-                  self.pendingAdmission == admissionToken, !Task.isCancelled,
-                  !self.readySignalAttempted, self.isActive, !self.stopBlocked,
-                  self.stopTask == nil, self.confirmationTask == nil else { return .deferred(.ownership) }
-            guard self.canScan else { return .deferred(.observation) }
-            guard self.pendingFrame == nil, let batch = self.latestBatch, let batchPose = batch.pose,
-                  let person = self.locked, person.frameID == batch.frameID,
-                  person.timestamp.isFinite, self.clock.now - person.timestamp >= 0,
-                  self.clock.now - person.timestamp <= self.config.maximumObservationAge else { return .deferred(.observation) }
+            guard let self else { return .deferred(.ownership) }
+            @MainActor func reject(_ reason: FollowReadyDeferral, _ condition: String) -> FollowReadyAdmissionDecision {
+                FollowReadyAdmissionScope.current?.rejectionCondition = condition
+                // Record the decision now, before asynchronous stop/result handling
+                // can replace the observation or fence this operation's delivery.
+                self.emitReadiness("follow_ready.admission_rejected", reason: reason.rawValue)
+                return .deferred(reason)
+            }
+            guard self.generation == token else { return reject(.ownership, "session_generation_changed") }
+            guard self.operation == id else { return reject(.ownership, "operation_replaced") }
+            guard self.pendingAdmission == admissionToken else { return reject(.ownership, "admission_token_changed") }
+            guard !Task.isCancelled else { return reject(.ownership, "task_cancelled") }
+            guard !self.readySignalAttempted else { return reject(.ownership, "attempt_already_consumed") }
+            guard self.isActive else { return reject(.ownership, "session_inactive") }
+            guard !self.stopBlocked else { return reject(.ownership, "stop_blocked") }
+            guard self.stopTask == nil else { return reject(.ownership, "stop_pending") }
+            guard self.confirmationTask == nil else { return reject(.ownership, "stop_confirmation_pending") }
+            guard self.perceptionReady else { return reject(.observation, "perception_not_ready") }
+            guard self.poseDeadline == nil else { return reject(.observation, "outage_recovery_pending") }
+            guard self.perceptionIssue == nil else { return reject(.observation, "perception_" + self.perceptionIssue!.rawValue) }
+            guard let batch = self.pendingFrame ?? self.latestBatch else { return reject(.observation, "frame_missing") }
+            let snapshot = FollowAdmissionSnapshot(batch: batch, previous: self.locked,
+                pending: self.pendingFrame != nil, tracker: self.tracker, now: self.clock.now, configuration: self.config)
+            FollowReadyAdmissionScope.current?.observationSnapshot = snapshot
+            FollowReadyAdmissionScope.current?.rejectionCondition = snapshot.rejection
+            if let rejection = snapshot.rejection { return reject(.observation, rejection) }
+            guard let person = snapshot.person, let batchPose = batch.pose else { return reject(.observation, "matched_geometry_missing") }
             let pose: Pose2D
             if let sample, sample.source != "legacy_unknown" {
-                guard let readUptime,
-                      sample.rejection(at: readUptime, expectedGeneration: batch.frameID.generation) == nil,
-                      let controllerPose = sample.pose else { return .deferred(.observation) }
+                guard let readUptime else { return reject(.observation, "controller_read_time_missing") }
+                if let rejection = sample.rejection(at: readUptime, expectedGeneration: batch.frameID.generation) {
+                    return reject(.observation, "controller_" + rejection)
+                }
+                guard let controllerPose = sample.pose else { return reject(.observation, "controller_pose_missing") }
                 pose = controllerPose
             } else {
                 // Legacy call/pose-only providers retain explicitly unknown provenance.
                 pose = batchPose
             }
             let heading = atan2(person.position.y - pose.position.y, person.position.x - pose.position.x)
-            guard abs(normalizeAngle(heading - pose.yaw)) <= self.config.alignmentAngularTolerance else { return .deferred(.heading) }
-            guard pose.position.distance(to: person.position) >= self.config.minimumHoldDistance + 0.12 else { return .deferred(.clearance) }
+            guard abs(normalizeAngle(heading - pose.yaw)) <= self.config.alignmentAngularTolerance else { return reject(.heading, "heading_outside_tolerance") }
+            guard pose.position.distance(to: person.position) >= self.config.minimumHoldDistance + 0.12 else { return reject(.clearance, "range_below_clearance") }
+            if snapshot.pending {
+                // Publish the accepted observation atomically. The processor still
+                // owns watchdogs and state handling, reusing this exact association.
+                self.evaluatedPendingSnapshot = snapshot
+                self.latestBatch = batch
+                self.latestFrame = batch.frameID
+                self.locked = person
+                self.lastPosition = person.position
+            }
             self.pendingAdmission = nil
             self.readySignalAttempted = true
             self.state = .signalingReady
@@ -814,6 +873,7 @@ public final class FollowMeCoordinator {
             frameProcessorTask?.cancel()
             frameProcessorTask = nil
             pendingFrame = nil
+            evaluatedPendingSnapshot = nil
             safetyTask?.cancel()
             movementTask?.cancel()
             deadlineTask?.cancel()
@@ -945,6 +1005,22 @@ public final class FollowMeCoordinator {
             payload: payload))
     }
 
+    private var sessionTimingPayload: [String: FollowDiagnosticValue] {
+        let now = clock.now
+        let commandElapsed = commandReceivedAt.flatMap { $0.isFinite && now >= $0 ? now - $0 : nil }
+        return ["command_received_at_s": commandReceivedAt.map { .number($0) } ?? .null,
+            "command_elapsed_s": commandElapsed.map { .number($0) } ?? .null,
+            "session_started_at_s": sessionStartedAt.map { .number($0) } ?? .null,
+            "session_elapsed_s": sessionStartedAt.map { .number(now - $0) } ?? .null,
+            "phase_started_at_s": phaseStartedAt.map { .number($0) } ?? .null,
+            "phase_elapsed_s": phaseStartedAt.map { .number(now - $0) } ?? .null,
+            "stationary_pause_seconds": .number(config.stationaryPauseSeconds),
+            "maximum_observation_age_s": .number(config.maximumObservationAge),
+            "alignment_angular_tolerance_rad": .number(config.alignmentAngularTolerance),
+            "ready_signal_clearance_m": .number(config.readySignalClearance),
+            "timing_clock": .string("system_uptime")]
+    }
+
     private var readinessPayload: [String: FollowDiagnosticValue] {
         FollowReadinessDiagnostics(batch: latestBatch, person: locked, now: clock.now, gate: readySignalClearance,
             pending: pendingAdmission != nil, attempted: readySignalAttempted, succeeded: readySignalSucceeded,
@@ -952,9 +1028,21 @@ public final class FollowMeCoordinator {
     }
 
     private func emitReadiness(_ event: String, reason: String, admission: FollowReadyAdmission? = nil) {
-        var payload = readinessPayload
-        payload.merge(FollowReadinessDiagnostics.controllerPayload(admission ?? FollowReadyAdmissionScope.current,
-            perceptionFrame: latestBatch?.frameID, sendAuthorized: readySignalAttempted, person: locked)) { _, new in new }
+        let admission = admission ?? FollowReadyAdmissionScope.current
+        let snapshot = admission?.observationSnapshot
+        var payload = snapshot.map { FollowReadinessDiagnostics(batch: $0.batch, person: $0.person,
+            now: $0.evaluatedAt, gate: config.readySignalClearance, pending: pendingAdmission != nil,
+            attempted: readySignalAttempted, succeeded: readySignalSucceeded, stopState: diagnosticStopState).payload } ?? readinessPayload
+        if let snapshot, let association = snapshot.association {
+            payload.merge(association.evaluation.payload(batch: snapshot.batch, now: snapshot.evaluatedAt, previousOutcome: nil)) { _, new in new }
+        }
+        payload["rejection_condition"] = admission?.rejectionCondition.map { .string($0) } ?? .null
+        payload["pending_frame_evaluation"] = .string(snapshot.map { $0.pending ? "evaluated" : "not_pending" } ?? "not_evaluated")
+        payload["admission_evaluated_at_s"] = snapshot.map { .number($0.evaluatedAt) } ?? .null
+        payload.merge(sessionTimingPayload) { _, new in new }
+        payload.merge(FollowReadinessDiagnostics.controllerPayload(admission,
+            perceptionFrame: snapshot?.batch.frameID ?? latestBatch?.frameID, sendAuthorized: readySignalAttempted,
+            person: snapshot == nil ? locked : snapshot?.person)) { _, new in new }
         failureEmitter.emit(.init(event: event,
             context: .init(sessionGeneration: generation, operationID: activeRequest?.requestToken,
                 purpose: "followReady", phase: String(describing: state), reason: reason), payload: payload))

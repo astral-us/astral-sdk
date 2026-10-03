@@ -39,9 +39,15 @@ public struct FollowTargetTracker {
     }
 
     func continueTrackEvaluated(_ people: [FollowPersonObservation], previous: FollowPersonObservation,
-                                predictedPosition: Vec2, now: TimeInterval)
+                                predictedPosition: Vec2, now: TimeInterval, frameID: ARFrameID? = nil)
         -> (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation) {
         evaluateMatches(people, now: now, mode: "continuity") { candidate, evidence in
+            guard candidate.frameID.generation == previous.frameID.generation else {
+                evidence.rejection = "frame_generation_mismatch"; return false
+            }
+            if let frameID, candidate.frameID != frameID {
+                evidence.rejection = "candidate_frame_mismatch"; return false
+            }
             let distance = candidate.position.distance(to: predictedPosition)
             evidence.record("world_distance_m", distance)
             guard distance <= configuration.maximumWorldDistance else {

@@ -13,29 +13,39 @@ final class ConversationViewModel {
     private var followState: () -> FollowMeState
     private var readySignalClearance: () -> Double
     private var inhibit: () -> Void
+    private var submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)?
+    private var monotonic: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
 
     init(submit: @escaping (String) async -> OperatorSubmission = { _ in .rejected("Rover is starting. Try again.") },
          stop: @escaping () async -> OperatorSubmission = { .accepted },
          followState: @escaping () -> FollowMeState = { .idle },
          readySignalClearance: @escaping () -> Double = { FollowMeConfiguration().readySignalClearance },
-         inhibit: @escaping () -> Void = {}) {
+         inhibit: @escaping () -> Void = {},
+         submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)? = nil,
+         monotonic: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.submit = submit
         self.stop = stop
         self.followState = followState
         self.readySignalClearance = readySignalClearance
         self.inhibit = inhibit
+        self.submitFinalized = submitFinalized
+        self.monotonic = monotonic
     }
 
     func configure(submit: @escaping (String) async -> OperatorSubmission,
                    stop: @escaping () async -> OperatorSubmission,
                    followState: @escaping () -> FollowMeState,
                    readySignalClearance: @escaping () -> Double = { FollowMeConfiguration().readySignalClearance },
-                   inhibit: @escaping () -> Void = {}) {
+                   inhibit: @escaping () -> Void = {},
+                   submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)? = nil,
+                   monotonic: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.submit = submit
         self.stop = stop
         self.followState = followState
         self.readySignalClearance = readySignalClearance
         self.inhibit = inhibit
+        self.submitFinalized = submitFinalized
+        self.monotonic = monotonic
     }
 
     var showsStopFollowing: Bool {
@@ -64,13 +74,17 @@ final class ConversationViewModel {
     }
 
     func submitFinalSpeech(_ text: String) async {
+        // Receipt of finalized recognized text, not acoustic utterance onset.
+        let receivedAt = monotonic()
         submissionGeneration &+= 1
         let generation = submissionGeneration
         let kind = OperatorCommandKind.classify(text)
         acceptsMissionPhase = kind == .mission
         missionPhase = kind == .mission ? .thinking : .idle
         if kind == .localStop { inhibit() }
-        let result = await submit(text)
+        let result: OperatorSubmission
+        if let submitFinalized { result = await submitFinalized(text, receivedAt) }
+        else { result = await submit(text) }
         guard generation == submissionGeneration else { return }
         switch result {
         case .accepted:

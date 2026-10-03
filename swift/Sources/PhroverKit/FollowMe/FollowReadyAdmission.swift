@@ -31,6 +31,8 @@ final class FollowReadyAdmission {
     private(set) var boundary: FollowReadyAdmissionBoundary?
     private(set) var controllerSample: NavigationPoseSample?
     private(set) var controllerReadUptime: Double?
+    var observationSnapshot: FollowAdmissionSnapshot?
+    var rejectionCondition: String?
     init(_ authorize: @escaping @MainActor () -> FollowReadyAdmissionDecision) {
         self.authorize = { _, _ in authorize() }
     }

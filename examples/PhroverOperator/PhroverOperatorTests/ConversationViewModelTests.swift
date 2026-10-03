@@ -5,6 +5,28 @@ import RoverNav
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testFinalizedSpeechPassesItsReceiptTimeBeforeAsynchronousRouting() async {
+        var now = 42.0
+        var receivedText: String?
+        var receivedAt: TimeInterval?
+        var legacySubmissions = 0
+        let model = ConversationViewModel()
+        model.configure(submit: { _ in legacySubmissions += 1; return .accepted },
+            stop: { .accepted }, followState: { .idle }, submitFinalized: { text, time in
+                receivedText = text
+                receivedAt = time
+                now = 42.3
+                await Task.yield()
+                return .accepted
+            }, monotonic: { now })
+        await model.submitFinalSpeech(" Follow Me! ")
+        XCTAssertEqual(receivedText, " Follow Me! ")
+        XCTAssertEqual(receivedAt, 42)
+        XCTAssertEqual(legacySubmissions, 0)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.missionPhase, .idle)
+    }
+
     func testClearanceLabelUsesConfiguredGateRoundedUpIncludingExactTenth() {
         var gate = 1.41
         let model = ConversationViewModel(followState: { .waitingForClearance }, readySignalClearance: { gate })

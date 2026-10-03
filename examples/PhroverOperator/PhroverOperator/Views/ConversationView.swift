@@ -105,17 +105,20 @@ struct ConversationView: View {
             agent = MissionAgent(motion: nav, perception: perception, voice: voice, phaseDidChange: { phase in
                 model.receiveMissionPhase(phase)
             }) { brain }
+            let followClock = SystemFollowClock()
             let follow = FollowMeCoordinator(
                 perception: ARFollowMePerceptionSource(ar: ar, detector: detector),
-                motion: NavigationFollowMeMotion(navigation: nav), clock: SystemFollowClock()
+                motion: NavigationFollowMeMotion(navigation: nav), clock: followClock
             )
             guard let agent else { return }
             let router = OperatorCommandRouter(mission: agent, follow: follow,
-                                               mayStartFollow: otherMotionActive)
+                                               mayStartFollow: otherMotionActive, clock: followClock)
             model.configure(submit: { await router.submit($0) },
                             stop: { await router.stop() }, followState: { follow.state },
                             readySignalClearance: { follow.readySignalClearance },
-                            inhibit: { follow.inhibitMotion() })
+                            inhibit: { follow.inhibitMotion() },
+                            submitFinalized: { text, receivedAt in await router.submit(text, finalizedTextReceivedAt: receivedAt) },
+                            monotonic: { followClock.now })
             authorized = await speechIn.requestAuthorization()
         }
         .onDisappear {
