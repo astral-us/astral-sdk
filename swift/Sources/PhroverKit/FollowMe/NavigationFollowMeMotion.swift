@@ -2,7 +2,7 @@ import Foundation
 import RoverNav
 
 @MainActor
-public final class NavigationFollowMeMotion: FollowMeContextualMotion {
+public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeAbsoluteHeadingMotion {
     private let navigation: NavigationController
 
     public init(navigation: NavigationController) { self.navigation = navigation }
@@ -30,6 +30,16 @@ public final class NavigationFollowMeMotion: FollowMeContextualMotion {
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
         await navigation.performFollowMotion(request, context: context)
     }
+
+    func performRecovery(_ request: FollowRecoveryHeadingRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
+        await FollowRecoveryScope.$authorization.withValue(request.authorization) {
+            await FollowRecoveryScope.$heading.withValue(request) {
+                await navigation.performFollowMotion(.scan(0), context: context)
+            }
+        }
+    }
+
+    func recoveryPoseSample() -> NavigationPoseSample { navigation.readFollowPose() }
 
     func motionFailures() -> AsyncStream<FollowMotionFailureDelivery> { navigation.followMotionFailures() }
 

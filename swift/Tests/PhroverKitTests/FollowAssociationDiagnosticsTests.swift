@@ -4,6 +4,20 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowAssociationDiagnosticsTests: XCTestCase {
+    func testRecoveryEvaluationReportsGenerationAndBatchRejectionsBeforeSpatialGate() {
+        let candidate = person(3, position: Vec2(4, 0))
+        let tracker = FollowTargetTracker()
+        let wrongGeneration = tracker.reacquireEvaluated([candidate], lastPosition: Vec2(4, 0), now: 10,
+            expectedGeneration: candidate.frameID.generation + 1, frameID: candidate.frameID)
+        XCTAssertEqual(wrongGeneration.evaluation.outcome, "lost")
+        XCTAssertEqual(wrongGeneration.evaluation.candidates.first?["rejection_reason"], .string("frame_generation_mismatch"))
+        let wrongBatch = tracker.reacquireEvaluated([candidate], lastPosition: Vec2(4, 0), now: 10,
+            expectedGeneration: candidate.frameID.generation,
+            frameID: .init(generation: candidate.frameID.generation, sequence: 99))
+        XCTAssertEqual(wrongBatch.evaluation.outcome, "lost")
+        XCTAssertEqual(wrongBatch.evaluation.candidates.first?["rejection_reason"], .string("candidate_frame_mismatch"))
+    }
+
     func testDiagnosticHeadingUsesHalfOpenNormalizationAndUnknownHealthStaysExplicit() throws {
         let candidate = person(1, position: Vec2(-1, 0))
         let evaluation = FollowTargetTracker().selectInitialEvaluated([candidate], now: 10).evaluation
@@ -46,24 +60,25 @@ final class FollowAssociationDiagnosticsTests: XCTestCase {
         XCTAssertEqual(tracker.selectInitialEvaluated([fresh], now: 10).decision?.frameID, fresh.frameID)
         XCTAssertEqual(tracker.selectInitialEvaluated([], now: 10).evaluation.outcome, "lost")
 
-        // Exact binary geometry: IoU is 0.5, centre displacement is 0.25.
+        // Exact binary interior geometry: IoU is 0.5, centre displacement is 0.125.
+        // Edge-touching boxes are rejected by the approved clipping gate before association.
         var config = FollowMeConfiguration()
         config.minimumBoxIoU = 0.5
-        config.maximumScreenCenterDistance = 0.125
+        config.maximumScreenCenterDistance = 0.0625
         let exact = FollowTargetTracker(configuration: config)
-        let prior = person(11, position: .zero, box: CGRect(x: 0, y: 0, width: 0.75, height: 0.5))
-        let iouBoundary = person(12, position: Vec2(0.75, 0), box: CGRect(x: 0.25, y: 0, width: 0.75, height: 0.5))
-        let iouBelow = person(13, position: .zero, box: CGRect(x: 0.2501, y: 0, width: 0.75, height: 0.5))
+        let prior = person(11, position: .zero, box: CGRect(x: 0.125, y: 0.125, width: 0.375, height: 0.5))
+        let iouBoundary = person(12, position: Vec2(0.75, 0), box: CGRect(x: 0.25, y: 0.125, width: 0.375, height: 0.5))
+        let iouBelow = person(13, position: .zero, box: CGRect(x: 0.2501, y: 0.125, width: 0.375, height: 0.5))
         XCTAssertEqual(exact.continueTrackEvaluated([iouBoundary], previous: prior, predictedPosition: .zero, now: 10).evaluation.outcome, "continued")
         XCTAssertEqual(exact.continueTrackEvaluated([iouBelow], previous: prior, predictedPosition: .zero, now: 10).evaluation.outcome, "lost")
         config.minimumBoxIoU = 1
-        config.maximumScreenCenterDistance = 0.25
+        config.maximumScreenCenterDistance = 0.125
         let screenTracker = FollowTargetTracker(configuration: config)
         let screenBoundary = screenTracker.continueTrackEvaluated([iouBoundary], previous: prior, predictedPosition: .zero, now: 10)
         XCTAssertEqual(screenBoundary.evaluation.outcome, "continued")
         guard case .object(let gates) = screenBoundary.evaluation.candidates[0]["gate_metrics"] else { return XCTFail("Missing gates") }
         XCTAssertEqual(gates["box_iou"], .number(0.5))
-        XCTAssertEqual(gates["screen_displacement"], .number(0.25))
+        XCTAssertEqual(gates["screen_displacement"], .number(0.125))
         XCTAssertEqual(screenTracker.continueTrackEvaluated([iouBelow], previous: prior, predictedPosition: .zero, now: 10).evaluation.outcome, "lost")
         XCTAssertEqual(screenTracker.continueTrackEvaluated([iouBoundary, iouBoundary], previous: prior, predictedPosition: .zero, now: 10).evaluation.outcome, "ambiguous")
         guard case .matched(let selected) = exact.continueTrack([iouBoundary], previous: prior, predictedPosition: .zero, now: 10) else { return XCTFail("Legacy continuity changed") }

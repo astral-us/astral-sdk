@@ -4,7 +4,14 @@ import RoverNav
 
 @MainActor
 final class ManualFollowClock: FollowMeClock {
-    private(set) var now: TimeInterval = 0
+    private var time: TimeInterval = 0
+    var onNextRead: (() -> Void)?
+    var now: TimeInterval {
+        let callback = onNextRead
+        onNextRead = nil
+        callback?()
+        return time
+    }
     private var sleepers: [(TimeInterval, CheckedContinuation<Void, Never>)] = []
 
     func sleep(seconds: Double) async {
@@ -12,7 +19,7 @@ final class ManualFollowClock: FollowMeClock {
     }
 
     func advance(to time: TimeInterval, wakeSleepers: Bool = true) {
-        now = time
+        self.time = time
         guard wakeSleepers else { return }
         let ready = sleepers.filter { $0.0 <= time }
         sleepers.removeAll { $0.0 <= time }

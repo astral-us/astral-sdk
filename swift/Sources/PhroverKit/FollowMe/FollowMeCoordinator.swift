@@ -24,6 +24,7 @@ public final class FollowMeCoordinator {
                 phaseStartedAt = changedAt
                 log("follow_state")
                 var phasePayload = sessionTimingPayload
+                phasePayload.merge(recoverySnapshot(now: changedAt)) { _, new in new }
                 phasePayload["previous_phase"] = .string(String(describing: oldValue))
                 phasePayload["previous_phase_elapsed_s"] = previousPhaseElapsed.map { .number($0) } ?? .null
                 failureEmitter.emit(.init(event: "follow_phase", context: .init(sessionGeneration: generation,
@@ -61,6 +62,8 @@ public final class FollowMeCoordinator {
     private var frameProcessorTask: Task<Void, Never>?
     private var pendingFrame: FollowFrameBatch?
     private var evaluatedPendingSnapshot: FollowAdmissionSnapshot?
+    /// Original continuity decision, before adopting this frame's selected lock.
+    private var currentAssociation: (generation: UInt64, frameID: ARFrameID, decision: FollowTrackMatch)?
     private var safetyTask: Task<Void, Never>?
     private var movementTask: Task<Void, Never>?
     private var deadlineTask: Task<Void, Never>?
@@ -86,8 +89,18 @@ public final class FollowMeCoordinator {
     private var confirmationID: UInt64 = 0
     private var stopBlocked = false
     private var locked: FollowPersonObservation?
-    private var lastPosition: Vec2?
-    private var reacquireDeadline: TimeInterval?
+    private var reliableMemory: FollowReliableMemory?
+    private var recoveryEpisode: FollowReacquisitionEpisode?
+    private var recoveryCenterSource: NavigationPoseSample?
+    private var recoveryCenterReadUptime: Double?
+    private var recoveryDiagnosticUnavailable: String?
+    private var pendingRecoveryTermination: FollowDiagnosticEvent?
+    private var recoveryHasProvisionalLock = false
+    private struct RecoveryStopBoundary {
+        let frameID: ARFrameID
+        let time: TimeInterval
+    }
+    private var recoveryStopBoundary: RecoveryStopBoundary?
     private var poseDeadline: TimeInterval?
     private var scanRotation: Double = 0
     private var scanning = false
@@ -154,8 +167,14 @@ public final class FollowMeCoordinator {
         readySignalConfirmedAfter = nil
         readySignalCompletionTime = nil
         departurePending = config.departureRangeIncrease > 0
-        lastPosition = nil
-        reacquireDeadline = nil
+        reliableMemory = nil
+        recoveryEpisode = nil
+        recoveryCenterSource = nil
+        recoveryCenterReadUptime = nil
+        recoveryDiagnosticUnavailable = nil
+        pendingRecoveryTermination = nil
+        recoveryHasProvisionalLock = false
+        recoveryStopBoundary = nil
         poseDeadline = nil
         perceptionReady = false
         scanRotation = 0
@@ -165,6 +184,7 @@ public final class FollowMeCoordinator {
         latestFrame = nil
         latestBatch = nil
         evaluatedPendingSnapshot = nil
+        currentAssociation = nil
         summaryBudget = FollowSummaryBudget()
         diagnosticStopState = "unknown"
         readinessStopPending = false
@@ -248,6 +268,8 @@ public final class FollowMeCoordinator {
     /// or Talk. The caller must subsequently await stop() before handing off motion.
     public func inhibitMotion() {
         guard isActive, stopTask == nil else { return }
+        emitRecovery("fenced", reason: "lifecycle_inhibition", stop: "pending")
+        pendingRecoveryTermination = recoveryTermination(reason: "lifecycle_inhibition", phase: .stopped)
         emitReadyCancellation(.stopped)
         generation &+= 1
         operation &+= 1
@@ -257,6 +279,7 @@ public final class FollowMeCoordinator {
         frameProcessorTask = nil
         pendingFrame = nil
         evaluatedPendingSnapshot = nil
+        currentAssociation = nil
         safetyTask?.cancel()
         movementTask?.cancel()
         deadlineTask?.cancel()
@@ -275,6 +298,8 @@ public final class FollowMeCoordinator {
 
     private func finish(_ result: FollowMeState, resolvingFailure: Bool = false) async -> Bool {
         if let stopTask {
+            let recoveryTermination = pendingRecoveryTermination
+            pendingRecoveryTermination = nil
             let confirmed = await stopTask.value
             if !confirmed {
                 stopBlocked = true
@@ -282,6 +307,7 @@ public final class FollowMeCoordinator {
             }
             self.stopTask = nil
             recordReadinessStop(confirmed)
+            if let recoveryTermination { emitRecoveryTermination(recoveryTermination, confirmed: confirmed) }
             return confirmed
         }
         if !isActive {
@@ -302,6 +328,7 @@ public final class FollowMeCoordinator {
             recordReadinessStop(confirmed)
             return confirmed
         }
+        let terminalRecovery = recoveryTermination(reason: result == .stopped ? "local_stop" : "terminal_failure", phase: result)
         emitReadyCancellation(result)
         generation &+= 1 // Inhibit callbacks and new goals before the first suspension.
         operation &+= 1
@@ -311,6 +338,7 @@ public final class FollowMeCoordinator {
         frameProcessorTask = nil
         pendingFrame = nil
         evaluatedPendingSnapshot = nil
+        currentAssociation = nil
         if !resolvingFailure { safetyTask?.cancel() }
         movementTask?.cancel()
         deadlineTask?.cancel()
@@ -351,6 +379,7 @@ public final class FollowMeCoordinator {
         }
         stopTask = nil
         pruneFailureResolution()
+        if let terminalRecovery { emitRecoveryTermination(terminalRecovery, confirmed: confirmed) }
         return confirmed
     }
 
@@ -442,6 +471,15 @@ public final class FollowMeCoordinator {
         case .failed(let message): _ = await finish(.failed(message))
         case .frame(let batch):
             guard generation == token, isActive, !stopBlocked else { return }
+            let receivedAt = clock.now
+            if let expected = recoveryEpisode?.anchor?.frameID.generation, batch.frameID.generation != expected {
+                _ = await finish(.failed("AR session reset during recovery."))
+                return
+            }
+            if let episode = recoveryEpisode, receivedAt >= episode.deadline {
+                _ = await expireRecovery(generation: token)
+                return
+            }
             if let previous = pendingFrame?.frameID ?? latestFrame,
                batch.frameID.generation == previous.generation,
                batch.frameID.sequence <= previous.sequence { return }
@@ -464,6 +502,7 @@ public final class FollowMeCoordinator {
 
     private func receive(_ batch: FollowFrameBatch, generation token: UInt64) async {
         guard generation == token, isActive, !stopBlocked else { return }
+        if recoveryExpired { _ = await expireRecovery(generation: token); return }
         if state != .pausing, !perceptionReady, let deadline = readinessDeadline, clock.now >= deadline {
             _ = await finish(.failed(perceptionFailureMessage))
             return
@@ -479,6 +518,7 @@ public final class FollowMeCoordinator {
            batch.frameID.sequence <= latestFrame.sequence, evaluatedPending == nil { return }
         evaluatedPendingSnapshot = nil
         latestFrame = batch.frameID
+        currentAssociation = nil
         latestBatch = batch
         let now = clock.now
         frameWatchdogTask?.cancel()
@@ -495,7 +535,8 @@ public final class FollowMeCoordinator {
                summaryBudget.takePipeline(signature: (issue?.rawValue ?? "healthy") + "|"
                     + (batch.trackingReason?.rawValue ?? "none") + "|"
                     + (batch.perceptionDiagnostics?.transitionSignature ?? "unknown"), now: now, healthy: issue == nil) {
-                failureEmitter.emit(.init(event: "follow_frame", context: frameContext, payload: framePayload))
+                failureEmitter.emit(.init(event: "follow_frame", context: frameContext,
+                    payload: framePayload.merging(recoverySnapshot(now: now)) { _, new in new }))
             }
         }
         // Observe diagnostics throughout the mandatory stationary interval. Readiness
@@ -537,7 +578,7 @@ public final class FollowMeCoordinator {
         }
         switch state {
         case .searching:
-            let evaluated = tracker.selectInitialEvaluated(batch.people, now: now)
+            let evaluated = tracker.selectInitialEvaluated(batch.people, now: now, frameID: batch.frameID)
             associationAvailable = true
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             if let selected = evaluated.decision {
@@ -546,7 +587,7 @@ public final class FollowMeCoordinator {
                     movementTask?.cancel()
                 }
                 locked = selected
-                lastPosition = selected.position
+                adoptMemory(selected, batch: batch, association: .initial)
                 if config.departureRangeIncrease > 0 {
                     state = .aligning
                     align(generation: token)
@@ -559,12 +600,13 @@ public final class FollowMeCoordinator {
             guard let locked else { return }
             let evaluated = evaluatedPending?.association ?? tracker.continueTrackEvaluated(
                 batch.people, previous: locked, predictedPosition: locked.position, now: now, frameID: batch.frameID)
+            currentAssociation = (token, batch.frameID, evaluated.decision)
             associationAvailable = true
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             switch evaluated.decision {
             case .matched(let selected):
                 self.locked = selected
-                lastPosition = selected.position
+                adoptMemory(selected, batch: batch, association: .continued)
                 if state == .waitingForMovement {
                     if let baseline = departureBaseline,
                        batch.pose!.position.distance(to: selected.position) >= baseline + config.departureRangeIncrease {
@@ -577,8 +619,10 @@ public final class FollowMeCoordinator {
                         return
                     }
                     if readySignalSucceeded, let confirmed = readySignalConfirmedAfter,
-                       confirmed != batch.frameID, let completed = readySignalCompletionTime,
+                       confirmed.generation == batch.frameID.generation, batch.frameID.sequence > confirmed.sequence,
+                       let completed = readySignalCompletionTime,
                        batch.timestamp >= completed {
+                        guard await restoreRecovery(selected, phase: .waitingForMovement) else { return }
                         departureBaseline = batch.pose!.position.distance(to: selected.position)
                         state = .waitingForMovement
                     }
@@ -586,11 +630,20 @@ public final class FollowMeCoordinator {
                     if let completed = alignmentCompletionTime, batch.timestamp < completed { return }
                     let heading = atan2(selected.position.y - batch.pose!.position.y,
                                         selected.position.x - batch.pose!.position.x)
-                    if let confirmed = alignmentConfirmedAfter, confirmed != batch.frameID,
+                    if let confirmed = alignmentConfirmedAfter,
+                       confirmed.generation == batch.frameID.generation, batch.frameID.sequence > confirmed.sequence,
                        abs(normalizeAngle(heading - batch.pose!.yaw)) <= config.alignmentAngularTolerance {
+                        if recoveryEpisode != nil, !recoveryFrameEligible(selected, batch: batch) { return }
                         if !readySignalAttempted {
-                            signalReady(generation: token)
+                            await signalReady(generation: token)
                         } else if readySignalSucceeded {
+                            if departureBaseline == nil {
+                                guard let confirmed = readySignalConfirmedAfter,
+                                      confirmed.generation == batch.frameID.generation,
+                                      batch.frameID.sequence > confirmed.sequence,
+                                      let completed = readySignalCompletionTime, batch.timestamp >= completed else { return }
+                            }
+                            guard await restoreRecovery(selected, phase: .waitingForMovement) else { return }
                             if departureBaseline == nil {
                                 // The one move finished, but loss preceded its post-stop baseline.
                                 departureBaseline = batch.pose!.position.distance(to: selected.position)
@@ -610,36 +663,60 @@ public final class FollowMeCoordinator {
             guard let locked else { return }
             let evaluated = tracker.continueTrackEvaluated(batch.people, previous: locked,
                 predictedPosition: locked.position, now: now, frameID: batch.frameID)
+            currentAssociation = (token, batch.frameID, evaluated.decision)
             associationAvailable = true
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             switch evaluated.decision {
             case .matched(let selected):
                 self.locked = selected
-                lastPosition = selected.position
+                adoptMemory(selected, batch: batch, association: .continued)
                 await follow(selected, rover: batch.pose!.position, generation: token)
             case .lost, .ambiguous: await loseTarget(generation: token)
             }
         case .reacquiring:
-            guard let deadline = reacquireDeadline, now < deadline, let lastPosition else { return }
-            let evaluated = tracker.reacquireEvaluated(batch.people, lastPosition: lastPosition, now: now)
+            guard let episode = recoveryEpisode, now < episode.deadline, let point = episode.anchor?.position else { return }
+            if recoveryStopBoundary != nil, let locked {
+                let evaluated = tracker.continueTrackEvaluated(batch.people, previous: locked,
+                    predictedPosition: locked.position, now: now, frameID: batch.frameID)
+                currentAssociation = (token, batch.frameID, evaluated.decision)
+                associationAvailable = true
+                emitAssociation(evaluated.evaluation, batch: batch, now: now)
+                if case .matched(let selected) = evaluated.decision {
+                    self.locked = selected
+                    if !departurePending, recoveryFrameEligible(selected, batch: batch) {
+                        await follow(selected, rover: batch.pose!.position, generation: token)
+                    }
+                } else {
+                    recoveryStopBoundary = nil
+                    scan(generation: token)
+                }
+                return
+            }
+            let deadline = episode.deadline
+            let evaluated = tracker.reacquireEvaluated(batch.people, lastPosition: point, now: now,
+                expectedGeneration: episode.anchor?.frameID.generation, frameID: batch.frameID)
+            currentAssociation = (token, batch.frameID, evaluated.decision)
             associationAvailable = true
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             if case .matched(let selected) = evaluated.decision {
-                if scanning {
-                    (motion as? any FollowMeContextualMotion)?.inhibitScanContinuation(origin: .detection)
-                    movementTask?.cancel()
+                (motion as? any FollowMeContextualMotion)?.inhibitScanContinuation(origin: .detection)
+                movementTask?.cancel()
+                guard await confirmStop(generation: token, origin: .detection) else { return }
+                scanning = false
+                guard generation == token, recoveryEpisode?.id == episode.id, state == .reacquiring,
+                      let stoppedFrame = pendingFrame?.frameID ?? latestFrame else { return }
+                let stopBoundary = RecoveryStopBoundary(frameID: stoppedFrame, time: clock.now)
+                if stopBoundary.time >= deadline {
+                    _ = await expireRecovery(generation: token, at: stopBoundary.time)
+                    return
                 }
-                if scanning { guard await confirmStop(generation: token, origin: .detection) else { return }; scanning = false }
-                guard generation == token, clock.now < deadline else { return }
-                reacquireDeadline = nil
-                deadlineTask?.cancel()
+                recoveryStopBoundary = stopBoundary
                 locked = selected
-                self.lastPosition = selected.position
+                recoveryHasProvisionalLock = true
+                emitRecovery("retained", reason: "provisional_detection_post_stop", stop: "confirmed")
                 if departurePending {
                     state = .aligning
                     align(generation: token)
-                } else {
-                    await follow(selected, rover: batch.pose!.position, generation: token)
                 }
             } else if !scanning { scan(generation: token) }
         default: break
@@ -652,18 +729,22 @@ public final class FollowMeCoordinator {
         let distance = rover.distance(to: selected.position)
         guard distance.isFinite else { await loseTarget(generation: token); return }
         guard distance > config.maximumHoldDistance else {
-            state = .holdingDistance
             if lastGoal != nil { _ = await confirmStop(generation: token) }
+            guard generation == token else { return }
+            if recoveryExpired { _ = await expireRecovery(generation: token); return }
+            guard await restoreRecovery(selected, phase: .holdingDistance) else { return }
+            state = .holdingDistance
             lastGoal = nil
             return
         }
         guard let goal = tracker.standOffGoal(rover: rover, person: selected.position) else { return }
-        state = .following
+        if recoveryEpisode == nil { state = .following }
         if let lastGoal, let lastGoalTime {
             guard goal.distance(to: lastGoal) >= config.minimumGoalChange,
                   clock.now - lastGoalTime >= 1 / config.maximumGoalUpdatesPerSecond else { return }
         }
         guard await confirmStop(generation: token), generation == token else { return }
+        if recoveryExpired { _ = await expireRecovery(generation: token); return }
         guard latestFrame == selected.frameID,
               clock.now - selected.timestamp >= 0,
               clock.now - selected.timestamp <= config.maximumObservationAge,
@@ -671,6 +752,8 @@ public final class FollowMeCoordinator {
             await perceptionUnavailable(perceptionIssue ?? .staleFrame, generation: token)
             return
         }
+        guard await restoreRecovery(selected, phase: .following) else { return }
+        state = .following
         lastGoal = goal
         lastGoalTime = clock.now
         launchMovement(generation: token, purpose: .followGoal) { [motion] context in
@@ -712,15 +795,17 @@ public final class FollowMeCoordinator {
             let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id,
                 purpose: .followAlignment, phase: capturedPhase)
             self.activeRequest = context
-            let contextualResult = await self.motion.performContextual(.alignment(angle), context: context)
+            let contextualResult = await self.motion.performContextual(.alignment(angle), context: context,
+                recovery: self.recoveryAuthorization(generation: token, operation: id))
             if await self.consumeResult(contextualResult) { return }
+            if self.recoveryExpired { _ = await self.expireRecovery(generation: token); return }
             let result = contextualResult.result
             guard self.generation == token, self.operation == id, self.alignmentSerial == serial,
                   self.state == .aligning else { return }
             guard await self.confirmStop(generation: token), self.alignmentSerial == serial,
                   self.state == .aligning, self.canScan else { return }
             guard result == .arrived else { return }
-            self.alignmentConfirmedAfter = self.latestFrame
+            self.alignmentConfirmedAfter = self.pendingFrame?.frameID ?? self.latestFrame
             self.alignmentCompletionTime = self.clock.now
         }
     }
@@ -733,10 +818,11 @@ public final class FollowMeCoordinator {
         alignmentCompletionTime = nil
     }
 
-    private func signalReady(generation token: UInt64) {
+    private func signalReady(generation token: UInt64) async {
         guard generation == token, canScan, !readySignalAttempted, pendingAdmission == nil else { return }
         guard let pose = latestBatch?.pose, let locked,
               pose.position.distance(to: locked.position) >= config.minimumHoldDistance + 0.12 else {
+            if let locked, !(await restoreRecovery(locked, phase: .waitingForClearance)) { return }
             state = .waitingForClearance
             return
         }
@@ -760,6 +846,7 @@ public final class FollowMeCoordinator {
             guard self.generation == token else { return reject(.ownership, "session_generation_changed") }
             guard self.operation == id else { return reject(.ownership, "operation_replaced") }
             guard self.pendingAdmission == admissionToken else { return reject(.ownership, "admission_token_changed") }
+            guard !self.recoveryExpired else { return reject(.ownership, "recovery_deadline_expired") }
             guard !Task.isCancelled else { return reject(.ownership, "task_cancelled") }
             guard !self.readySignalAttempted else { return reject(.ownership, "attempt_already_consumed") }
             guard self.isActive else { return reject(.ownership, "session_inactive") }
@@ -776,6 +863,14 @@ public final class FollowMeCoordinator {
             FollowReadyAdmissionScope.current?.rejectionCondition = snapshot.rejection
             if let rejection = snapshot.rejection { return reject(.observation, rejection) }
             guard let person = snapshot.person, let batchPose = batch.pose else { return reject(.observation, "matched_geometry_missing") }
+            if self.recoveryEpisode != nil {
+                guard self.recoveryFrameEligible(person, batch: batch),
+                      let confirmed = self.alignmentConfirmedAfter,
+                      batch.frameID.generation == confirmed.generation, batch.frameID.sequence > confirmed.sequence,
+                      let completed = self.alignmentCompletionTime, batch.timestamp >= completed else {
+                    return reject(.observation, "recovery_post_stop_match_required")
+                }
+            }
             let pose: Pose2D
             if let sample, sample.source != "legacy_unknown" {
                 guard let readUptime else { return reject(.observation, "controller_read_time_missing") }
@@ -791,14 +886,18 @@ public final class FollowMeCoordinator {
             let heading = atan2(person.position.y - pose.position.y, person.position.x - pose.position.x)
             guard abs(normalizeAngle(heading - pose.yaw)) <= self.config.alignmentAngularTolerance else { return reject(.heading, "heading_outside_tolerance") }
             guard pose.position.distance(to: person.position) >= self.config.minimumHoldDistance + 0.12 else { return reject(.clearance, "range_below_clearance") }
+            guard !self.recoveryExpired else { return reject(.ownership, "recovery_deadline_expired") }
             if snapshot.pending {
                 // Publish the accepted observation atomically. The processor still
                 // owns watchdogs and state handling, reusing this exact association.
                 self.evaluatedPendingSnapshot = snapshot
+                if let association = snapshot.association {
+                    self.currentAssociation = (token, batch.frameID, association.decision)
+                }
                 self.latestBatch = batch
                 self.latestFrame = batch.frameID
                 self.locked = person
-                self.lastPosition = person.position
+                self.adoptMemory(person, batch: batch, association: .acceptedPendingContinuity)
             }
             self.pendingAdmission = nil
             self.readySignalAttempted = true
@@ -808,13 +907,28 @@ public final class FollowMeCoordinator {
             return .accepted
         })
         movementTask = Task { [weak self, motion] in
-            let contextualResult = await motion.performContextual(.ready, context: context, admission: admission)
+            let contextualResult = await motion.performContextual(.ready, context: context, admission: admission,
+                recovery: self?.recoveryAuthorization(generation: token, operation: id))
             guard let self else { return }
             if self.pendingAdmission == admissionToken { self.pendingAdmission = nil }
             if await self.consumeResult(contextualResult) { return }
+            if self.recoveryExpired { _ = await self.expireRecovery(generation: token); return }
             guard self.generation == token, self.operation == id else { return }
             if case .notStarted(let deferred) = contextualResult.outcome {
                 self.diagnosticStopState = "confirmed"
+                if deferred == .clearance, contextualResult.stopOutcome == .confirmed,
+                   let snapshot = admission.observationSnapshot, let person = snapshot.person,
+                   let batch = self.pendingFrame ?? self.latestBatch,
+                   batch.frameID == snapshot.batch.frameID,
+                   self.recoveryFrameEligible(person, batch: batch) {
+                    if snapshot.pending {
+                        self.evaluatedPendingSnapshot = snapshot
+                        self.latestBatch = batch
+                        self.latestFrame = batch.frameID
+                        self.locked = person
+                    }
+                    guard await self.restoreRecovery(person, phase: .waitingForClearance) else { return }
+                }
                 self.state = .waitingForClearance
                 self.emitReadiness("follow_ready.admission_deferred", reason: deferred.rawValue, admission: admission)
                 if deferred == .heading { self.state = .aligning; self.align(generation: token) }
@@ -833,7 +947,7 @@ public final class FollowMeCoordinator {
             guard await self.confirmStop(generation: token), self.state == .signalingReady,
                   self.canScan else { return }
             self.readySignalSucceeded = true
-            self.readySignalConfirmedAfter = self.latestFrame
+            self.readySignalConfirmedAfter = self.pendingFrame?.frameID ?? self.latestFrame
             self.readySignalCompletionTime = self.clock.now
             self.emitReadiness("follow_ready.completed", reason: "final_stop_confirmed_new_frame_required")
         }
@@ -848,6 +962,10 @@ public final class FollowMeCoordinator {
             let id = confirmationID
             let confirmed = await confirmationTask.value
             if confirmed, confirmationID == id { self.confirmationTask = nil }
+            if confirmed, generation == token, recoveryExpired {
+                _ = await expireRecovery(generation: token)
+                return false
+            }
             return confirmed && generation == token && !stopBlocked && stopTask == nil
         }
         confirmationID &+= 1
@@ -861,7 +979,26 @@ public final class FollowMeCoordinator {
         }
         confirmationTask = task
         diagnosticStopState = "pending"
+        let recoveryStopPayload = recoveryEpisode.map {
+            FollowReacquisitionDiagnostics.payload($0, now: clock.now, stop: "pending",
+                centerSource: recoveryCenterSource, centerReadUptime: recoveryCenterReadUptime)
+        }
+        let recoveryStopOperation = operation
+        let recoveryStopPhase = String(describing: state)
+        let recoveryStopStarted = recoveryStopPayload == nil ? nil : clock.now
         let confirmed = await task.value
+        if var payload = recoveryStopPayload {
+            payload["stop_outcome"] = .string(confirmed ? "confirmed" : "failed")
+            payload["stop_origin"] = .string(origin.rawValue)
+            payload["confirmation_id"] = .number(Double(id))
+            payload["stop_host_duration_s"] = FollowReacquisitionDiagnostics.number(recoveryStopStarted.map { clock.now - $0 })
+            payload["stop_duration_clock"] = .string("system_uptime")
+            payload["budget_snapshot_boundary"] = .string("stop_request")
+            failureEmitter.emit(.init(event: "follow_recovery.stop_response",
+                context: .init(sessionGeneration: token, operationID: recoveryStopOperation,
+                    phase: recoveryStopPhase, stale: generation != token || confirmationID != id,
+                    reason: confirmed ? "stop_acknowledged" : "stop_not_confirmed"), payload: payload))
+        }
         diagnosticStopState = confirmed ? "confirmed" : "failed"
         if confirmationID == id { confirmationTask = nil }
         if !confirmed {
@@ -874,6 +1011,7 @@ public final class FollowMeCoordinator {
             frameProcessorTask = nil
             pendingFrame = nil
             evaluatedPendingSnapshot = nil
+            currentAssociation = nil
             safetyTask?.cancel()
             movementTask?.cancel()
             deadlineTask?.cancel()
@@ -882,6 +1020,10 @@ public final class FollowMeCoordinator {
             startupTask?.cancel()
             pauseTask?.cancel()
             cancelAlignment()
+            return false
+        }
+        if generation == token, recoveryExpired {
+            _ = await expireRecovery(generation: token)
             return false
         }
         return generation == token && !stopBlocked && stopTask == nil
@@ -903,7 +1045,7 @@ public final class FollowMeCoordinator {
     }
 
     private var canScan: Bool {
-        guard isActive, perceptionReady, !stopBlocked, stopTask == nil, confirmationTask == nil,
+        guard isActive, !recoveryExpired, perceptionReady, !stopBlocked, stopTask == nil, confirmationTask == nil,
               perceptionIssue == nil, poseDeadline == nil, let batch = latestBatch,
               batch.pose != nil, batch.depthAvailable,
               batch.trackingQuality != .limited, batch.trackingQuality != .unavailable,
@@ -914,12 +1056,12 @@ public final class FollowMeCoordinator {
 
     private func scan(generation token: UInt64) {
         guard generation == token, !scanning, canScan else { return }
+        if state == .reacquiring { scanRecovery(generation: token); return }
         let limit = min(2 * .pi, config.maximumScanRotation)
         if state == .searching && scanRotation >= limit - 0.0001 {
             Task { _ = await finish(.failed("No person found.")) }
             return
         }
-        if state == .reacquiring, let deadline = reacquireDeadline, clock.now >= deadline { return }
         scanning = true
         let angle = state == .searching ? min(config.scanIncrement, limit - scanRotation) : config.scanIncrement
         scanRotation += angle
@@ -944,21 +1086,228 @@ public final class FollowMeCoordinator {
 
     private func loseTarget(generation token: UInt64) async {
         guard generation == token, state != .reacquiring else { return }
+        if recoveryEpisode == nil {
+            recoveryHasProvisionalLock = false
+            recoveryCenterSource = nil
+            recoveryCenterReadUptime = nil
+            recoveryDiagnosticUnavailable = nil
+            recoveryEpisode = FollowReacquisitionEpisode(firstLoss: clock.now, anchor: reliableMemory)
+            let episode = recoveryEpisode!
+            emitRecovery("started", reason: "first_loss", episode: episode, stop: "pending")
+            deadlineTask = Task { [weak self, clock] in
+                await clock.sleep(seconds: max(0, episode.deadline - clock.now))
+                guard !Task.isCancelled, let self, self.generation == token,
+                      self.recoveryEpisode?.id == episode.id else { return }
+                _ = await self.expireRecovery(generation: token)
+            }
+        } else {
+            emitRecovery("retained", reason: "loss_before_normal_restoration")
+        }
+        (motion as? any FollowMeContextualMotion)?.inhibitScanContinuation(origin: .independent)
+        movementTask?.cancel()
+        scanning = false
         cancelAlignment()
+        recoveryStopBoundary = nil
         state = .reacquiring
-        reacquireDeadline = clock.now + config.reacquisitionSeconds
         guard await confirmStop(generation: token) else { return }
         guard generation == token else { return }
+        scanning = false
         lastGoal = nil
-        let deadline = reacquireDeadline!
-        deadlineTask?.cancel()
-        deadlineTask = Task { [weak self, clock] in
-            await clock.sleep(seconds: max(0, deadline - clock.now))
-            guard let self, self.generation == token, self.state == .reacquiring,
-                  self.clock.now >= deadline else { return }
-            _ = await self.finish(.failed("Person lost."))
-        }
+        if recoveryExpired { _ = await expireRecovery(generation: token); return }
         scan(generation: token)
+    }
+
+    private func expireRecovery(generation token: UInt64, at validationTime: TimeInterval? = nil) async -> Bool {
+        guard generation == token, isActive, let episode = recoveryEpisode,
+              (validationTime ?? clock.now) >= episode.deadline else { return false }
+        emitRecovery("expired", reason: "original_deadline_reached", episode: episode)
+        _ = await finish(.failed("Person lost."))
+        return true
+    }
+
+    private var recoveryExpired: Bool {
+        recoveryEpisode.map { clock.now >= $0.deadline } ?? false
+    }
+
+    private func recoveryFrameEligible(_ person: FollowPersonObservation, batch: FollowFrameBatch) -> Bool {
+        guard let episode = recoveryEpisode, clock.now < episode.deadline,
+              let stopBoundary = recoveryStopBoundary,
+              batch.frameID.generation == episode.anchor?.frameID.generation,
+              batch.frameID.generation == stopBoundary.frameID.generation, batch.frameID.sequence > stopBoundary.frameID.sequence,
+              person.frameID == batch.frameID, batch.timestamp >= stopBoundary.time,
+              FollowFrameHealth.issue(batch, now: clock.now, configuration: config) == nil,
+              pendingFrame == nil || pendingFrame?.frameID == batch.frameID,
+              !stopBlocked, stopTask == nil, confirmationTask == nil, poseDeadline == nil else { return false }
+        return true
+    }
+
+    /// No suspension between the final matched-phase gate and paired memory commit.
+    private func restoreRecovery(_ person: FollowPersonObservation, phase: FollowMeState) async -> Bool {
+        guard let episode = recoveryEpisode else { return true }
+        guard let batch = latestBatch else { return false }
+        let eligible = recoveryFrameEligible(person, batch: batch)
+        let validationTime = clock.now
+        if validationTime >= episode.deadline {
+            _ = await expireRecovery(generation: generation, at: validationTime)
+            return false
+        }
+        // This one authoritative time validates both health and accepted memory. No
+        // suspension or additional clock read precedes the phase/memory transaction.
+        guard eligible, FollowFrameHealth.issue(batch, now: validationTime, configuration: config) == nil,
+              let quality = batch.trackingQuality,
+              let memory = FollowReliableMemory(accepted: person, association: .continued,
+                  now: validationTime, trackingQuality: quality) else { return false }
+        reliableMemory = memory
+        state = phase
+        emitRecovery("cleared", reason: "normal_phase_restored", stop: "confirmed",
+            extra: ["restored_frame_id": FollowReacquisitionDiagnostics.frame(person.frameID),
+                "recovery_active": .bool(false), "deadline_active": .bool(false),
+                "provisional_frame_id": .null, "provisional_person_x": .null,
+                "provisional_person_z": .null, "provisional_raw_person_id": .null])
+        recoveryEpisode = nil
+        recoveryStopBoundary = nil
+        deadlineTask?.cancel()
+        deadlineTask = nil
+        recoveryCenterSource = nil
+        recoveryCenterReadUptime = nil
+        recoveryDiagnosticUnavailable = nil
+        return true
+    }
+
+    private func recoveryAuthorization(generation token: UInt64, operation id: UInt64) -> FollowRecoveryAuthorization? {
+        guard let episode = recoveryEpisode, let anchor = episode.anchor else { return nil }
+        return .init(episodeID: episode.id, expectedGeneration: anchor.frameID.generation, deadline: episode.deadline,
+            now: { [clock] in clock.now }, canContinue: { [weak self] in
+                guard let self, self.generation == token, self.operation == id,
+                      self.recoveryEpisode?.id == episode.id, self.canScan,
+                      let batch = self.pendingFrame ?? self.latestBatch,
+                      batch.frameID.generation == anchor.frameID.generation else { return false }
+                guard FollowFrameHealth.issue(batch, now: self.clock.now, configuration: self.config) == nil else { return false }
+                if self.state == .reacquiring, self.recoveryStopBoundary == nil,
+                   self.pendingFrame?.frameID == batch.frameID, let point = anchor.position {
+                    let association = self.tracker.reacquireEvaluated(batch.people,
+                        lastPosition: point, now: self.clock.now,
+                        expectedGeneration: anchor.frameID.generation, frameID: batch.frameID)
+                    if case .matched = association.decision {
+                        (self.motion as? any FollowMeContextualMotion)?.inhibitScanContinuation(origin: .detection)
+                        return false
+                    }
+                }
+                if self.state != .reacquiring, let locked = self.locked {
+                    let association: FollowTrackMatch?
+                    if self.currentAssociation?.generation == token,
+                       self.currentAssociation?.frameID == batch.frameID {
+                        association = self.currentAssociation?.decision
+                    } else if self.pendingFrame?.frameID == batch.frameID {
+                        if self.evaluatedPendingSnapshot?.batch.frameID != batch.frameID {
+                            self.evaluatedPendingSnapshot = FollowAdmissionSnapshot(batch: batch,
+                                previous: locked, pending: true, tracker: self.tracker,
+                                now: self.clock.now, configuration: self.config)
+                        }
+                        association = self.evaluatedPendingSnapshot?.association?.decision
+                    } else {
+                        association = nil
+                    }
+                    guard case .matched = association else { return false }
+                }
+                return true
+            })
+    }
+
+    private func adoptMemory(_ person: FollowPersonObservation, batch: FollowFrameBatch,
+                             association: FollowReliableMemory.Association) {
+        guard recoveryEpisode == nil, person.frameID == batch.frameID,
+              reliableMemory?.frameID != person.frameID,
+              FollowFrameHealth.issue(batch, now: clock.now, configuration: config) == nil,
+              let quality = batch.trackingQuality,
+              let memory = FollowReliableMemory(accepted: person, association: association,
+                  now: clock.now, trackingQuality: quality) else { return }
+        reliableMemory = memory
+    }
+
+    private func recoveryPose(_ sample: NavigationPoseSample, expectedGeneration: UInt64) -> FollowRecoveryPose? {
+        guard sample.source != "legacy_unknown", sample.rejection(at: clock.now, expectedGeneration: expectedGeneration) == nil,
+              let pose = sample.pose, let frame = sample.frameID, let timestamp = sample.sourceTimestamp,
+              let quality = sample.trackingQuality else { return nil }
+        return .init(pose: pose, frameID: frame, timestamp: timestamp, trackingQuality: quality)
+    }
+
+    private func scanRecovery(generation token: UInt64) {
+        guard var episode = recoveryEpisode, clock.now < episode.deadline else { return }
+        guard let anchor = episode.anchor else {
+            emitRecoveryUnavailable("missing_reliable_memory"); return
+        }
+        guard let companion = motion as? any FollowMeAbsoluteHeadingMotion else {
+            emitRecoveryUnavailable("absolute_heading_companion_unavailable"); return
+        }
+        if episode.center == nil {
+            let sample = companion.recoveryPoseSample()
+            guard let pose = recoveryPose(sample, expectedGeneration: anchor.frameID.generation) else {
+                emitRecoveryUnavailable(sample.rejection(at: clock.now, expectedGeneration: anchor.frameID.generation)
+                    ?? "missing_recovery_provenance"); return
+            }
+            episode = episode.selectingCenter(current: pose, now: clock.now)
+            recoveryEpisode = episode
+            if episode.center != nil {
+                recoveryCenterSource = sample
+                recoveryCenterReadUptime = clock.now
+                recoveryDiagnosticUnavailable = nil
+            }
+            emitRecovery(episode.center == nil ? "unavailable" : "center_selected",
+                reason: episode.center == nil ? "no_valid_center_or_source" : "center_frozen",
+                episode: episode, centerSource: sample)
+        }
+        guard let center = episode.center, episode.stageIndex < FollowReacquisitionPlanner.offsets.count else { return }
+        let episodeID = episode.id
+        operation &+= 1
+        let id = operation
+        guard let authorization = recoveryAuthorization(generation: token, operation: id) else { return }
+        let request = FollowRecoveryHeadingRequest(stageHeading: FollowReacquisitionPlanner.wrap(
+            center.heading + FollowReacquisitionPlanner.offsets[episode.stageIndex]), authorization: authorization)
+        let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id,
+            purpose: .followScan, phase: String(describing: state))
+        activeRequest = context
+        scanning = true
+        emitRecovery("request_started", reason: "absolute_stage_requested", episode: episode,
+            extra: ["request_token": .number(Double(id)), "requested_stage_heading_rad": .number(request.stageHeading)])
+        movementTask = Task { [weak self, motion] in
+            let result = await motion.performRecoveryHeading(request, context: context)
+            guard let self else { return }
+            if await self.consumeResult(result) { return }
+            guard self.generation == token, self.operation == id,
+                  self.recoveryEpisode?.id == episodeID, self.state == .reacquiring else { return }
+            if self.recoveryExpired { _ = await self.expireRecovery(generation: token); return }
+            self.scanning = false
+            self.movementTask = nil
+            self.emitRecovery("request_completed", reason: String(describing: result.result),
+                stop: result.stopOutcome.rawValue,
+                extra: FollowReacquisitionDiagnostics.segmentPayload(result.recovery).merging([
+                    "controller_operation_id": FollowReacquisitionDiagnostics.number(result.context.controllerOperationID.map(Double.init)),
+                    "request_token": .number(Double(id))]) { _, new in new })
+            guard self.canScan, result.result == .arrived, result.stopOutcome == .confirmed,
+                  let evidence = result.recovery, let source = evidence.arrivalSource,
+                  let actual = self.recoveryPose(source, expectedGeneration: anchor.frameID.generation),
+                  let current = self.recoveryEpisode else { return }
+            // The measured stage gate owns progression; command counts and result labels do not.
+            let stageArrival = current.recordingArrival(actual: actual, now: self.clock.now)
+            if stageArrival.stageIndex != current.stageIndex {
+                self.recoveryEpisode = stageArrival
+            } else if evidence.segmentArrived, let target = evidence.segmentHeading {
+                self.recoveryEpisode = current.recordingSegmentArrival(target: target, actual: actual, now: self.clock.now)
+            } else { return }
+            self.emitRecovery("segment_completed", reason: evidence.requestedDelta == 0
+                ? "stage_skipped_within_tolerance" : (evidence.stageArrived == true ? "measured_stage_arrival" : "measured_segment_arrival"),
+                episode: current, stop: result.stopOutcome.rawValue,
+                extra: FollowReacquisitionDiagnostics.segmentPayload(evidence).merging([
+                    "next_stage_index": .number(Double(self.recoveryEpisode?.stageIndex ?? current.stageIndex)),
+                    "next_segment_index": .number(Double(self.recoveryEpisode?.segmentIndex ?? current.segmentIndex)),
+                    "controller_operation_id": FollowReacquisitionDiagnostics.number(result.context.controllerOperationID.map(Double.init)),
+                    "request_token": .number(Double(id))]) { _, new in new })
+            if self.recoveryEpisode?.stageIndex == FollowReacquisitionPlanner.offsets.count {
+                self.emitRecovery("exhausted", reason: "finite_pass_complete_observe_stationary", stop: "confirmed")
+            }
+            self.scan(generation: token)
+        }
     }
 
     private func perceptionUnavailable(_ issue: FollowPerceptionIssue, generation token: UInt64) async {
@@ -994,6 +1343,7 @@ public final class FollowMeCoordinator {
         let reasons = (batch.perceptionDiagnostics?.transitionSignature ?? "unknown") + "|" + trackerReasons
         guard summaryBudget.takeAssociation(outcome: evaluation.outcome, now: now, reasons: reasons) else { return }
         var payload = evaluation.payload(batch: batch, now: now, previousOutcome: previous)
+        payload.merge(recoverySnapshot(now: now)) { _, new in new }
         if state == .waitingForClearance {
             let selected = evaluation.selectedIndex.map { batch.people[$0] }
             payload.merge(FollowReadinessDiagnostics(batch: batch, person: selected, now: now, gate: readySignalClearance,
@@ -1003,6 +1353,71 @@ public final class FollowMeCoordinator {
         failureEmitter.emit(.init(event: "follow_person.association",
             context: .init(sessionGeneration: generation, phase: String(describing: state), outcome: evaluation.outcome),
             payload: payload))
+    }
+
+    private func emitRecovery(_ event: String, reason: String, episode: FollowReacquisitionEpisode? = nil,
+                              stop: String? = nil, centerSource: NavigationPoseSample? = nil,
+                              extra: [String: FollowDiagnosticValue] = [:]) {
+        guard let episode = episode ?? recoveryEpisode else { return }
+        var payload = FollowReacquisitionDiagnostics.payload(episode, now: clock.now,
+            stop: stop ?? (stopBlocked ? "failed" : diagnosticStopState), centerSource: centerSource ?? recoveryCenterSource,
+            centerReadUptime: recoveryCenterReadUptime)
+        payload.merge(FollowReacquisitionDiagnostics.snapshot(memory: reliableMemory,
+            provisional: recoveryHasProvisionalLock ? locked : nil, episode: episode,
+            healthy: perceptionIssue == nil, currentFrame: latestFrame)) { _, new in new }
+        payload.merge(extra) { _, new in new }
+        failureEmitter.emit(.init(event: "follow_recovery." + event,
+            context: .init(sessionGeneration: generation, operationID: activeRequest?.requestToken,
+                purpose: activeRequest?.purpose.rawValue, phase: String(describing: state), reason: reason),
+            payload: payload))
+    }
+
+    private func emitRecoveryUnavailable(_ reason: String) {
+        guard recoveryDiagnosticUnavailable != reason else { return }
+        recoveryDiagnosticUnavailable = reason
+        emitRecovery("unavailable", reason: reason, extra: ["unavailable_reason": .string(reason)])
+    }
+
+    private func recoveryTermination(reason: String, phase: FollowMeState) -> FollowDiagnosticEvent? {
+        guard let episode = recoveryEpisode else { return nil }
+        return .init(event: "follow_recovery.terminated", context: .init(sessionGeneration: generation,
+            operationID: activeRequest?.requestToken, phase: String(describing: phase), reason: reason),
+            payload: FollowReacquisitionDiagnostics.payload(episode, now: clock.now, stop: "pending",
+                centerSource: recoveryCenterSource, centerReadUptime: recoveryCenterReadUptime))
+    }
+
+    private func emitRecoveryTermination(_ event: FollowDiagnosticEvent, confirmed: Bool) {
+        var payload = event.payload
+        payload["stop_outcome"] = .string(confirmed ? "confirmed" : "failed")
+        payload["terminal_confirmation_uptime_s"] = .number(clock.now)
+        payload["budget_snapshot_boundary"] = .string("terminal_fence_before_stop_wait")
+        failureEmitter.emit(.init(event: event.event, context: .init(sessionGeneration: event.context.sessionGeneration,
+            operationID: event.context.operationID, phase: event.context.phase,
+            stale: event.context.sessionGeneration.map { generation != $0 &+ 1 } ?? true,
+            reason: confirmed ? event.context.reason : "stop_not_confirmed"), payload: payload))
+    }
+
+    private func recoverySnapshot(now: Double) -> [String: FollowDiagnosticValue] {
+        let episode = isActive ? recoveryEpisode : nil
+        var payload = FollowReacquisitionDiagnostics.snapshot(memory: reliableMemory, provisional: locked,
+            episode: episode, healthy: latestBatch.map {
+                FollowFrameHealth.issue($0, now: now, configuration: config) == nil
+            } ?? false, currentFrame: latestBatch?.frameID)
+        if !isActive { payload["current_target_availability"] = .string("unavailable_inactive") }
+        if episode != nil, !recoveryHasProvisionalLock {
+            for key in ["provisional_frame_id", "provisional_person_x", "provisional_person_z", "provisional_raw_person_id"] {
+                payload[key] = .null
+            }
+        }
+        payload["episode_id"] = .null
+        payload["deadline_s"] = .null
+        payload["center_heading_rad"] = .null
+        if let episode {
+            payload.merge(FollowReacquisitionDiagnostics.payload(episode, now: now,
+                stop: stopBlocked ? "failed" : diagnosticStopState, centerSource: recoveryCenterSource,
+                centerReadUptime: recoveryCenterReadUptime)) { _, new in new }
+        }
+        return payload
     }
 
     private var sessionTimingPayload: [String: FollowDiagnosticValue] {
@@ -1040,6 +1455,7 @@ public final class FollowMeCoordinator {
         payload["pending_frame_evaluation"] = .string(snapshot.map { $0.pending ? "evaluated" : "not_pending" } ?? "not_evaluated")
         payload["admission_evaluated_at_s"] = snapshot.map { .number($0.evaluatedAt) } ?? .null
         payload.merge(sessionTimingPayload) { _, new in new }
+        payload.merge(recoverySnapshot(now: clock.now)) { _, new in new }
         payload.merge(FollowReadinessDiagnostics.controllerPayload(admission,
             perceptionFrame: snapshot?.batch.frameID ?? latestBatch?.frameID, sendAuthorized: readySignalAttempted,
             person: snapshot == nil ? locked : snapshot?.person)) { _, new in new }

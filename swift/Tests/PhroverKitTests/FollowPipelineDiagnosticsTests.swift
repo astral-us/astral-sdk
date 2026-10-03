@@ -6,6 +6,64 @@ import RoverNav
 
 @MainActor
 final class FollowPipelineDiagnosticsTests: XCTestCase {
+    func testRecoverySnapshotsKeepLastReliableSeparateFromProvisionalAndShareSummaryBudget() async throws {
+        let perception = FollowPerceptionFake()
+        let motion = FollowMotionFake()
+        let clock = ManualFollowClock()
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        let sink = FollowDiagnosticRecordingSink()
+        let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
+            configuration: config, eventSink: sink.append)
+        _ = await coordinator.start()
+        func send(_ sequence: UInt64, point: Double?, healthy: Bool = true) async {
+            let id = ARFrameID(generation: 1, sequence: sequence)
+            let pose = Pose2D(position: .zero, yaw: 0)
+            let people: [FollowPersonObservation] = point.map { [ .init(frameID: id, timestamp: 0, confidence: 0.9,
+                boundingBox: CGRect(x: 0.4, y: 0.2, width: 0.2, height: 0.6), position: Vec2($0, 0), pose: pose) ] } ?? []
+            perception.send(.frame(.init(frameID: id, timestamp: 0, pose: pose, depthAvailable: true,
+                people: people, trackingQuality: healthy ? .normal : .limited)))
+            for _ in 0..<100 { await Task.yield() }
+        }
+        func records(_ name: String) throws -> [[String: Any]] {
+            try sink.records.filter { $0.event == name }.map {
+                try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap($0.fields["payload"]).utf8)) as? [String: Any])
+            }
+        }
+        await send(1, point: 4)
+        await send(2, point: nil)
+        let unavailable = try XCTUnwrap(records("follow_recovery.unavailable").first)
+        XCTAssertEqual(unavailable["reason"] as? String, "absolute_heading_companion_unavailable")
+        XCTAssertTrue(unavailable["center_source_timestamp_s"] is NSNull)
+        let entry = try XCTUnwrap(records("follow_recovery.started").first)
+        XCTAssertTrue(entry["provisional_frame_id"] is NSNull, "The last reliable lock is not a provisional detection")
+        await send(3, point: 4.2)
+        await send(4, point: 4.2, healthy: false)
+        let snapshot = try XCTUnwrap(records("follow_frame").last)
+        XCTAssertEqual(snapshot["recovery_active"] as? Bool, true)
+        XCTAssertEqual(snapshot["reliable_frame_id"] as? String, "1:1")
+        XCTAssertEqual(snapshot["provisional_frame_id"] as? String, "1:3")
+        XCTAssertEqual(snapshot["provisional_person_x"] as? Double, 4.2)
+        XCTAssertEqual(snapshot["reliable_person_x"] as? Double, 4)
+        XCTAssertEqual(snapshot["anchor_frame_id"] as? String, "1:1")
+        XCTAssertEqual(snapshot["current_target_availability"] as? String, "unavailable_unhealthy_perception")
+        XCTAssertEqual(snapshot["deadline_s"] as? Double, 10)
+        let count = sink.records.count
+        for sequence: UInt64 in 5...20 { await send(sequence, point: 4.2, healthy: false) }
+        XCTAssertEqual(sink.records.count, count, "Repeated unhealthy frames do not create a new diagnostic stream")
+        _ = await coordinator.stop()
+        let stopped = try XCTUnwrap(records("follow_phase").last)
+        XCTAssertEqual(stopped["current_target_availability"] as? String, "unavailable_inactive")
+        XCTAssertTrue(stopped["episode_id"] is NSNull)
+        _ = await coordinator.start()
+        await send(21, point: nil)
+        let fresh = try XCTUnwrap(records("follow_person.association").last)
+        XCTAssertEqual(fresh["recovery_active"] as? Bool, false)
+        XCTAssertTrue(fresh["reliable_frame_id"] is NSNull)
+        XCTAssertTrue(fresh["provisional_frame_id"] is NSNull)
+        _ = await coordinator.stop()
+    }
+
     func testEmittedConfidenceAndDispersionFactsComeFromTheEvaluatedWindow() throws {
         let detection = Detector.Detection(label: "person", confidence: 0.9,
             boundingBox: CGRect(x: 0.4, y: 0.2, width: 0.2, height: 0.6))

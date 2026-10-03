@@ -3,6 +3,31 @@ import XCTest
 
 @MainActor
 final class FollowDiagnosticEventTests: XCTestCase {
+    func testRecoveryFactsUseExistingPrecisePrimitiveEnvelopeAndPrivacyFilter() throws {
+        let memory = FollowReliableMemory(position: nil, pairedPose: nil, bearing: 0.123456789123,
+            frameID: .init(generation: 3, sequence: 4), timestamp: 7, association: .continued, pairedYaw: 0.4)
+        let episode = FollowReacquisitionEpisode(firstLoss: 8, anchor: memory)
+        var payload = FollowReacquisitionDiagnostics.payload(episode, now: 9, stop: "pending")
+        payload["images"] = .string("excluded")
+        payload["measurement"] = .object(["yaw": .number(.nan), "depth_array": .array([.number(1)])])
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "recovery", monotonic: { 9 },
+            utc: { Date(timeIntervalSince1970: 0) }, sink: sink.append)
+        emitter.emit(.init(event: "follow_recovery.started", context: .init(sessionGeneration: 2, reason: "first_loss"), payload: payload))
+        let record = try decode(try XCTUnwrap(sink.records.first?.fields))
+        XCTAssertEqual(record["anchor_bearing_rad"] as? Double, 0.123456789123)
+        XCTAssertEqual(record["event_sequence"] as? Int, 1)
+        XCTAssertEqual(record["session_generation"] as? Int, 2)
+        XCTAssertEqual(record["deadline_s"] as? Double, 18)
+        XCTAssertTrue(record["anchor_raw_person_id"] is NSNull)
+        XCTAssertTrue(record["measured_movement_rad"] is NSNull)
+        XCTAssertNil(record["images"])
+        let measurement = try XCTUnwrap(record["measurement"] as? [String: Any])
+        XCTAssertTrue(measurement["yaw"] is NSNull)
+        XCTAssertEqual(measurement["yaw_availability"] as? String, "nonfinite")
+        XCTAssertNil(measurement["depth_array"])
+    }
+
     func testEnvelopeIncludesExplicitNullsAndOrdersEqualTimeEvents() throws {
         var records: [(String, [String: String])] = []
         let emitter = FollowDiagnosticEmitter(streamID: "controller", monotonic: { 12.5 },

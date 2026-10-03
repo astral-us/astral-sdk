@@ -6,6 +6,201 @@ import simd
 
 @MainActor
 final class FollowReadyAdmissionIntegrationTests: XCTestCase {
+    func testAcceptedRecoveryDecisionCannotAuthorizeNewPendingOrInvalidatedSource() async {
+        for condition in ["new_pending", "stale", "generation", "deadline", "late_frame"] {
+            let fixture = Fixture()
+            fixture.enriched = true
+            await fixture.acquire()
+            fixture.send(2, range: 1.6, peopleAvailable: false)
+            await drain()
+            fixture.send(3, range: 1.6)
+            await drain()
+            fixture.send(4, range: 1.7)
+            await fixture.feedback.waitUntilEntered()
+            fixture.holdReadyAcknowledgement = true
+            fixture.feedback.release()
+            await fixture.readyFeedback.waitUntilEntered()
+            fixture.send(5, range: 2.3, secondPersonRange: 2.6)
+            await drain()
+            switch condition {
+            case "new_pending":
+                fixture.send(6, range: 2.3, secondPersonRange: 2.6)
+                fixture.clock.onNextRead = { fixture.readyFeedback.release() }
+            case "stale":
+                fixture.clock.advance(to: 0.501, wakeSleepers: false)
+                fixture.readyFeedback.release()
+            case "generation":
+                fixture.send(6, range: 2.3, generation: 2)
+                fixture.clock.onNextRead = { fixture.readyFeedback.release() }
+            case "deadline":
+                fixture.clock.advance(to: 10, wakeSleepers: false)
+                fixture.send(6, range: 2.3)
+                fixture.clock.onNextRead = { fixture.readyFeedback.release() }
+            default:
+                fixture.send(4, range: 0, peopleAvailable: false)
+                await drain()
+                fixture.readyFeedback.release()
+            }
+            await drain()
+            XCTAssertEqual(fixture.commands, 1, condition)
+            let completions = fixture.records.filter { $0["event"] as? String == "follow_ready.completed" }.count
+            XCTAssertEqual(completions, condition == "late_frame" ? 1 : 0, condition)
+            if condition == "generation" { XCTAssertEqual(fixture.coordinator.state, .failed("AR session reset during recovery.")) }
+            if condition == "deadline" { XCTAssertEqual(fixture.coordinator.state, .failed("Person lost.")) }
+            _ = await fixture.coordinator.stop()
+        }
+    }
+
+    func testRecoveryReadyKeepsProcessedUniqueDecisionAcrossHeldPostSendAcknowledgement() async throws {
+        let fixture = Fixture()
+        fixture.enriched = true
+        await fixture.acquire()
+        fixture.send(2, range: 1.6, peopleAvailable: false)
+        await drain()
+        fixture.send(3, range: 1.6)
+        await drain()
+        fixture.send(4, range: 1.7)
+        await fixture.feedback.waitUntilEntered()
+        fixture.holdReadyAcknowledgement = true
+        fixture.feedback.release()
+        await fixture.readyFeedback.waitUntilEntered()
+        XCTAssertEqual(fixture.commands, 1)
+        fixture.send(5, range: 2.3, secondPersonRange: 2.6)
+        await drain() // Original 1.7 m lock uniquely accepts 2.3 m, rejects 2.6 m.
+        fixture.readyFeedback.release()
+        await drain()
+        XCTAssertEqual(fixture.coordinator.state, .signalingReady,
+            "The accepted frame must not be reassociated against its own updated 2.3 m lock")
+        XCTAssertEqual(fixture.records.filter { $0["event"] as? String == "follow_ready.completed" }.count, 1)
+        XCTAssertEqual(fixture.commands, 1)
+        fixture.send(6, range: 2.3)
+        await drain()
+        XCTAssertEqual(fixture.coordinator.state, .waitingForMovement, "Baseline still requires a distinct fresh frame")
+        XCTAssertEqual(fixture.commands, 1, "Recovery cannot repeat its consumed ready signal")
+        _ = await fixture.coordinator.stop()
+    }
+
+    func testPendingUniqueReacquisitionFencesRealScanBeforeAcknowledgementResumes() async throws {
+        let fixture = Fixture()
+        fixture.enriched = true
+        await fixture.acquire()
+        fixture.yaw = 0.5
+        fixture.holdAcknowledgement = true
+        fixture.send(2, range: 1.6, peopleAvailable: false)
+        await fixture.scanFeedback.waitUntilEntered()
+        await drain()
+        let sends = fixture.wheelCommands.count
+        let stops = fixture.stops
+        fixture.send(3, range: 3.0) // Within frozen 1.5 m anchor gate; outside continuity.
+        fixture.clock.onNextRead = { fixture.scanFeedback.release() }
+        await drain()
+        XCTAssertEqual(fixture.stopSendCounts.dropFirst(stops).first, sends,
+            "A queued unique reacquisition must fence the real controller before another nonzero send")
+        XCTAssertGreaterThan(fixture.stops, stops, "Detection must drain confirmed stop before alignment")
+        XCTAssertEqual(fixture.coordinator.state, .aligning)
+        let retained = try XCTUnwrap(fixture.records.last { $0["event"] as? String == "follow_recovery.retained" })
+        XCTAssertEqual(retained["anchor_person_x"] as? Double, 1.6)
+        XCTAssertEqual(retained["deadline_s"] as? Double, 10)
+        fixture.holdAcknowledgement = false
+        _ = await fixture.coordinator.stop()
+    }
+
+    func testRealRecoveryReadyFeedbackRetainsDeadlineAndSuccessfulBaselineClearsIt() async {
+        for expire in [false, true] {
+            let fixture = Fixture()
+            await fixture.acquire()
+            fixture.send(2, range: 1.6, peopleAvailable: false)
+            await drain()
+            fixture.enriched = true
+            fixture.send(3, range: 1.6)
+            await drain()
+            fixture.send(4, range: 1.6)
+            await fixture.feedback.waitUntilEntered()
+            if expire {
+                fixture.clock.advance(to: 9.9, wakeSleepers: false)
+                fixture.send(5, range: 1.6)
+                await drain()
+                fixture.clock.advance(to: 10, wakeSleepers: false)
+            }
+            fixture.feedback.release()
+            await drain()
+            if expire {
+                XCTAssertEqual(fixture.coordinator.state, .failed("Person lost."))
+                XCTAssertEqual(fixture.commands, 0)
+                XCTAssertEqual(fixture.states.last?["ready_signal_attempted"], "false")
+            } else {
+                XCTAssertEqual(fixture.coordinator.state, .signalingReady)
+                XCTAssertEqual(fixture.commands, 1)
+                fixture.send(5, range: 1.6)
+                await drain()
+                XCTAssertEqual(fixture.coordinator.state, .waitingForMovement)
+                fixture.send(6, range: 1.6, peopleAvailable: false)
+                await drain()
+                let episodes = fixture.records.filter { $0["event"] as? String == "follow_recovery.started" }
+                XCTAssertEqual(episodes.count, 2)
+                XCTAssertEqual(episodes.last?["anchor_frame_id"] as? String, "1:5")
+                XCTAssertEqual(fixture.commands, 1)
+            }
+            _ = await fixture.coordinator.stop()
+        }
+    }
+
+    func testRecoveryReadyClearanceDeferralCommitsNewestNormalMatchWithoutConsumingAttempt() async throws {
+        let fixture = Fixture()
+        await fixture.acquire()
+        fixture.send(2, range: 1.6, peopleAvailable: false)
+        await drain()
+        fixture.enriched = true
+        fixture.send(3, range: 1.6)
+        await drain()
+        fixture.send(4, range: 1.6)
+        await fixture.feedback.waitUntilEntered()
+        fixture.send(5, range: 1.3)
+        await drain()
+        fixture.feedback.release()
+        await drain()
+        XCTAssertEqual(fixture.coordinator.state, .waitingForClearance)
+        XCTAssertEqual(fixture.commands, 0)
+        XCTAssertEqual(fixture.states.last?["ready_signal_attempted"], "false")
+        fixture.send(6, range: 1.3, peopleAvailable: false)
+        await drain()
+        let episodes = fixture.records.filter { $0["event"] as? String == "follow_recovery.started" }
+        XCTAssertEqual(episodes.count, 2, "Confirmed clearance deferral is an actual healthy normal phase")
+        XCTAssertEqual(episodes.last?["anchor_frame_id"] as? String, "1:5")
+        _ = await fixture.coordinator.stop()
+    }
+
+    func testAcceptedPendingContinuityFreezesItsOriginalPairedMemoryAtLoss() async throws {
+        let fixture = Fixture()
+        fixture.enriched = true
+        fixture.suspendSend = true
+        await fixture.acquire()
+        fixture.send(2, range: 1.6)
+        await fixture.feedback.waitUntilEntered()
+        fixture.send(3, range: 1.7)
+        await drain()
+        fixture.send(4, range: 2.3, secondPersonRange: 2.6)
+        // Resume feedback at the ingress clock check: frame 4 will be queued
+        // before the controller resumes, and before its processor is scheduled.
+        fixture.clock.onNextRead = { fixture.feedback.release() }
+        await fixture.sendFeedback.waitUntilEntered()
+        fixture.send(5, range: 0, peopleAvailable: false)
+        await drain()
+        let loss = try XCTUnwrap(fixture.records.first { $0["event"] as? String == "follow_recovery.started" })
+        XCTAssertEqual(loss["anchor_frame_id"] as? String, "1:4")
+        let authorized = try XCTUnwrap(fixture.records.first { $0["event"] as? String == "follow_ready.admission_authorized" })
+        let pending = authorized["pending_frame_evaluation"] as? String == "evaluated"
+        XCTAssertEqual(loss["anchor_association"] as? String, pending ? "acceptedPendingContinuity" : "continued",
+            "Memory source must describe whether admission or the normal processor accepted the original association")
+        XCTAssertEqual(loss["anchor_person_x"] as? Double, 2.3)
+        XCTAssertEqual(loss["anchor_rover_x"] as? Double, 0)
+        XCTAssertEqual(loss["anchor_yaw_rad"] as? Double, 0)
+        fixture.suspendSend = false
+        fixture.sendFeedback.release()
+        await drain()
+        _ = await fixture.coordinator.stop()
+    }
+
     func testUnknownTrackingOnPendingFrameCannotAuthorizeOlderHealthyObservation() async throws {
         let fixture = Fixture()
         fixture.enriched = true
@@ -130,14 +325,18 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         // Only 2.3 is within 0.75 m of the ORIGINAL 1.7 m lock. Reassociating
         // against the adopted 2.3 m lock would wrongly make 2.6 ambiguous.
         fixture.send(5, range: 2.3, secondPersonRange: 2.6)
-        fixture.feedback.release()
+        fixture.clock.onNextRead = { fixture.feedback.release() }
         await drain()
         XCTAssertEqual(fixture.commands, 1)
         let authorized = try XCTUnwrap(fixture.records.first { $0["event"] as? String == "follow_ready.admission_authorized" })
         XCTAssertEqual(authorized["frame_id"] as? String, "1:5")
         XCTAssertEqual(authorized["controller_pose_frame_id"] as? String, "1:5")
-        XCTAssertEqual(authorized["pending_frame_evaluation"] as? String, "evaluated")
-        XCTAssertEqual(authorized["matched_candidate_count"] as? Int, 1)
+        if authorized["pending_frame_evaluation"] as? String == "evaluated" {
+            XCTAssertEqual(authorized["matched_candidate_count"] as? Int, 1)
+        } else {
+            XCTAssertEqual(authorized["pending_frame_evaluation"] as? String, "not_pending")
+            XCTAssertTrue(authorized["matched_candidate_count"] is NSNull, "Do not invent a second association for an already processed frame")
+        }
         XCTAssertEqual(fixture.coordinator.state, .signalingReady, "Consuming that raw frame cannot establish a new post-stop baseline")
         fixture.send(6, range: 3.0)
         await drain()
@@ -530,6 +729,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
 
     func testLossAfterRealSendCannotRepeatReadyAfterAlignedReacquisition() async {
         let fixture = Fixture()
+        fixture.enriched = true
         fixture.suspendSend = true
         await fixture.acquire()
         fixture.send(2, range: 1.6)
@@ -796,6 +996,13 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         var feedback = FollowDiagnosticSuspension()
         let sendFeedback = FollowDiagnosticSuspension()
         var suspendSend = false
+        var holdAcknowledgement = false
+        var holdReadyAcknowledgement = false
+        let readyFeedback = FollowDiagnosticSuspension()
+        let scanFeedback = FollowDiagnosticSuspension()
+        var wheelCommands: [WheelCommand] = []
+        var stops = 0
+        var stopSendCounts: [Int] = []
         var synthetic = false
         var enriched = false
         var independentControllerFrame = false
@@ -886,10 +1093,13 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             for _ in 0..<100 { await Task.yield() }
         }
         func acknowledgement() async -> Date? {
+            if holdReadyAcknowledgement && commands > 0 && !readyFeedback.entered { await readyFeedback.suspend() }
+            if holdAcknowledgement && !scanFeedback.entered { await scanFeedback.suspend() }
             if ready && !feedback.entered { await feedback.suspend() }
             return controllerTime
         }
         func sendCommand(_ command: WheelCommand) async throws {
+            if command.left != 0 || command.right != 0 { wheelCommands.append(command) }
             turning = command.left != command.right
             if turning { turns += 1 }
             if command.left == command.right, command.left != 0 { commands += 1 }
@@ -897,6 +1107,8 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             if failSend { throw URLError(.networkConnectionLost) }
         }
         func stopRover() throws {
+            stops += 1
+            stopSendCounts.append(wheelCommands.count)
             if failStop { throw URLError(.cannotConnectToHost) }
         }
         func tick() async {

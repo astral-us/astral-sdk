@@ -92,10 +92,16 @@ protocol FollowMeContextualMotion: FollowMeMotion {
 
 extension FollowMeMotion {
     func performContextual(_ request: FollowMotionRequest, context: FollowMotionRequestContext,
-                           admission: FollowReadyAdmission? = nil) async -> FollowMotionResult {
-        await FollowReadyAdmissionScope.$current.withValue(admission ?? FollowReadyAdmissionScope.current) {
-            if let contextual = self as? any FollowMeContextualMotion { return await contextual.perform(request, context: context) }
-            return await performLegacy(request, context: context)
+                           admission: FollowReadyAdmission? = nil,
+                           recovery: FollowRecoveryAuthorization? = nil) async -> FollowMotionResult {
+        await FollowRecoveryScope.$authorization.withValue(recovery ?? FollowRecoveryScope.authorization) {
+            await FollowReadyAdmissionScope.$current.withValue(admission ?? FollowReadyAdmissionScope.current) {
+                if FollowRecoveryScope.authorization != nil, !(self is any FollowMeAbsoluteHeadingMotion) {
+                    return await stopForUnavailableRecovery(context: context)
+                }
+                if let contextual = self as? any FollowMeContextualMotion { return await contextual.perform(request, context: context) }
+                return await performLegacy(request, context: context)
+            }
         }
     }
 

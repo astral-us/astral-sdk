@@ -9,12 +9,16 @@ public struct FollowTargetTracker {
         self.configuration = configuration
     }
 
-    func selectInitialEvaluated(_ people: [FollowPersonObservation], now: TimeInterval)
+    func selectInitialEvaluated(_ people: [FollowPersonObservation], now: TimeInterval, frameID: ARFrameID? = nil)
         -> (decision: FollowPersonObservation?, evaluation: FollowAssociationEvaluation) {
         var evidence: [FollowCandidateEvidence] = []
         let indices = people.indices.filter { index in
             var candidate = FollowCandidateEvidence()
-            let accepted = eligible(people[index], now: now, evidence: &candidate)
+            var accepted = eligible(people[index], now: now, evidence: &candidate)
+            if let frameID, people[index].frameID != frameID {
+                candidate.rejection = "candidate_frame_mismatch"
+                accepted = false
+            }
             evidence.append(candidate)
             return accepted
         }
@@ -67,9 +71,16 @@ public struct FollowTargetTracker {
         }
     }
 
-    func reacquireEvaluated(_ people: [FollowPersonObservation], lastPosition: Vec2, now: TimeInterval)
+    func reacquireEvaluated(_ people: [FollowPersonObservation], lastPosition: Vec2, now: TimeInterval,
+                            expectedGeneration: UInt64? = nil, frameID: ARFrameID? = nil)
         -> (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation) {
         evaluateMatches(people, now: now, mode: "reacquisition") { candidate, evidence in
+            if let expectedGeneration, candidate.frameID.generation != expectedGeneration {
+                evidence.rejection = "frame_generation_mismatch"; return false
+            }
+            if let frameID, candidate.frameID != frameID {
+                evidence.rejection = "candidate_frame_mismatch"; return false
+            }
             let distance = candidate.position.distance(to: lastPosition)
             evidence.record("reacquisition_distance_m", distance)
             guard distance <= configuration.reacquisitionDistance else {
@@ -134,6 +145,9 @@ public struct FollowTargetTracker {
         evidence.metrics["finite_geometry"] = .bool(finite)
         evidence.metrics["finite_geometry_availability"] = .string("available")
         guard finite else { evidence.rejection = "invalid_geometry"; return false }
+        guard box.minX > 0, box.minY > 0, box.maxX < 1, box.maxY < 1 else {
+            evidence.rejection = "clipped_box"; return false
+        }
         evidence.eligible = true
         return true
     }

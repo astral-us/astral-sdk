@@ -87,9 +87,12 @@ struct FollowMotionResult: Sendable {
     let stopOutcome: FollowMotionStopOutcome
     let commandReceipt: RoverCommandDiagnosticReceipt?
     let stopReceipt: RoverCommandDiagnosticReceipt?
+    let recovery: FollowRecoverySegmentEvidence?
     init(result: NavigationResult, context: FollowMotionOperationContext, failure: FollowMotionFailureDelivery?,
          stopOutcome: FollowMotionStopOutcome = .unknown, commandReceipt: RoverCommandDiagnosticReceipt? = nil,
-         stopReceipt: RoverCommandDiagnosticReceipt? = nil, deferred: FollowReadyDeferral? = nil) {
+         stopReceipt: RoverCommandDiagnosticReceipt? = nil, deferred: FollowReadyDeferral? = nil,
+         recovery: FollowRecoverySegmentEvidence? = nil) {
+        self.recovery = recovery
         self.deferred = deferred
         self.result = result
         self.context = context
@@ -104,6 +107,13 @@ struct FollowMotionResult: Sendable {
 /// Facts are captured synchronously by NavigationController and frozen for delivery.
 @MainActor
 final class FollowMotionOperationEvidence {
+    let recoveryEpisodeID: UUID?
+    let recoveryDeadline: Double?
+    let recoveryStageHeading: Double?
+    let recoveryExpectedGeneration: UInt64?
+    var recoveryAuthorizationTime: Double?
+    var recoveryAuthorizationOutcome: String?
+    var recovery: FollowRecoverySegmentEvidence?
     let initialContext: FollowMotionOperationContext
     var targetYaw: Double?
     var fenced = false
@@ -116,11 +126,17 @@ final class FollowMotionOperationEvidence {
     private(set) var commandReceipt: RoverCommandDiagnosticReceipt?
     private(set) var stopReceipt: RoverCommandDiagnosticReceipt?
 
-    init(context: FollowMotionOperationContext) { initialContext = context }
+    init(context: FollowMotionOperationContext) {
+        initialContext = context
+        recoveryEpisodeID = FollowRecoveryScope.authorization?.episodeID
+        recoveryDeadline = FollowRecoveryScope.authorization?.deadline
+        recoveryStageHeading = FollowRecoveryScope.heading?.stageHeading
+        recoveryExpectedGeneration = FollowRecoveryScope.authorization?.expectedGeneration
+    }
     var context: FollowMotionOperationContext {
         .init(request: initialContext.request, controllerOperationID: initialContext.controllerOperationID,
             purpose: initialContext.purpose, profile: initialContext.profile,
-            requestedRotation: initialContext.requestedRotation, targetYaw: targetYaw)
+            requestedRotation: recovery?.requestedDelta ?? initialContext.requestedRotation, targetYaw: targetYaw)
     }
     func recordFailure(_ reason: NavigationFailure) {
         if primaryFailure == nil || primaryFailure == .commandFailed { primaryFailure = reason }
@@ -139,7 +155,8 @@ final class FollowMotionOperationEvidence {
     func result(_ result: NavigationResult) -> FollowMotionResult {
         .init(result: result, context: context, failure: failure(source: .result),
             stopOutcome: stopOutcome, commandReceipt: commandReceipt, stopReceipt: stopReceipt,
-            deferred: primaryFailure == nil && stopOutcome != .failed ? FollowReadyAdmissionScope.current?.deferred : nil)
+            deferred: primaryFailure == nil && stopOutcome != .failed ? FollowReadyAdmissionScope.current?.deferred : nil,
+            recovery: recovery)
     }
 }
 

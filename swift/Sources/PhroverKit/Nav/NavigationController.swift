@@ -77,7 +77,7 @@ public final class NavigationController {
         nextFollowOperationID &+= 1 // Controller-owned identity reserved before the first suspension.
         let captured = FollowMotionOperationContext(request: context, controllerOperationID: nextFollowOperationID,
             purpose: request.purpose, profile: request.purpose == .followScan ? RoverConfig.followScanRotationProfile : nil,
-            requestedRotation: request.requestedRotation)
+            requestedRotation: FollowRecoveryScope.heading == nil ? request.requestedRotation : nil)
         let evidence = FollowMotionOperationEvidence(context: captured)
         if request.purpose == .followScan, let diagnosticEmitter {
             evidence.scanTrace = FollowScanDiagnosticTrace(emitter: diagnosticEmitter)
@@ -98,6 +98,15 @@ public final class NavigationController {
                 case .alignment(let angle): result = await rotateForFollowAlignment(by: angle)
                 case .ready: result = await navigateForFollowReadySignal()
                 case .following(let goal, let clearance): result = await navigateForFollow(to: goal, stoppingAtForwardClearance: clearance)
+                }
+                if result == .arrived, FollowRecoveryScope.authorization != nil,
+                   !recoveryAuthorized || evidence.fenced || evidence.ownedGeneration != operationGeneration {
+                    result = .cancelled
+                }
+                if result == .arrived, request.purpose != .followScan, FollowRecoveryScope.authorization != nil,
+                   followPoseRejection(readFollowPose(), at: sourceNow()) != nil {
+                    result = .failed(.trackingLost)
+                    finish(result)
                 }
                 if Task.isCancelled, let confirmation = beginCallerCancellation(for: evidence) {
                     // Cancellation is inhibition, not acknowledgement. Freeze terminal
@@ -330,9 +339,9 @@ public final class NavigationController {
         let reservation = operationGeneration
         FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
-        guard operationGeneration == reservation, !Task.isCancelled else { return .cancelled }
+        guard operationGeneration == reservation, !Task.isCancelled, recoveryAuthorized else { return .cancelled }
         let startSample = readFollowPose()
-        guard startSample.rejection(at: sourceNow()) == nil, let start = startSample.pose else {
+        guard followPoseRejection(startSample, at: sourceNow()) == nil, let start = startSample.pose else {
             return .failed(currentPoseSample == nil ? .noPose : .trackingLost)
         }
         let direction = Vec2(cos(start.yaw), sin(start.yaw))
@@ -373,14 +382,14 @@ public final class NavigationController {
         while !Task.isCancelled {
             let ack = await currentLastAck()
             guard !Task.isCancelled, operationGeneration == ownedGeneration,
-                  FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed else { return .cancelled }
+                  FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed, recoveryAuthorized else { return .cancelled }
             // Actor acknowledgement reads can suspend. Sample clock and safety only
             // after that read so neither fresh acknowledgements nor changed hazards
             // are evaluated against an older snapshot.
             let time = now()
             let sourceTime = sourceNow()
             let sample = readFollowPose()
-            guard sample.rejection(at: sourceTime, expectedGeneration: sourceGeneration) == nil,
+            guard followPoseRejection(sample, at: sourceTime, expectedGeneration: sourceGeneration) == nil,
                   let pose = sample.pose else { return .failed(.trackingLost) }
             let delta = pose.position - start.position
             let along = delta.x * direction.x + delta.y * direction.y
@@ -408,6 +417,11 @@ public final class NavigationController {
             let speed = min(0.05, (0.10 - along) * 0.8)
             if !sent, let admission = FollowReadyAdmissionScope.current,
                !admission.admit(boundary: .controllerFirstSend, sample: sample, readUptime: sourceTime) { return .cancelled }
+            if FollowRecoveryScope.authorization != nil {
+                guard recoveryAuthorized, operationGeneration == ownedGeneration,
+                      FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed else { return .cancelled }
+                if followPoseRejection(sample, at: sourceNow()) != nil { return .failed(.trackingLost) }
+            }
             sent = true
             do { try await sendCommand(WheelCommand(left: speed, right: speed)) }
             catch { return Task.isCancelled ? .cancelled : .failed(.commandFailed) }
@@ -520,15 +534,20 @@ public final class NavigationController {
         FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop(origin: "independent") } catch { return .failed(.commandFailed) }
         guard operationGeneration == reservation, !Task.isCancelled,
-              FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
+              FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
         operationGeneration &+= 1
         FollowMotionTaskScope.evidence?.ownedGeneration = operationGeneration
         let startSourceTime = sourceNow()
         let startSample = readFollowPose()
-        guard startSample.rejection(at: startSourceTime) == nil, let startYaw = startSample.pose?.yaw else {
+        if let recovery = FollowRecoveryScope.heading {
+            FollowMotionTaskScope.evidence?.recovery = .init(postStopSource: startSample, resolutionSource: nil,
+                stageHeading: recovery.stageHeading, segmentHeading: nil, requestedDelta: nil,
+                arrivalSource: nil, segmentArrived: false, stageArrived: nil, postStopReadUptime: startSourceTime)
+        }
+        guard followPoseRejection(startSample, at: startSourceTime) == nil, let startYaw = startSample.pose?.yaw else {
             if currentPoseSample != nil, let evidence = FollowMotionTaskScope.evidence {
                 evidence.scanTrace?.unavailablePost(sample: .init(sample: startSample, uptime: startSourceTime,
-                    expectedGeneration: nil), evidence: evidence, latch: stopUnconfirmed)
+                    expectedGeneration: FollowRecoveryScope.authorization?.expectedGeneration), evidence: evidence, latch: stopUnconfirmed)
             }
             let result = NavigationResult.failed(currentPoseSample == nil ? .noPose : .trackingLost)
             finish(result)
@@ -536,7 +555,8 @@ public final class NavigationController {
         }
         state = .driving
         publishSafetyState(.moving)
-        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .followScan,
+        let initialTarget = FollowRecoveryScope.heading?.stageHeading ?? normalizeAngle(startYaw + angle)
+        let task = Task { await performRotate(to: initialTarget, mode: .followScan,
             followProfile: profile, sourceGeneration: startSample.frameID?.generation) }
         loop = task
         let result = await task.value
@@ -544,7 +564,30 @@ public final class NavigationController {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
         do { try await confirmStop(origin: "final") } catch { return .failed(.commandFailed) }
         guard operationGeneration == reservation + 1, !Task.isCancelled,
-              FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
+              FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
+        if let previous = FollowMotionTaskScope.evidence?.recovery {
+            let arrival = readFollowPose()
+            let arrivalReadUptime = sourceNow()
+            let valid = followPoseRejection(arrival, at: arrivalReadUptime) == nil
+            let segmentArrived = valid && arrival.pose.map {
+                abs(FollowReacquisitionPlanner.wrap((previous.segmentHeading ?? .nan) - $0.yaw)) <= profile.angularTolerance
+            } == true
+            let stageArrived = valid ? arrival.pose.map {
+                abs(FollowReacquisitionPlanner.wrap(previous.stageHeading - $0.yaw)) <= profile.angularTolerance
+            } : nil
+            FollowMotionTaskScope.evidence?.recovery = .init(postStopSource: previous.postStopSource,
+                resolutionSource: previous.resolutionSource, stageHeading: previous.stageHeading,
+                segmentHeading: previous.segmentHeading, requestedDelta: previous.requestedDelta,
+                arrivalSource: arrival, segmentArrived: result == .arrived && segmentArrived,
+                stageArrived: result == .arrived ? stageArrived : nil,
+                postStopReadUptime: previous.postStopReadUptime, resolutionReadUptime: previous.resolutionReadUptime,
+                arrivalReadUptime: arrivalReadUptime)
+            if result == .arrived, !valid {
+                let unavailable = NavigationResult.failed(.trackingLost)
+                finish(unavailable)
+                return unavailable
+            }
+        }
         return result
     }
 
@@ -558,10 +601,12 @@ public final class NavigationController {
         FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
         guard operationGeneration == reservation, !Task.isCancelled,
-              FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
+              FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
         operationGeneration &+= 1
         FollowMotionTaskScope.evidence?.ownedGeneration = operationGeneration
-        guard let startYaw = currentPose()?.yaw else {
+        let startSample = FollowRecoveryScope.authorization == nil ? NavigationPoseSample.legacy(currentPose()) : readFollowPose()
+        guard FollowRecoveryScope.authorization == nil || followPoseRejection(startSample, at: sourceNow()) == nil,
+              let startYaw = startSample.pose?.yaw else {
             let result = NavigationResult.failed(.noPose)
             finish(result)
             return result
@@ -723,9 +768,31 @@ public final class NavigationController {
 
     // MARK: - Loop
 
-    private func readFollowPose() -> NavigationPoseSample {
+    func readFollowPose() -> NavigationPoseSample {
         if let currentPoseSample { return currentPoseSample() ?? .unavailable }
         return .legacy(currentPose())
+    }
+
+    private var recoveryAuthorized: Bool {
+        guard let authorization = FollowRecoveryScope.authorization else { return true }
+        let time = authorization.now()
+        let allowed = authorization.authorized(at: time) && FollowRecoveryScope.heading?.stageHeading.isFinite != false
+        FollowMotionTaskScope.evidence?.recoveryAuthorizationTime = time
+        FollowMotionTaskScope.evidence?.recoveryAuthorizationOutcome = allowed ? "authorized" :
+            (!time.isFinite || !authorization.deadline.isFinite ? "nonfinite_deadline_clock" :
+                (time >= authorization.deadline ? "deadline_expired" :
+                    (Task.isCancelled ? "cancelled" : "ownership_health_or_heading_fenced")))
+        return allowed
+    }
+
+    private func followPoseRejection(_ sample: NavigationPoseSample, at time: TimeInterval,
+                                     expectedGeneration: UInt64? = nil) -> String? {
+        if let recovery = FollowRecoveryScope.authorization {
+            guard sample.source != "legacy_unknown", sample.frameID != nil,
+                  sample.sourceTimestamp != nil, sample.trackingQuality != nil else { return "missing_recovery_provenance" }
+            return sample.rejection(at: time, expectedGeneration: recovery.expectedGeneration)
+        }
+        return sample.rejection(at: time, expectedGeneration: expectedGeneration)
     }
 
     private func drive(to goal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?,
@@ -913,7 +980,9 @@ public final class NavigationController {
     private func performRotate(to targetYaw: Double, mode: RotationMode,
                                followProfile: FollowScanRotationProfile? = nil,
                                sourceGeneration: UInt64? = nil) async -> NavigationResult {
-        FollowMotionTaskScope.evidence?.targetYaw = targetYaw
+        var targetYaw = targetYaw
+        var recoveryResolved = false
+        FollowMotionTaskScope.evidence?.targetYaw = FollowRecoveryScope.heading == nil ? targetYaw : nil
         let pulsed = mode == .scan || mode == .followScan
         let profile = mode == .followScan ? followProfile : nil
         let angularTolerance = profile?.angularTolerance ?? (pulsed ? RoverConfig.scanTurnYawTolerance : 0.05)
@@ -921,18 +990,20 @@ public final class NavigationController {
         var hasSentCommand = false
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
+            guard recoveryAuthorized else { break }
             let evidence = FollowMotionTaskScope.evidence
             let trace = evidence?.scanTrace
             var lastAck: Date?
-            if mode == .followScan {
+            let requiresSource = mode == .followScan || FollowRecoveryScope.authorization != nil
+            if requiresSource {
                 trace?.enter("ack_read")
                 lastAck = await currentLastAck()
                 guard !Task.isCancelled, evidence?.fenced != true, !stopUnconfirmed,
-                      operationGeneration == ownedGeneration else { break }
+                      operationGeneration == ownedGeneration, recoveryAuthorized else { break }
             }
-            let sourceTime = mode == .followScan ? sourceNow() : 0
-            let controlSample = mode == .followScan ? readFollowPose() : .legacy(currentPose())
-            guard mode != .followScan || controlSample.rejection(at: sourceTime, expectedGeneration: sourceGeneration) == nil,
+            let sourceTime = requiresSource ? sourceNow() : 0
+            let controlSample = requiresSource ? readFollowPose() : .legacy(currentPose())
+            guard !requiresSource || followPoseRejection(controlSample, at: sourceTime, expectedGeneration: sourceGeneration) == nil,
                   let pose = controlSample.pose else {
                 if let evidence = FollowMotionTaskScope.evidence {
                     let rejected = currentPoseSample == nil ? nil : RotationPoseDiagnosticSample(
@@ -944,6 +1015,27 @@ public final class NavigationController {
                 finish(result)
                 return result
             }
+            if mode == .followScan, let recovery = FollowRecoveryScope.heading, !recoveryResolved {
+                let delta: Double
+                switch FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: recovery.stageHeading, actualYaw: pose.yaw) {
+                case .turn(let resolvedDelta, let target):
+                    delta = resolvedDelta
+                    targetYaw = target
+                case .stageArrived:
+                    delta = 0
+                    targetYaw = FollowReacquisitionPlanner.wrap(pose.yaw)
+                case .unavailable, .exhausted:
+                    return .cancelled
+                }
+                recoveryResolved = true
+                evidence?.targetYaw = targetYaw
+                if let previous = evidence?.recovery {
+                    evidence?.recovery = .init(postStopSource: previous.postStopSource, resolutionSource: controlSample,
+                        stageHeading: recovery.stageHeading, segmentHeading: targetYaw, requestedDelta: delta,
+                        arrivalSource: nil, segmentArrived: false, stageArrived: nil,
+                        postStopReadUptime: previous.postStopReadUptime, resolutionReadUptime: sourceTime)
+                }
+            }
             let error = normalizeAngle(targetYaw - pose.yaw)
             let sample = currentPoseSample != nil && mode == .followScan
                 ? RotationPoseDiagnosticSample(sample: controlSample, uptime: sourceTime, expectedGeneration: sourceGeneration)
@@ -954,13 +1046,13 @@ public final class NavigationController {
             }
             if abs(error) <= angularTolerance {
                 try? await rotationStop(origin: "final")
-                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { return .cancelled }
+                if requiresSource && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed || !recoveryAuthorized) { return .cancelled }
                 let result = NavigationResult.arrived
                 finish(result)
                 return result
             }
 
-            if mode != .followScan {
+            if !requiresSource {
                 trace?.enter("ack_read")
                 lastAck = await currentLastAck()
             }
@@ -1042,6 +1134,16 @@ public final class NavigationController {
                 trace?.pulse(sample, command: cmd, evidence: evidence, latch: stopUnconfirmed)
                 trace?.beginSend(cmd, evidence: evidence, latch: stopUnconfirmed)
             }
+            if FollowRecoveryScope.authorization != nil {
+                guard recoveryAuthorized, operationGeneration == ownedGeneration,
+                      !Task.isCancelled, evidence?.fenced != true, !stopUnconfirmed else { break }
+                if followPoseRejection(controlSample, at: sourceNow()) != nil {
+                    try? await rotationStop(origin: "cleanup")
+                    let result = NavigationResult.failed(.trackingLost)
+                    finish(result)
+                    return result
+                }
+            }
             do {
                 try await sendCommand(cmd)
                 if let evidence { trace?.endSend(evidence: evidence, latch: stopUnconfirmed, outcome: "acknowledged") }
@@ -1060,13 +1162,13 @@ public final class NavigationController {
                 ])
                 return .failed(.commandFailed)
             }
-            if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
+            if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed || !recoveryAuthorized) { break }
             if pulsed {
                 if let evidence { trace?.beginWait("pulse_wait", duration: profile?.pulseWait ?? RoverConfig.scanTurnPulseDuration,
                     evidence: evidence, latch: stopUnconfirmed) }
                 await sleep(.seconds(profile?.pulseWait ?? RoverConfig.scanTurnPulseDuration))
                 if let evidence { trace?.endWait("pulse_wait", evidence: evidence, latch: stopUnconfirmed, interrupted: Task.isCancelled) }
-                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
+                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed || !recoveryAuthorized) { break }
                 do {
                     try await rotationStop(origin: "pulse")
                 } catch {
@@ -1079,14 +1181,14 @@ public final class NavigationController {
                     finish(result)
                     return result
                 }
-                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
+                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed || !recoveryAuthorized) { break }
                 RuntimeFileLog.append("nav_scan_turn_settle", fields: [
                     "settle_seconds": String(format: "%.2f", RoverConfig.scanTurnSettleDuration)
                 ])
                 if let evidence { trace?.beginWait("settle", duration: profile?.settleWait ?? RoverConfig.scanTurnSettleDuration,
                     evidence: evidence, latch: stopUnconfirmed) }
                 await sleep(.seconds(profile?.settleWait ?? RoverConfig.scanTurnSettleDuration))
-                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) {
+                if mode == .followScan && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed || !recoveryAuthorized) {
                     if let evidence { trace?.endWait("settle", evidence: evidence, latch: stopUnconfirmed, interrupted: true) }
                     break
                 }

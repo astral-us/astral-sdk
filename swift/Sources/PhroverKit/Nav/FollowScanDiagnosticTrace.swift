@@ -90,6 +90,9 @@ final class FollowScanDiagnosticTrace {
         payload.merge(operationFields) { _, value in value }
         payload.merge(watchdogFields) { _, value in value }
         payload.merge(stageFields) { _, value in value }
+        if evidence.recoveryEpisodeID != nil {
+            payload.merge(FollowReacquisitionDiagnostics.controllerPayload(evidence)) { _, value in value }
+        }
         for timing in ["pulse_begin_monotonic_s", "send_start_monotonic_s", "send_end_monotonic_s", "send_host_duration_s",
                        "pulse_wait_start_monotonic_s", "pulse_wait_end_monotonic_s", "pulse_wait_host_duration_s",
                        "settle_start_monotonic_s", "settle_end_monotonic_s", "settle_host_duration_s"] {
