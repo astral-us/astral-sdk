@@ -45,7 +45,8 @@ indirect enum FollowDiagnosticValue: Sendable, Equatable {
     /// Defense in depth; callers supply only bounded primitive diagnostic facts.
     fileprivate static func jsonObject(_ values: [String: Self]) -> [String: Any] {
         let excluded: Set<String> = ["image", "images", "audio", "transcript", "transcripts",
-            "request_body", "response_body", "raw_detector_count", "projection_count"]
+            "request_body", "response_body", "projection_count", "depth_array", "depth_samples",
+            "url", "path", "request_payload", "biometric_identity"]
         var result: [String: Any] = [:]
         for (key, value) in values where !excluded.contains(key) {
             result[key] = value.jsonValue

@@ -325,7 +325,8 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(4, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, y: 4.3)]))
         await drain()
         XCTAssertEqual(motion.requests.map(\.purpose), [.followAlignment, .followReady, .followGoal])
-        XCTAssertEqual(motion.contexts.map(\.phase), ["aligning", "signalingReady", "following"])
+        XCTAssertEqual(motion.contexts.map(\.phase), ["aligning", "aligning", "following"],
+                       "Capture the actual pending request phase, not signaling before admission")
         XCTAssertEqual(Set(motion.contexts.map(\.sessionGeneration)), [1])
         XCTAssertEqual(Set(motion.contexts.map(\.requestToken)).count, 3)
         _ = await coordinator.stop()
@@ -362,8 +363,87 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
         await drain()
         XCTAssertEqual(motion.readySignals, 0)
-        XCTAssertEqual(coordinator.state, .failed("Not enough person clearance for the 10 cm ready signal. Step back and start following again."))
+        XCTAssertEqual(String(describing: coordinator.state), "waitingForClearance")
+        XCTAssertTrue(coordinator.isActive)
         XCTAssertTrue(motion.goals.isEmpty)
+        let alignments = motion.alignments.count
+        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5, y: 1.31)]))
+        await drain()
+        XCTAssertEqual(motion.alignments.count, alignments)
+        XCTAssertEqual(motion.readySignals, 0)
+        _ = await coordinator.stop()
+    }
+
+    func testClearanceWaitHeadingDriftReturnsToAlignmentAndNeedsNewPostStopFrame() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .waitingForClearance)
+        motion.suspendAlignment = true
+        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2 - 0.06), people: [person(3, at: 5, y: 1.4)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .aligning)
+        XCTAssertEqual(motion.alignments.count, 2)
+        motion.releaseAlignment()
+        await drain()
+        XCTAssertEqual(motion.readySignals, 0)
+        perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, at: 5, y: 1.4)]))
+        await drain()
+        XCTAssertEqual(motion.readySignals, 1)
+        _ = await coordinator.stop()
+    }
+
+    func testCachedOrFutureStepBackFrameCannotReleaseClearanceWait() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.6)]))
+        await drain()
+        XCTAssertEqual(coordinator.state, .waitingForClearance)
+        perception.send(frame(3, at: 5.1, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5.1, y: 1.6)]))
+        await drain()
+        XCTAssertEqual(motion.readySignals, 0)
+        XCTAssertTrue(motion.goals.isEmpty)
+        XCTAssertEqual(coordinator.perceptionIssue, .staleFrame)
+        clock.advance(to: 7)
+        await drain()
+        XCTAssertFalse(coordinator.isActive, "Clearance waiting cannot extend the existing outage deadline")
+        _ = await coordinator.stop()
+    }
+
+    func testHealthyMatchedClearanceWaitHasNoNewTimeoutOrMotion() async {
+        let (coordinator, perception, motion, clock) = productionSetup()
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        await drain()
+        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
+        await drain()
+        for sequence in UInt64(3)...33 {
+            let time = 5 + Double(sequence - 2) * 0.4
+            clock.advance(to: time)
+            perception.send(frame(sequence, at: time, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                                  people: [person(sequence, at: time, y: 1.3)]))
+            await drain()
+        }
+        XCTAssertEqual(coordinator.state, .waitingForClearance)
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(motion.readySignals, 0)
+        XCTAssertEqual(motion.alignments.count, 1)
+        XCTAssertTrue(motion.rotations.isEmpty)
+        XCTAssertTrue(motion.goals.isEmpty)
+        _ = await coordinator.stop()
     }
 
     func testLossAfterSignalStopBeforeBaselineReacquiresWithoutSecondMoveAndCanDepart() async {
@@ -1750,7 +1830,13 @@ final class FollowMeCoordinatorTests: XCTestCase {
         clock.advance(to: 1.3)
         perception.send(frame(8, at: 1.3, depth: false))
         await drain()
-        XCTAssertEqual(logs.filter { $0.0 == "follow_frame" }.count, 2)
+        let pipeline = logs.filter { $0.0 == "follow_frame" }.compactMap { entry -> [String: Any]? in
+            guard let data = entry.1["payload"]?.data(using: .utf8) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
+        XCTAssertEqual(pipeline.count, 3, "Initial tracking issue, changed reason, and changed health emit immediately")
+        XCTAssertEqual(pipeline.compactMap { $0["monotonic_s"] as? Double }, [0, 0.2, 0.3],
+                       "Repeated identical unhealthy evaluations do not consume the healthy periodic allowance")
         _ = await coordinator.stop()
     }
 

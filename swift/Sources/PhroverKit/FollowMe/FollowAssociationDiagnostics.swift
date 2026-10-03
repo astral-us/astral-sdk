@@ -5,6 +5,8 @@ import RoverNav
 struct FollowSummaryBudget {
     private(set) var previousOutcome: String?
     private var lastHealthy: Double?
+    private var previousAssociationSignature: String?
+    private var previousPipelineSignature: String?
 
     mutating func takeHealthy(now: Double) -> Bool {
         guard now.isFinite, lastHealthy == nil || now >= lastHealthy! + 1 else { return false }
@@ -12,8 +14,10 @@ struct FollowSummaryBudget {
         return true
     }
 
-    mutating func takeAssociation(outcome: String, now: Double) -> Bool {
-        let transition = outcome != previousOutcome
+    mutating func takeAssociation(outcome: String, now: Double, reasons: String = "") -> Bool {
+        let signature = outcome + "|" + reasons
+        let transition = signature != previousAssociationSignature
+        previousAssociationSignature = signature
         previousOutcome = outcome
         if transition {
             // Healthy transitions bypass the allowance but occupy this frame's slot,
@@ -24,6 +28,13 @@ struct FollowSummaryBudget {
             return true
         }
         return outcome == "continued" && takeHealthy(now: now)
+    }
+
+    mutating func takePipeline(signature: String, now: Double, healthy: Bool) -> Bool {
+        let transition = previousPipelineSignature != signature
+        previousPipelineSignature = signature
+        if transition { if now.isFinite { lastHealthy = now }; return true }
+        return healthy && takeHealthy(now: now)
     }
 }
 
@@ -42,8 +53,10 @@ struct FollowAssociationEvaluation {
         let association: [String: FollowDiagnosticValue] = [
             "association_outcome": .string(outcome), "previous_outcome": previousOutcome.map { .string($0) } ?? .null,
             "association_mode": .string(mode),
-            "projected_person_count": .number(Double(candidates.count)),
+            "tracker_input_count": .number(Double(candidates.count)),
             "eligible_candidate_count": .number(Double(eligibleCount)),
+            "selected_candidate_count": .number(selectedIndex == nil ? 0 : 1),
+            "tracker_counts_availability": .string("available"),
             "matched_candidate_count": matchedCount.map { .number(Double($0)) } ?? .null,
             "matched_candidate_count_availability": .string(matchedCount == nil ? "not_applicable_initial_selection" : "available"),
             "selected_candidate": selectedIndex.map { .object(candidates[$0]) } ?? .null,
@@ -64,8 +77,12 @@ struct FollowAssociationEvaluation {
 
     static func healthPayload(batch: FollowFrameBatch, now: Double) -> [String: FollowDiagnosticValue] {
         let age = now - batch.timestamp
-        let paired = batch.pose != nil && batch.people.allSatisfy { $0.frameID == batch.frameID }
-        return [
+        let evaluated = batch.perceptionDiagnostics?.inferenceStatus == .executed
+        let paired = batch.pose != nil && (evaluated || !batch.people.isEmpty)
+            && batch.perceptionDiagnostics?.inferenceStatus != .failed
+            && batch.perceptionDiagnostics?.inferenceStatus != .skippedTracking
+            && batch.people.allSatisfy { $0.frameID == batch.frameID }
+        var result: [String: FollowDiagnosticValue] = [
             "frame_id": .string("\(batch.frameID.generation):\(batch.frameID.sequence)"),
             "observation_monotonic_s": .number(batch.timestamp), "observation_age_s": .number(age),
             "tracking_state": batch.trackingQuality.map { .string(String(describing: $0)) } ?? .null,
@@ -75,9 +92,18 @@ struct FollowAssociationEvaluation {
             "same_frame": paired ? .bool(true) : .null,
             "same_frame_availability": .string(paired ? "same_frame" : "unknown"),
             "pose_available": .bool(batch.pose != nil), "depth_available": .bool(batch.depthAvailable),
+            "projected_person_count": batch.perceptionDiagnostics.map {
+                $0.projectedPersonCount.map { .number(Double($0)) } ?? .null
+            } ?? .number(Double(batch.people.count)),
+            "projected_person_count_availability": .string(batch.perceptionDiagnostics != nil
+                && batch.perceptionDiagnostics?.projectedPersonCount == nil ? "not_evaluated" : "available"),
+            "eligible_candidate_count": .null, "matched_candidate_count": .null, "selected_candidate_count": .null,
+            "tracker_counts_availability": .string("not_evaluated"),
             "inference_duration_s": batch.inferenceDuration.map { .number($0) } ?? .null,
             "inference_duration_s_availability": .string(batch.inferenceDuration == nil ? "not_measured" : "available")
         ]
+        result.merge(FollowPerceptionDiagnostics.payload(batch.perceptionDiagnostics)) { _, new in new }
+        return result
     }
 }
 
@@ -105,7 +131,9 @@ struct FollowCandidateEvidence {
         let geometryAvailable = dx.isFinite && dy.isFinite && range.isFinite && pose.yaw.isFinite
         let heading = RotationDiagnosticMeasurement.normalize(atan2(dy, dx) - pose.yaw)
         return [
-            "candidate_id": .number(Double(index)), "candidate_id_scope": .string("frame_local"),
+            "candidate_id": .number(Double(observation.rawPersonID ?? index)), "candidate_id_scope": .string("frame_local"),
+            "raw_person_id": observation.rawPersonID.map { .number(Double($0)) } ?? .null,
+            "raw_person_id_availability": .string(observation.rawPersonID == nil ? "unknown_legacy_provider" : "available"),
             "frame_id": .string("\(observation.frameID.generation):\(observation.frameID.sequence)"),
             "observation_monotonic_s": .number(observation.timestamp),
             "confidence": .number(Double(observation.confidence)),

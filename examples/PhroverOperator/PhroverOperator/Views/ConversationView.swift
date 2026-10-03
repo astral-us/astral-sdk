@@ -114,6 +114,7 @@ struct ConversationView: View {
                                                mayStartFollow: otherMotionActive)
             model.configure(submit: { await router.submit($0) },
                             stop: { await router.stop() }, followState: { follow.state },
+                            readySignalClearance: { follow.readySignalClearance },
                             inhibit: { follow.inhibitMotion() })
             authorized = await speechIn.requestAuthorization()
         }

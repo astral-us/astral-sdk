@@ -18,6 +18,10 @@ public enum ARTrackingQuality: Equatable, Sendable {
     case normal
 }
 
+public enum ARDepthSource: String, Sendable {
+    case smoothedSceneDepth, sceneDepth
+}
+
 public struct ARFrameSnapshot: @unchecked Sendable {
     public let id: ARFrameID
     public let timestamp: TimeInterval
@@ -28,11 +32,14 @@ public struct ARFrameSnapshot: @unchecked Sendable {
     public let depthMap: CVPixelBuffer?
     public let pose: Pose2D
     public let trackingQuality: ARTrackingQuality
+    public let depthConfidenceMap: CVPixelBuffer?
+    public let depthSource: ARDepthSource?
 
     public init(id: ARFrameID, timestamp: TimeInterval, image: CVPixelBuffer,
                 cameraTransform: simd_float4x4, cameraIntrinsics: simd_float3x3,
                 imageResolution: CGSize, depthMap: CVPixelBuffer?, pose: Pose2D,
-                trackingQuality: ARTrackingQuality) {
+                trackingQuality: ARTrackingQuality, depthConfidenceMap: CVPixelBuffer? = nil,
+                depthSource: ARDepthSource? = nil) {
         self.id = id
         self.timestamp = timestamp
         self.image = image
@@ -42,6 +49,8 @@ public struct ARFrameSnapshot: @unchecked Sendable {
         self.depthMap = depthMap
         self.pose = pose
         self.trackingQuality = trackingQuality
+        self.depthConfidenceMap = depthConfidenceMap
+        self.depthSource = depthSource
     }
 }
 
@@ -131,12 +140,15 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     // MARK: - ARSessionDelegate
 
     public func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        let depthMap = (frame.smoothedSceneDepth ?? frame.sceneDepth)?.depthMap
+        let selectedDepth = frame.smoothedSceneDepth ?? frame.sceneDepth
+        let depthSource: ARDepthSource? = frame.smoothedSceneDepth != nil ? .smoothedSceneDepth
+            : (selectedDepth != nil ? .sceneDepth : nil)
         ingest(image: frame.capturedImage, timestamp: frame.timestamp,
                cameraTransform: frame.camera.transform, intrinsics: frame.camera.intrinsics,
-               imageResolution: frame.camera.imageResolution, depthMap: depthMap,
+               imageResolution: frame.camera.imageResolution, depthMap: selectedDepth?.depthMap,
                trackingQuality: Self.trackingQuality(from: frame.camera.trackingState),
-               compatibilityCamera: frame.camera, compatibilityTrackingState: frame.camera.trackingState)
+               compatibilityCamera: frame.camera, compatibilityTrackingState: frame.camera.trackingState,
+               depthConfidenceMap: selectedDepth?.confidenceMap, depthSource: depthSource)
     }
 
     public func sessionWasInterrupted(_ session: ARSession) { interruptionBegan() }
@@ -172,14 +184,15 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                         cameraTransform: simd_float4x4, intrinsics: simd_float3x3,
                         imageResolution: CGSize, depthMap: CVPixelBuffer?,
                         trackingQuality: ARTrackingQuality, compatibilityCamera: ARCamera? = nil,
-                        compatibilityTrackingState: ARCamera.TrackingState? = nil) {
+                        compatibilityTrackingState: ARCamera.TrackingState? = nil,
+                        depthConfidenceMap: CVPixelBuffer? = nil, depthSource: ARDepthSource? = nil) {
         frameSequence &+= 1
         let currentPose = Self.groundPose(from: cameraTransform)
         let snapshot = ARFrameSnapshot(
             id: ARFrameID(generation: sessionGeneration, sequence: frameSequence), timestamp: timestamp,
             image: image, cameraTransform: cameraTransform, cameraIntrinsics: intrinsics,
             imageResolution: imageResolution, depthMap: depthMap, pose: currentPose,
-            trackingQuality: trackingQuality
+            trackingQuality: trackingQuality, depthConfidenceMap: depthConfidenceMap, depthSource: depthSource
         )
         latestSnapshot = snapshot
         latestPixelBuffer = snapshot.image
@@ -240,10 +253,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     func ingestForTesting(image: CVPixelBuffer, timestamp: TimeInterval,
                           cameraTransform: simd_float4x4, intrinsics: simd_float3x3,
                           imageResolution: CGSize, depthMap: CVPixelBuffer?,
-                          trackingQuality: ARTrackingQuality) {
+                          trackingQuality: ARTrackingQuality, depthConfidenceMap: CVPixelBuffer? = nil,
+                          depthSource: ARDepthSource? = nil) {
         ingest(image: image, timestamp: timestamp, cameraTransform: cameraTransform,
                intrinsics: intrinsics, imageResolution: imageResolution, depthMap: depthMap,
-               trackingQuality: trackingQuality)
+               trackingQuality: trackingQuality, depthConfidenceMap: depthConfidenceMap, depthSource: depthSource)
     }
 
     func interruptionBeganForTesting() { interruptionBegan() }

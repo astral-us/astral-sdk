@@ -10,15 +10,18 @@ public struct FollowPersonObservation {
     public let boundingBox: CGRect
     public let position: Vec2
     public let pose: Pose2D
+    /// Canonical-person index within this frame's raw detections; nil for older providers.
+    public let rawPersonID: Int?
 
     public init(frameID: ARFrameID, timestamp: TimeInterval, confidence: Float,
-                boundingBox: CGRect, position: Vec2, pose: Pose2D) {
+                boundingBox: CGRect, position: Vec2, pose: Pose2D, rawPersonID: Int? = nil) {
         self.frameID = frameID
         self.timestamp = timestamp
         self.confidence = confidence
         self.boundingBox = boundingBox
         self.position = position
         self.pose = pose
+        self.rawPersonID = rawPersonID
     }
 }
 
@@ -38,6 +41,7 @@ public struct FollowMeConfiguration {
     public var reacquisitionDistance: Double = 1.5
     public var standOffDistance: Double = 1.5
     public var minimumHoldDistance: Double = 1.25
+    public var readySignalClearance: Double { minimumHoldDistance + 0.12 }
     public var maximumHoldDistance: Double = 1.75
     public var scanIncrement: Double = .pi / 6
     public var maximumScanRotation: Double = 2 * .pi

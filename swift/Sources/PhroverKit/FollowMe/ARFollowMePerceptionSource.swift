@@ -30,14 +30,16 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                     let reason = ar.session.currentFrame.map { Self.trackingReason(from: $0.camera.trackingState) } ?? nil
                     if snapshot.trackingQuality != .normal {
                         continuation.yield(.frame(Self.batch(from: snapshot, detections: [],
-                                                            trackingReason: reason, inferenceDuration: 0)))
+                                                            trackingReason: reason)))
                         continue
                     }
                     let started = ProcessInfo.processInfo.systemUptime
-                    let detections = detector.detect(snapshot).detections
+                    let receipt = detector.evaluateForFollow(snapshot)
                     let duration = ProcessInfo.processInfo.systemUptime - started
-                    continuation.yield(.frame(Self.batch(from: snapshot, detections: detections,
-                                                        trackingReason: reason, inferenceDuration: duration)))
+                    continuation.yield(.frame(Self.batch(from: snapshot, detections: receipt.frame.detections,
+                                                        trackingReason: reason, inferenceDuration: duration,
+                                                        inferenceStatus: receipt.status == .executed ? .executed : .failed,
+                                                        inferenceFailureReason: receipt.failureReason)))
                 }
             }
             let lifecycleTask = Task {
@@ -60,21 +62,36 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
     public static func batch(from snapshot: ARFrameSnapshot,
                              detections: [Detector.Detection],
                              trackingReason: FollowTrackingReason? = nil,
-                             inferenceDuration: TimeInterval? = nil) -> FollowFrameBatch {
-        let people: [FollowPersonObservation] = snapshot.trackingQuality == .normal ? detections.compactMap { detection in
-            guard detection.label.lowercased() == "person", snapshot.depthMap != nil else { return nil }
-            let foot = CGPoint(x: detection.boundingBox.midX, y: detection.boundingBox.minY)
-            guard let position = ARSessionManager.unproject(normalizedPoint: foot, in: snapshot),
+                             inferenceDuration: TimeInterval? = nil,
+                              inferenceStatus: FollowInferenceStatus = .executed,
+                              inferenceFailureReason: Detector.FailureReason? = nil) -> FollowFrameBatch {
+        let rawPeople = detections.filter { $0.label.lowercased() == "person" }
+        let status: FollowInferenceStatus = snapshot.trackingQuality == .normal ? inferenceStatus : .skippedTracking
+        let evaluated = status != .skippedTracking && status != .failed
+        let detectorCountsKnown = status == .executed
+        let candidates = evaluated ? rawPeople.enumerated().map { id, detection in
+            FollowPersonProjection.evaluate(box: detection.boundingBox, detectorConfidence: detection.confidence,
+                                            rawPersonID: id, in: snapshot)
+        } : []
+        let people: [FollowPersonObservation] = candidates.compactMap { candidate in
+            guard let position = candidate.position, candidate.rejection == nil,
                   position.x.isFinite, position.y.isFinite else { return nil }
             return FollowPersonObservation(frameID: snapshot.id, timestamp: snapshot.timestamp,
-                                           confidence: detection.confidence, boundingBox: detection.boundingBox,
-                                           position: position, pose: snapshot.pose)
-        } : []
+                                           confidence: candidate.detectorConfidence, boundingBox: candidate.box,
+                                           position: position, pose: snapshot.pose, rawPersonID: candidate.rawPersonID)
+        }
+        let diagnostics = FollowPerceptionDiagnostics(frameID: snapshot.id, timestamp: snapshot.timestamp,
+            inferenceStatus: status, inferenceFailureReason: inferenceFailureReason,
+            rawDetectorCount: detectorCountsKnown ? detections.count : nil, rawPersonCount: detectorCountsKnown ? rawPeople.count : nil,
+            projectionAttemptedCount: evaluated ? candidates.count : nil,
+            projectionAcceptedCount: evaluated ? people.count : nil,
+            projectionRejectedCount: evaluated ? candidates.count - people.count : nil,
+            projectedPersonCount: evaluated ? people.count : nil, candidates: candidates)
         return FollowFrameBatch(frameID: snapshot.id, timestamp: snapshot.timestamp,
                                 pose: snapshot.trackingQuality == .normal ? snapshot.pose : nil,
                                 depthAvailable: snapshot.depthMap != nil, people: people,
                                 trackingQuality: snapshot.trackingQuality, trackingReason: trackingReason,
-                                inferenceDuration: inferenceDuration)
+                                inferenceDuration: inferenceDuration, perceptionDiagnostics: diagnostics)
     }
 
     public static func trackingReason(from state: ARCamera.TrackingState) -> FollowTrackingReason? {

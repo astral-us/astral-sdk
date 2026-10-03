@@ -12,6 +12,17 @@ import ImageIO
 /// "who's there" behaviors. This is the on-device half of the hybrid AI split — heavy
 /// vision-language reasoning can be offloaded to the cloud via `DialogEscalating`.
 public final class Detector {
+    public enum EvaluationStatus: String, Sendable { case executed, failed }
+    public enum FailureReason: String, Sendable {
+        case unavailable = "detector_unavailable", inferenceFailed = "inference_failed"
+    }
+    public struct EvaluationReceipt: Sendable {
+        public let frame: FrameDetections
+        public let status: EvaluationStatus
+        public let failureReason: FailureReason?
+        /// Orientation actually evaluated for these boxes; nil for unknown legacy handlers/failure.
+        public let orientation: CGImagePropertyOrientation?
+    }
     public struct Detection: Sendable {
         public let label: String
         public let confidence: Float
@@ -31,7 +42,8 @@ public final class Detector {
     }
 
     private var request: VNCoreMLRequest?
-    private let detectionHandler: ((CVPixelBuffer) -> [Detection])?
+    private let detectionHandler: ((CVPixelBuffer) throws -> [Detection])?
+    private var visionHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [Detection])?
     public var isLoaded: Bool { request != nil }
     public private(set) var supportedCanonicalLabels: Set<String> = []
 
@@ -74,9 +86,17 @@ public final class Detector {
         }
     }
 
-    init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) -> [Detection]) {
+    init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) throws -> [Detection]) {
         request = nil
         self.detectionHandler = detectionHandler
+        supportedCanonicalLabels = supportedLabels
+    }
+
+    /// Exercises the same orientation selection as the production Vision request.
+    init(supportedLabels: Set<String>, visionHandler: @escaping (CVPixelBuffer, CGImagePropertyOrientation) throws -> [Detection]) {
+        request = nil
+        detectionHandler = nil
+        self.visionHandler = visionHandler
         supportedCanonicalLabels = supportedLabels
     }
 
@@ -100,13 +120,47 @@ public final class Detector {
     }
 
     public func detect(_ pixelBuffer: CVPixelBuffer) -> [Detection] {
-        if let detectionHandler { return detectionHandler(pixelBuffer) }
-        guard let request else { return [] }
-        for orientation in Self.detectionOrientations(preferred: .right) {
-            let detections = detect(pixelBuffer, request: request, orientation: orientation)
-            if !detections.isEmpty { return detections }
+        evaluate(pixelBuffer).detections
+    }
+
+    private func evaluate(_ pixelBuffer: CVPixelBuffer,
+                          orientations: [CGImagePropertyOrientation] = Detector.detectionOrientations(preferred: .right))
+        -> (detections: [Detection], reason: FailureReason?, orientation: CGImagePropertyOrientation?) {
+        if let detectionHandler {
+            do { return (try detectionHandler(pixelBuffer), nil, nil) }
+            catch { return ([], .inferenceFailed, nil) }
         }
-        return []
+        guard request != nil || visionHandler != nil else { return ([], .unavailable, nil) }
+        var failed = false
+        var evaluatedOrientation: CGImagePropertyOrientation?
+        for orientation in orientations {
+            do {
+                let detections: [Detection]
+                if let visionHandler { detections = try visionHandler(pixelBuffer, orientation) }
+                else if let request { detections = try detect(pixelBuffer, request: request, orientation: orientation) }
+                else { return ([], .unavailable, nil) }
+                evaluatedOrientation = orientation
+                if !detections.isEmpty { return (detections, nil, orientation) }
+            } catch { failed = true }
+        }
+        return ([], failed ? .inferenceFailed : nil, failed ? nil : evaluatedOrientation)
+    }
+
+    public func evaluate(_ snapshot: ARFrameSnapshot) -> EvaluationReceipt {
+        let result = evaluate(snapshot.image)
+        return EvaluationReceipt(frame: .init(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
+                                             detections: result.detections),
+                                 status: result.reason == nil ? .executed : .failed, failureReason: result.reason,
+                                 orientation: result.orientation)
+    }
+
+    /// Follow projection uses the inverse .right transform; never feed fallback boxes to it.
+    public func evaluateForFollow(_ snapshot: ARFrameSnapshot) -> EvaluationReceipt {
+        let result = evaluate(snapshot.image, orientations: [.right])
+        return EvaluationReceipt(frame: .init(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
+                                             detections: result.detections),
+                                 status: result.reason == nil ? .executed : .failed,
+                                 failureReason: result.reason, orientation: result.orientation)
     }
 
     public func detect(_ snapshot: ARFrameSnapshot) -> FrameDetections {
@@ -124,16 +178,12 @@ public final class Detector {
 
     private func detect(_ pixelBuffer: CVPixelBuffer,
                         request: VNCoreMLRequest,
-                        orientation: CGImagePropertyOrientation) -> [Detection] {
+                         orientation: CGImagePropertyOrientation) throws -> [Detection] {
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation)
         do {
             try handler.perform([request])
         } catch {
-            RuntimeFileLog.append("detector_failed", fields: [
-                "orientation": "\(orientation.rawValue)",
-                "error": error.localizedDescription
-            ])
-            return []
+            throw error
         }
         guard let results = request.results as? [VNRecognizedObjectObservation] else { return [] }
         return results.map {

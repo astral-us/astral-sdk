@@ -33,7 +33,7 @@ public enum RoverConfig {
     public static let scanTurnYawTolerance = 7.0 * Double.pi / 180.0
     /// Selected only for initial follow search and reacquisition, never alignment.
     static let followScanRotationProfile = FollowScanRotationProfile(
-        pulseWait: 0.200, settleWait: 0.300, wheelCap: 0.10, yawGain: 0.30,
+        pulseWait: 0.200, settleWait: 0.300, wheelCap: minimumRotateWheelSpeed, yawGain: 0.30,
         angularTolerance: scanTurnYawTolerance)
     /// Stand-off distance for a confidently locked visual target.
     public static let visualTargetStopDistance = 0.30

@@ -114,7 +114,9 @@ final class FollowDiagnosticEventTests: XCTestCase {
             "error": .object(error.payload), "images": .string("secret"),
             "audio": .string("secret"), "transcript": .string("secret"),
             "response_body": .string("secret"), "raw_detector_count": .number(2),
-            "candidate": .object(["projection_count": .number(3)]),
+            "candidate": .object(["projection_count": .number(3), "depth_samples": .array([.number(3)]),
+                                  "url": .string("https://private/path"), "path": .string("/private"),
+                                  "request_payload": .string("secret"), "biometric_identity": .string("secret")]),
             "missing_metric": .number(.nan)
         ]))
         let record = try decode(fields)
@@ -122,10 +124,14 @@ final class FollowDiagnosticEventTests: XCTestCase {
         XCTAssertEqual((encodedError["code"] as? String)?.count, 64)
         XCTAssertEqual((encodedError["message"] as? String)?.count, 256)
         XCTAssertFalse(try XCTUnwrap(fields["payload"]).contains("\n"))
-        for key in ["images", "audio", "transcript", "response_body", "raw_detector_count"] {
+        for key in ["images", "audio", "transcript", "response_body"] {
             XCTAssertNil(record[key])
         }
         XCTAssertNil((record["candidate"] as? [String: Any])?["projection_count"])
+        XCTAssertEqual(record["raw_detector_count"] as? Int, 2, "Task 5 permits the measured raw count")
+        for key in ["depth_samples", "url", "path", "request_payload", "biometric_identity"] {
+            XCTAssertNil((record["candidate"] as? [String: Any])?[key])
+        }
         XCTAssertTrue(record["missing_metric"] is NSNull)
         XCTAssertEqual(record["missing_metric_availability"] as? String, "nonfinite")
     }

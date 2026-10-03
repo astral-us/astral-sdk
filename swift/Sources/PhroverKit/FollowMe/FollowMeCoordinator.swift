@@ -2,12 +2,12 @@ import Foundation
 import RoverNav
 
 public enum FollowMeState: Equatable {
-    case idle, pausing, searching, aligning, signalingReady, waitingForMovement, following, holdingDistance, reacquiring, stopped
+    case idle, pausing, searching, aligning, waitingForClearance, signalingReady, waitingForMovement, following, holdingDistance, reacquiring, stopped
     case failed(String)
 
     public var isActive: Bool {
         switch self {
-        case .pausing, .searching, .aligning, .signalingReady, .waitingForMovement, .following, .holdingDistance, .reacquiring: true
+        case .pausing, .searching, .aligning, .waitingForClearance, .signalingReady, .waitingForMovement, .following, .holdingDistance, .reacquiring: true
         default: false
         }
     }
@@ -18,11 +18,19 @@ public enum FollowMeState: Equatable {
 public final class FollowMeCoordinator {
     public private(set) var state: FollowMeState = .idle {
         didSet {
-            if state != oldValue { log("follow_state") }
+            if state != oldValue {
+                log("follow_state")
+                if state == .waitingForClearance {
+                    emitReadiness("follow_ready.clearance_entered", reason: "too_close_before_send")
+                } else if oldValue == .waitingForClearance {
+                    emitReadiness("follow_ready.clearance_exited", reason: state == .signalingReady ? "first_send_authorized" : "state_transition")
+                }
+            }
         }
     }
     public private(set) var perceptionIssue: FollowPerceptionIssue?
     public var isActive: Bool { state.isActive }
+    public var readySignalClearance: Double { config.readySignalClearance }
 
     private let perception: any FollowMePerception
     private let motion: any FollowMeMotion
@@ -35,6 +43,8 @@ public final class FollowMeCoordinator {
     private var failureResolution: FollowMotionFailureResolution?
     private var activeRequest: FollowMotionRequestContext?
     private var summaryBudget = FollowSummaryBudget()
+    private var diagnosticStopState = "unknown"
+    private var readinessStopPending = false
     private var loggedIssue: FollowPerceptionIssue?
     private var loggedTrackingReason: FollowTrackingReason?
     private var generation: UInt64 = 0
@@ -55,6 +65,7 @@ public final class FollowMeCoordinator {
     private var alignmentCompletionTime: TimeInterval?
     private var departureBaseline: Double?
     private var readySignalAttempted = false
+    private var pendingAdmission: FollowReadyAdmissionToken?
     private var readySignalSucceeded = false
     private var readySignalConfirmedAfter: ARFrameID?
     private var readySignalCompletionTime: TimeInterval?
@@ -115,6 +126,7 @@ public final class FollowMeCoordinator {
         alignmentConfirmedAfter = nil
         departureBaseline = nil
         readySignalAttempted = false
+        pendingAdmission = nil
         readySignalSucceeded = false
         readySignalConfirmedAfter = nil
         readySignalCompletionTime = nil
@@ -130,6 +142,8 @@ public final class FollowMeCoordinator {
         latestFrame = nil
         latestBatch = nil
         summaryBudget = FollowSummaryBudget()
+        diagnosticStopState = "unknown"
+        readinessStopPending = false
         loggedIssue = nil
         loggedTrackingReason = nil
         perceptionIssue = .noFrames
@@ -196,6 +210,7 @@ public final class FollowMeCoordinator {
     /// or Talk. The caller must subsequently await stop() before handing off motion.
     public func inhibitMotion() {
         guard isActive, stopTask == nil else { return }
+        emitReadyCancellation(.stopped)
         generation &+= 1
         operation &+= 1
         state = .stopped
@@ -227,6 +242,7 @@ public final class FollowMeCoordinator {
                 state = .failed("Rover stop could not be confirmed.")
             }
             self.stopTask = nil
+            recordReadinessStop(confirmed)
             return confirmed
         }
         if !isActive {
@@ -244,8 +260,10 @@ public final class FollowMeCoordinator {
                 state = .stopped
             }
             stopTask = nil
+            recordReadinessStop(confirmed)
             return confirmed
         }
+        emitReadyCancellation(result)
         generation &+= 1 // Inhibit callbacks and new goals before the first suspension.
         operation &+= 1
         state = result
@@ -280,6 +298,7 @@ public final class FollowMeCoordinator {
             stopBlocked = true
             state = .failed("Rover stop could not be confirmed.")
         }
+        recordReadinessStop(confirmed)
         if resolvingFailure, let record = failureResolution {
             let acknowledgement = FollowMotionFailureDelivery(context: record.context, reason: record.primaryReason,
                 stopOutcome: confirmed ? .confirmed : .failed, source: .confirmation)
@@ -343,6 +362,7 @@ public final class FollowMeCoordinator {
     }
 
     private func consumeResult(_ result: FollowMotionResult) async -> Bool {
+        if case .notStarted = result.outcome { return false }
         if let failure = result.failure {
             await resolveFailure(failure)
             return true
@@ -442,7 +462,10 @@ public final class FollowMeCoordinator {
         defer {
             // An evaluated association owns the combined summary, including when
             // its periodic allowance is exhausted. No deferred frame history.
-            if !associationAvailable, generation == token, isActive, summaryBudget.takeHealthy(now: now) {
+            if !associationAvailable, generation == token, isActive,
+               summaryBudget.takePipeline(signature: (issue?.rawValue ?? "healthy") + "|"
+                    + (batch.trackingReason?.rawValue ?? "none") + "|"
+                    + (batch.perceptionDiagnostics?.transitionSignature ?? "unknown"), now: now, healthy: issue == nil) {
                 failureEmitter.emit(.init(event: "follow_frame", context: frameContext, payload: framePayload))
             }
         }
@@ -503,7 +526,7 @@ public final class FollowMeCoordinator {
                     await follow(selected, rover: batch.pose!.position, generation: token)
                 }
             } else if !scanning { scan(generation: token) }
-        case .aligning, .signalingReady, .waitingForMovement:
+        case .aligning, .waitingForClearance, .signalingReady, .waitingForMovement:
             guard let locked else { return }
             let evaluated = tracker.continueTrackEvaluated(batch.people, previous: locked, predictedPosition: locked.position, now: now)
             associationAvailable = true
@@ -547,6 +570,7 @@ public final class FollowMeCoordinator {
                             _ = await finish(.failed("Ready signal interrupted. Stop and start following again."))
                         }
                     } else {
+                        state = .aligning
                         align(generation: token)
                     }
                 }
@@ -680,26 +704,66 @@ public final class FollowMeCoordinator {
     }
 
     private func signalReady(generation token: UInt64) {
-        guard generation == token, canScan, !readySignalAttempted else { return }
+        guard generation == token, canScan, !readySignalAttempted, pendingAdmission == nil else { return }
         guard let pose = latestBatch?.pose, let locked,
               pose.position.distance(to: locked.position) >= config.minimumHoldDistance + 0.12 else {
-            Task {
-                guard generation == token else { return }
-                _ = await finish(.failed("Not enough person clearance for the 10 cm ready signal. Step back and start following again."))
-            }
+            state = .waitingForClearance
             return
         }
-        readySignalAttempted = true
-        state = .signalingReady
         operation &+= 1
         let id = operation
+        let admissionToken = FollowReadyAdmissionToken(generation: token, operation: id)
+        pendingAdmission = admissionToken
         let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id,
             purpose: .followReady, phase: String(describing: state))
         activeRequest = context
+        emitReadiness("follow_ready.admission_pending", reason: "eligible_preflight")
+        let admission = FollowReadyAdmission(validating: { [weak self] sample, readUptime in
+            guard let self, self.generation == token, self.operation == id,
+                  self.pendingAdmission == admissionToken, !Task.isCancelled,
+                  !self.readySignalAttempted, self.isActive, !self.stopBlocked,
+                  self.stopTask == nil, self.confirmationTask == nil else { return .deferred(.ownership) }
+            guard self.canScan else { return .deferred(.observation) }
+            guard self.pendingFrame == nil, let batch = self.latestBatch, let batchPose = batch.pose,
+                  let person = self.locked, person.frameID == batch.frameID,
+                  person.timestamp.isFinite, self.clock.now - person.timestamp >= 0,
+                  self.clock.now - person.timestamp <= self.config.maximumObservationAge else { return .deferred(.observation) }
+            let pose: Pose2D
+            if let sample, sample.source != "legacy_unknown" {
+                guard let readUptime,
+                      sample.rejection(at: readUptime, expectedGeneration: batch.frameID.generation) == nil,
+                      let controllerPose = sample.pose else { return .deferred(.observation) }
+                pose = controllerPose
+            } else {
+                // Legacy call/pose-only providers retain explicitly unknown provenance.
+                pose = batchPose
+            }
+            let heading = atan2(person.position.y - pose.position.y, person.position.x - pose.position.x)
+            guard abs(normalizeAngle(heading - pose.yaw)) <= self.config.alignmentAngularTolerance else { return .deferred(.heading) }
+            guard pose.position.distance(to: person.position) >= self.config.minimumHoldDistance + 0.12 else { return .deferred(.clearance) }
+            self.pendingAdmission = nil
+            self.readySignalAttempted = true
+            self.state = .signalingReady
+            self.emitReadiness("follow_ready.admission_authorized", reason: "first_send_authorized")
+            self.diagnosticStopState = "not_stopped"
+            return .accepted
+        })
         movementTask = Task { [weak self, motion] in
-            let contextualResult = await motion.performContextual(.ready, context: context)
+            let contextualResult = await motion.performContextual(.ready, context: context, admission: admission)
             guard let self else { return }
+            if self.pendingAdmission == admissionToken { self.pendingAdmission = nil }
             if await self.consumeResult(contextualResult) { return }
+            guard self.generation == token, self.operation == id else { return }
+            if case .notStarted(let deferred) = contextualResult.outcome {
+                self.diagnosticStopState = "confirmed"
+                self.state = .waitingForClearance
+                self.emitReadiness("follow_ready.admission_deferred", reason: deferred.rawValue, admission: admission)
+                if deferred == .heading { self.state = .aligning; self.align(generation: token) }
+                if deferred == .observation, self.pendingFrame == nil, !self.canScan {
+                    await self.perceptionUnavailable(self.perceptionIssue ?? .staleFrame, generation: token)
+                }
+                return
+            }
             let result = contextualResult.result
             guard self.generation == token, self.operation == id,
                   self.state == .signalingReady else { return }
@@ -712,6 +776,7 @@ public final class FollowMeCoordinator {
             self.readySignalSucceeded = true
             self.readySignalConfirmedAfter = self.latestFrame
             self.readySignalCompletionTime = self.clock.now
+            self.emitReadiness("follow_ready.completed", reason: "final_stop_confirmed_new_frame_required")
         }
     }
 
@@ -736,7 +801,9 @@ public final class FollowMeCoordinator {
             catch { return false }
         }
         confirmationTask = task
+        diagnosticStopState = "pending"
         let confirmed = await task.value
+        diagnosticStopState = confirmed ? "confirmed" : "failed"
         if confirmationID == id { confirmationTask = nil }
         if !confirmed {
             generation &+= 1
@@ -861,10 +928,56 @@ public final class FollowMeCoordinator {
 
     private func emitAssociation(_ evaluation: FollowAssociationEvaluation, batch: FollowFrameBatch, now: Double) {
         let previous = summaryBudget.previousOutcome
-        guard summaryBudget.takeAssociation(outcome: evaluation.outcome, now: now) else { return }
+        let trackerReasons = Set(evaluation.candidates.compactMap { candidate -> String? in
+            if case .string(let reason) = candidate["rejection_reason"] { return reason }; return nil
+        }).sorted().joined(separator: ",")
+        let reasons = (batch.perceptionDiagnostics?.transitionSignature ?? "unknown") + "|" + trackerReasons
+        guard summaryBudget.takeAssociation(outcome: evaluation.outcome, now: now, reasons: reasons) else { return }
+        var payload = evaluation.payload(batch: batch, now: now, previousOutcome: previous)
+        if state == .waitingForClearance {
+            let selected = evaluation.selectedIndex.map { batch.people[$0] }
+            payload.merge(FollowReadinessDiagnostics(batch: batch, person: selected, now: now, gate: readySignalClearance,
+                pending: pendingAdmission != nil, attempted: readySignalAttempted, succeeded: readySignalSucceeded,
+                stopState: stopBlocked ? "failed" : diagnosticStopState).payload) { existing, _ in existing }
+        }
         failureEmitter.emit(.init(event: "follow_person.association",
             context: .init(sessionGeneration: generation, phase: String(describing: state), outcome: evaluation.outcome),
-            payload: evaluation.payload(batch: batch, now: now, previousOutcome: previous)))
+            payload: payload))
+    }
+
+    private var readinessPayload: [String: FollowDiagnosticValue] {
+        FollowReadinessDiagnostics(batch: latestBatch, person: locked, now: clock.now, gate: readySignalClearance,
+            pending: pendingAdmission != nil, attempted: readySignalAttempted, succeeded: readySignalSucceeded,
+            stopState: stopBlocked ? "failed" : diagnosticStopState).payload
+    }
+
+    private func emitReadiness(_ event: String, reason: String, admission: FollowReadyAdmission? = nil) {
+        var payload = readinessPayload
+        payload.merge(FollowReadinessDiagnostics.controllerPayload(admission ?? FollowReadyAdmissionScope.current,
+            perceptionFrame: latestBatch?.frameID, sendAuthorized: readySignalAttempted, person: locked)) { _, new in new }
+        failureEmitter.emit(.init(event: event,
+            context: .init(sessionGeneration: generation, operationID: activeRequest?.requestToken,
+                purpose: "followReady", phase: String(describing: state), reason: reason), payload: payload))
+    }
+
+    private func emitReadyCancellation(_ result: FollowMeState) {
+        guard state == .waitingForClearance || state == .signalingReady || pendingAdmission != nil else { return }
+        let reason: String
+        if result == .stopped { reason = "local_stop" }
+        else if result == .failed("Person too close during ready signal. Step back and start following again.") {
+            reason = "person_approached_during_signal"
+        } else { reason = "readiness_interrupted" }
+        diagnosticStopState = "pending"
+        readinessStopPending = true
+        emitReadiness("follow_ready.cancelled", reason: reason)
+    }
+
+    private func recordReadinessStop(_ confirmed: Bool) {
+        diagnosticStopState = confirmed ? "confirmed" : "failed"
+        guard readinessStopPending else { return }
+        readinessStopPending = false
+        emitReadiness(confirmed ? "follow_ready.stop_confirmed" : "follow_ready.stop_failed",
+            reason: confirmed ? "stop_acknowledged" : "stop_not_confirmed")
     }
 
     private func updatePerceptionIssue(_ issue: FollowPerceptionIssue?) {
@@ -885,6 +998,10 @@ public final class FollowMeCoordinator {
         let batch = latestBatch
         var fields: [String: String] = [
             "state": String(describing: state),
+            "ready_signal_attempted": String(readySignalAttempted),
+            "ready_admission_pending": String(pendingAdmission != nil),
+            "ready_signal_succeeded": String(readySignalSucceeded),
+            "ready_signal_clearance_metres": String(readySignalClearance),
             "issue": perceptionIssue?.rawValue ?? "none",
             "frame_id": batch.map { "\($0.frameID.generation):\($0.frameID.sequence)" } ?? "none",
             "frame_timestamp": batch.map { String($0.timestamp) } ?? "unknown",

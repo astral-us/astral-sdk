@@ -31,7 +31,7 @@ final class NavigationRotationWatchdogTests: XCTestCase {
         XCTAssertGreaterThan(stops, 2)
     }
 
-    func testFollowScanUsesSlowWheelsWithoutGenericMinimumFloor() async {
+    func testFollowScanUsesFixedReliableWheelMagnitude() async {
         var yaw = 0.0
         var commands: [WheelCommand] = []
         let controller = NavigationController(
@@ -42,7 +42,7 @@ final class NavigationRotationWatchdogTests: XCTestCase {
         let result = await controller.rotateForFollowScan(by: .pi / 6)
         XCTAssertEqual(result, .arrived)
         XCTAssertFalse(commands.isEmpty)
-        XCTAssertTrue(commands.allSatisfy { abs($0.left) <= 0.10 && abs($0.right) <= 0.10 })
+        XCTAssertTrue(commands.allSatisfy { abs($0.left) == 0.25 && abs($0.right) == 0.25 })
         XCTAssertTrue(commands.allSatisfy { $0.left < 0 && $0.right > 0 })
     }
 

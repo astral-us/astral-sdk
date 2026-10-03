@@ -60,6 +60,9 @@ final class FollowScanDiagnosticTrace {
             "profile_pulse_wait_s": profile.map { .number($0.pulseWait) } ?? .null,
             "profile_settle_s": profile.map { .number($0.settleWait) } ?? .null,
             "profile_wheel_cap_mps": profile.map { .number($0.wheelCap) } ?? .null,
+            "profile_wheel_floor_mps": profile.map { .number($0.wheelFloor) } ?? .null,
+            "profile_command_law": profile.map { .string($0.commandLaw) } ?? .null,
+            "profile_yaw_gain_active": profile.map { .bool($0.yawGainActive) } ?? .null,
             "profile_yaw_gain": profile.map { .number($0.yawGain) } ?? .null,
             "profile_angular_tolerance_rad": profile.map { .number($0.angularTolerance) } ?? .null,
         ]
@@ -132,11 +135,12 @@ final class FollowScanDiagnosticTrace {
         }
     }
 
-    func unavailablePost(evidence: FollowMotionOperationEvidence, latch: Bool) {
-        finalSample = nil
+    func unavailablePost(sample: RotationPoseDiagnosticSample? = nil,
+                         evidence: FollowMotionOperationEvidence, latch: Bool) {
+        finalSample = sample
+        post = sample
         watchdog = nil // No current error-distance sample; retain only the known checkpoint pairing.
         if pendingSettle {
-            post = nil
             endWait("settle", evidence: evidence, latch: latch, interrupted: false)
             emit("pulse_complete", evidence: evidence, latch: latch, outcome: "completed")
             insidePulse = false
@@ -197,6 +201,13 @@ final class FollowScanDiagnosticTrace {
         let end = name == "settle" ? (settleEnd ?? emitter.hostTime()) : emitter.hostTime()
         retainTiming(name, end: end)
         var fields = timingFields(end: end)
+        // Post-settle feedback may suspend and enter ack_read before evaluation.
+        // Preserve the wait's own boundaries rather than that newer stage start.
+        if case .number(let start) = timings[name + "_start_monotonic_s"] {
+            timings[name + "_host_duration_s"] = .number(end - start)
+            fields["start_monotonic_s"] = .number(start)
+            fields["host_duration_s"] = .number(end - start)
+        }
         fields["requested_wait_s"] = waitDuration.map { .number($0) } ?? .null
         emit(name + "_end", evidence: evidence, latch: latch,
             outcome: interrupted ? "interrupted" : "completed", fields: fields)

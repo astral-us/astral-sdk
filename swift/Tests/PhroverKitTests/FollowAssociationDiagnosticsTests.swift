@@ -123,7 +123,8 @@ final class FollowAssociationDiagnosticsTests: XCTestCase {
         XCTAssertTrue(event["matched_candidate_count"] is NSNull)
         XCTAssertEqual(event["matched_candidate_count_availability"] as? String, "not_applicable_initial_selection")
         XCTAssertTrue(event["selected_candidate"] is NSNull)
-        XCTAssertNil(event["raw_detector_count"])
+        XCTAssertTrue(event["raw_detector_count"] is NSNull)
+        XCTAssertEqual(event["raw_detector_count_availability"] as? String, "not_evaluated_or_unknown")
         XCTAssertNil(event["projection_count"])
         let observed = person(7, position: Vec2(3.123456789, 4), pose: Pose2D(position: Vec2(3.123456789, 0), yaw: .pi))
         let evaluation = FollowTargetTracker().selectInitialEvaluated([observed], now: 10).evaluation

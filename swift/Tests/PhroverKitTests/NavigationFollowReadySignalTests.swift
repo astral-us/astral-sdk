@@ -4,6 +4,121 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowReadySignalTests: XCTestCase {
+    func testPreSendPoseCorrectionCannotCompleteReadySignalOrConsumeAdmission() async {
+        for correction in [0.08, 0.10, 0.12] {
+            let gate = FollowDiagnosticSuspension()
+            var position = Vec2.zero
+            var sequence: UInt64 = 1
+            var commands = 0
+            var admissions = 0
+            let controller = NavigationController(currentPose: { Pose2D(position: position, yaw: 0) },
+                forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
+                    if !gate.entered { await gate.suspend() }; return Date()
+                }, sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in },
+                poseSample: { NavigationPoseSample(pose: Pose2D(position: position, yaw: 0),
+                    frameID: .init(generation: 1, sequence: sequence), sourceTimestamp: 100,
+                    trackingQuality: .normal) }, sourceNow: { 100 })
+            let admission = FollowReadyAdmission { admissions += 1; return .accepted }
+            let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 1,
+                purpose: .followReady, phase: "aligning")
+            let task = Task { await NavigationFollowMeMotion(navigation: controller).performContextual(.ready,
+                context: context, admission: admission) }
+            await gate.waitUntilEntered()
+            position = Vec2(correction, 0)
+            sequence = 2
+            gate.release()
+            let result = await task.value
+            XCTAssertEqual(result.outcome, .navigation(.failed(.stalled)), "correction=\(correction)")
+            XCTAssertNil(result.deferred)
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            XCTAssertEqual(commands, 0)
+            XCTAssertEqual(admissions, 0)
+        }
+    }
+    func testExpiredEnrichedPoseFailsBeforeAdmissionInsteadOfDeferring() async {
+        await assertSafetyBeforeAdmission(sourceTimestamp: 99.499, expected: .trackingLost)
+    }
+    func testUnsafeShortPathFailsBeforeAdmissionInsteadOfDeferring() async {
+        await assertSafetyBeforeAdmission(safePlan: false, expected: .noPath)
+    }
+    func testNonfiniteObstacleClearanceFailsBeforeAdmissionInsteadOfDeferring() async {
+        await assertSafetyBeforeAdmission(clearance: .nan, expected: .obstacle)
+    }
+    func testFutureAcknowledgementFailsBeforeAdmissionInsteadOfDeferring() async {
+        await assertSafetyBeforeAdmission(ack: Date(timeIntervalSince1970: 101), expected: .commsLost)
+    }
+    func testStaleAcknowledgementFailsBeforeAdmissionInsteadOfDeferring() async {
+        await assertSafetyBeforeAdmission(ack: Date(timeIntervalSince1970: 90), expected: .commsLost)
+    }
+
+    private func assertSafetyBeforeAdmission(clearance: Double = 2,
+        ack: Date? = Date(timeIntervalSince1970: 100), safePlan: Bool = true,
+        sourceTimestamp: Double = 100, expected: NavigationFailure) async {
+        var admissions = 0
+        var commands = 0
+        let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { clearance }, plan: { _, goal in safePlan ? [goal] : [Vec2(0.1, 0.03)] },
+            lastAckAt: { ack }, sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in },
+            now: { Date(timeIntervalSince1970: 100) }, poseSample: {
+                NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 1),
+                    sourceTimestamp: sourceTimestamp, trackingQuality: .normal)
+            }, sourceNow: { 100 })
+        let admission = FollowReadyAdmission { admissions += 1; return .deferred(.clearance) }
+        let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning")
+        let result = await NavigationFollowMeMotion(navigation: controller).performContextual(.ready,
+            context: context, admission: admission)
+        XCTAssertEqual(result.outcome, .navigation(.failed(expected)))
+        XCTAssertNil(result.deferred)
+        XCTAssertEqual(admissions, 0)
+        XCTAssertEqual(commands, 0)
+    }
+    func testContextualDeferralIsNotArrivalOrFailureAndConfirmsStopAfterFeedback() async {
+        let gate = FollowDiagnosticSuspension()
+        var admissions = 0
+        var commands = 0
+        var stops = 0
+        let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
+                await gate.suspend(); return Date()
+            }, sendCommand: { _ in commands += 1 }, stopRover: { stops += 1 }, sleep: { _ in })
+        let admission = FollowReadyAdmission { admissions += 1; return .deferred(.clearance) }
+        let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 2, purpose: .followReady, phase: "aligning")
+        let task = Task { await NavigationFollowMeMotion(navigation: controller).performContextual(.ready,
+            context: context, admission: admission) }
+        await gate.waitUntilEntered()
+        XCTAssertEqual(admissions, 0, "Controller entry/preflight is too early to reserve an attempt")
+        gate.release()
+        let result = await task.value
+        XCTAssertEqual(admissions, 1)
+        XCTAssertEqual(result.deferred, .clearance)
+        XCTAssertEqual(result.outcome, .notStarted(.clearance), "Contextual consumers must distinguish deferral from navigation cancellation")
+        XCTAssertNotEqual(result.result, .arrived)
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(commands, 0)
+        XCTAssertEqual(stops, 2)
+    }
+    func testReadyFeedbackSuspensionRejectsExpiredEnrichedPose() async {
+        let gate = FollowDiagnosticSuspension()
+        var timestamp = 100.0
+        var position = Vec2.zero
+        var commands = 0
+        let controller = NavigationController(currentPose: { Pose2D(position: position, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
+                if !gate.entered { await gate.suspend() }; return Date()
+            }, sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in position = Vec2(0.1, 0) },
+            poseSample: { NavigationPoseSample(pose: Pose2D(position: position, yaw: 0),
+                frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: timestamp,
+                trackingQuality: .normal) }, sourceNow: { 100 })
+        let signal = Task { await NavigationFollowMeMotion(navigation: controller).signalReady() }
+        await gate.waitUntilEntered()
+        timestamp = 99.499
+        gate.release()
+        let result = await signal.value
+        XCTAssertEqual(result, .failed(.trackingLost))
+        XCTAssertEqual(commands, 0)
+    }
+
     func testStopDuringAckReadPreventsReadyWheelCommand() async throws {
         var ackRead: CheckedContinuation<Date?, Never>?
         var commands = 0
@@ -11,7 +126,10 @@ final class NavigationFollowReadySignalTests: XCTestCase {
             currentPose: { Pose2D(position: .zero, yaw: 0) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] },
             lastAckAt: { await withCheckedContinuation { ackRead = $0 } },
-            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in })
+            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in },
+            poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
+                frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: 100,
+                trackingQuality: .normal) }, sourceNow: { 100 })
         let signal = Task { await controller.navigateForFollowReadySignal() }
         while ackRead == nil { await Task.yield() }
         let stopping = Task { try await controller.stopAndConfirm() }
@@ -25,11 +143,15 @@ final class NavigationFollowReadySignalTests: XCTestCase {
     }
 
     func testAsyncAckGetterUsesPostAwaitClockPoseAndClearance() async {
-        for scenario in 0..<5 {
+        for scenario in 0..<8 {
             var time = Date(timeIntervalSince1970: 100)
             var position = Vec2.zero
             var clearance = 2.0
             var commands = 0
+            var sourceTime = 100.0
+            var sourceTimestamp = 100.0
+            var sourceGeneration: UInt64 = 8
+            var sourceTracking = ARTrackingQuality.normal
             let controller = NavigationController(
                 currentPose: { Pose2D(position: position, yaw: 0) },
                 forwardClearance: { clearance }, plan: { _, goal in [goal] },
@@ -37,6 +159,11 @@ final class NavigationFollowReadySignalTests: XCTestCase {
                     let previousAck = time
                     await Task.yield()
                     time = time.addingTimeInterval(0.2)
+                    sourceTime += 0.2
+                    sourceTimestamp = sourceTime
+                    if scenario == 5 { sourceTimestamp = sourceTime - 0.501 }
+                    if scenario == 6 { sourceGeneration = 9 }
+                    if scenario == 7 { sourceTracking = .limited }
                     if scenario == 3 { clearance = 0.1 }
                     if scenario == 4 { position = Vec2(0.14, 0) }
                     if scenario == 1 { return time.addingTimeInterval(1) }
@@ -44,9 +171,13 @@ final class NavigationFollowReadySignalTests: XCTestCase {
                     if scenario >= 3 { return previousAck }
                     return time
                 }, sendCommand: { _ in commands += 1 }, stopRover: {},
-                sleep: { _ in position = Vec2(0.10, 0) }, now: { time })
+                sleep: { _ in position = Vec2(0.10, 0) }, now: { time },
+                poseSample: { NavigationPoseSample(pose: Pose2D(position: position, yaw: 0),
+                    frameID: ARFrameID(generation: sourceGeneration, sequence: 1), sourceTimestamp: sourceTimestamp,
+                    trackingQuality: sourceTracking) }, sourceNow: { sourceTime })
             let result = await controller.navigateForFollowReadySignal()
-            let expected: [NavigationResult] = [.arrived, .failed(.commsLost), .failed(.commsLost), .failed(.obstacle), .failed(.stalled)]
+            let expected: [NavigationResult] = [.arrived, .failed(.commsLost), .failed(.commsLost), .failed(.obstacle),
+                .failed(.stalled), .failed(.trackingLost), .failed(.trackingLost), .failed(.trackingLost)]
             XCTAssertEqual(result, expected[scenario], "scenario=\(scenario)")
             XCTAssertEqual(commands, scenario == 0 ? 1 : 0, "Never issue a command based on pre-await safety samples")
         }

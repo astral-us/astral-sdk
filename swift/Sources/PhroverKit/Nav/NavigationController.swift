@@ -28,6 +28,8 @@ public final class NavigationController {
     public private(set) var safetyState: NavigationSafetyState = .idle
 
     private let currentPose: () -> Pose2D?
+    private let currentPoseSample: (() -> NavigationPoseSample?)?
+    private let sourceNow: () -> TimeInterval
     private let currentForwardClearance: () -> Double
     private let makePlan: (Vec2, Vec2) -> [Vec2]?
     private let readySignalCostmap: ((Vec2) -> Costmap)?
@@ -173,6 +175,8 @@ public final class NavigationController {
     public init(ar: ARSessionManager, control: RoverControl) {
         let planner = AStarPlanner()
         currentPose = { ar.pose }
+        currentPoseSample = { ar.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }
+        sourceNow = { ProcessInfo.processInfo.systemUptime }
         currentForwardClearance = { ar.forwardClearance }
         makePlan = { start, goal in
             let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
@@ -200,8 +204,12 @@ public final class NavigationController {
          now: @escaping () -> Date = Date.init,
          sendCommandReceipt: ((WheelCommand) async -> RoverCommandDiagnosticResult)? = nil,
          stopRoverReceipt: (() async -> RoverCommandDiagnosticResult)? = nil,
-         diagnosticEmitter: FollowDiagnosticEmitter? = nil) {
+         diagnosticEmitter: FollowDiagnosticEmitter? = nil,
+         poseSample: (() -> NavigationPoseSample?)? = nil,
+         sourceNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.currentPose = currentPose
+        self.currentPoseSample = poseSample
+        self.sourceNow = sourceNow
         self.currentForwardClearance = forwardClearance
         self.makePlan = plan
         self.readySignalCostmap = readySignalCostmap
@@ -323,8 +331,10 @@ public final class NavigationController {
         FollowMotionTaskScope.evidence?.ownedGeneration = reservation
         do { try await confirmStop() } catch { return .failed(.commandFailed) }
         guard operationGeneration == reservation, !Task.isCancelled else { return .cancelled }
-        guard let start = currentPose(), start.position.x.isFinite,
-              start.position.y.isFinite, start.yaw.isFinite else { return .failed(.noPose) }
+        let startSample = readFollowPose()
+        guard startSample.rejection(at: sourceNow()) == nil, let start = startSample.pose else {
+            return .failed(currentPoseSample == nil ? .noPose : .trackingLost)
+        }
         let direction = Vec2(cos(start.yaw), sin(start.yaw))
         let goal = start.position + direction * 0.10
         guard let planned = makePlan(start.position, goal), !planned.isEmpty else { return .failed(.noPath) }
@@ -344,7 +354,8 @@ public final class NavigationController {
         }
         state = .driving
         publishSafetyState(.moving)
-        let task = Task { await driveReadySignal(from: start, direction: direction) }
+        let task = Task { await driveReadySignal(from: start, direction: direction,
+            sourceGeneration: startSample.frameID?.generation, ownedGeneration: reservation) }
         loop = task
         let result = await task.value
         guard operationGeneration == reservation else { return .cancelled }
@@ -354,18 +365,23 @@ public final class NavigationController {
         return result
     }
 
-    private func driveReadySignal(from start: Pose2D, direction: Vec2) async -> NavigationResult {
+    private func driveReadySignal(from start: Pose2D, direction: Vec2,
+                                  sourceGeneration: UInt64?, ownedGeneration: UInt) async -> NavigationResult {
         let started = now()
         var progress = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.01)
+        var sent = false
         while !Task.isCancelled {
             let ack = await currentLastAck()
-            guard !Task.isCancelled else { return .cancelled }
+            guard !Task.isCancelled, operationGeneration == ownedGeneration,
+                  FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed else { return .cancelled }
             // Actor acknowledgement reads can suspend. Sample clock and safety only
             // after that read so neither fresh acknowledgements nor changed hazards
             // are evaluated against an older snapshot.
             let time = now()
-            guard let pose = currentPose(), pose.position.x.isFinite,
-                  pose.position.y.isFinite, pose.yaw.isFinite else { return .failed(.trackingLost) }
+            let sourceTime = sourceNow()
+            let sample = readFollowPose()
+            guard sample.rejection(at: sourceTime, expectedGeneration: sourceGeneration) == nil,
+                  let pose = sample.pose else { return .failed(.trackingLost) }
             let delta = pose.position - start.position
             let along = delta.x * direction.x + delta.y * direction.y
             let lateral = abs(delta.x * direction.y - delta.y * direction.x)
@@ -385,10 +401,14 @@ public final class NavigationController {
             case .stopTipping: return .failed(.tipping)
             }
             guard !Task.isCancelled else { return .cancelled }
-            if along >= 0.08 { return .arrived }
+            // A pre-send pose correction is not measured progress from this signal.
+            if along >= 0.08 { return sent ? .arrived : .failed(.stalled) }
             if time.timeIntervalSince(started) >= 5 || progress.observe(
                 distanceToGoal: 0.10 - along, now: time, commanded: true) { return .failed(.stalled) }
             let speed = min(0.05, (0.10 - along) * 0.8)
+            if !sent, let admission = FollowReadyAdmissionScope.current,
+               !admission.admit(boundary: .controllerFirstSend, sample: sample, readUptime: sourceTime) { return .cancelled }
+            sent = true
             do { try await sendCommand(WheelCommand(left: speed, right: speed)) }
             catch { return Task.isCancelled ? .cancelled : .failed(.commandFailed) }
             await sleep(.seconds(RoverConfig.commandInterval))
@@ -503,14 +523,21 @@ public final class NavigationController {
               FollowMotionTaskScope.evidence?.fenced != true else { return .cancelled }
         operationGeneration &+= 1
         FollowMotionTaskScope.evidence?.ownedGeneration = operationGeneration
-        guard let startYaw = currentPose()?.yaw else {
-            let result = NavigationResult.failed(.noPose)
+        let startSourceTime = sourceNow()
+        let startSample = readFollowPose()
+        guard startSample.rejection(at: startSourceTime) == nil, let startYaw = startSample.pose?.yaw else {
+            if currentPoseSample != nil, let evidence = FollowMotionTaskScope.evidence {
+                evidence.scanTrace?.unavailablePost(sample: .init(sample: startSample, uptime: startSourceTime,
+                    expectedGeneration: nil), evidence: evidence, latch: stopUnconfirmed)
+            }
+            let result = NavigationResult.failed(currentPoseSample == nil ? .noPose : .trackingLost)
             finish(result)
             return result
         }
         state = .driving
         publishSafetyState(.moving)
-        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .followScan, followProfile: profile) }
+        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .followScan,
+            followProfile: profile, sourceGeneration: startSample.frameID?.generation) }
         loop = task
         let result = await task.value
         guard operationGeneration == reservation + 1 else { return .cancelled }
@@ -696,6 +723,11 @@ public final class NavigationController {
 
     // MARK: - Loop
 
+    private func readFollowPose() -> NavigationPoseSample {
+        if let currentPoseSample { return currentPoseSample() ?? .unavailable }
+        return .legacy(currentPose())
+    }
+
     private func drive(to goal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?,
                        isFollowGoal: Bool) async -> NavigationResult {
         var hasSentCommand = false
@@ -879,17 +911,33 @@ public final class NavigationController {
     }
 
     private func performRotate(to targetYaw: Double, mode: RotationMode,
-                               followProfile: FollowScanRotationProfile? = nil) async -> NavigationResult {
+                               followProfile: FollowScanRotationProfile? = nil,
+                               sourceGeneration: UInt64? = nil) async -> NavigationResult {
         FollowMotionTaskScope.evidence?.targetYaw = targetYaw
         let pulsed = mode == .scan || mode == .followScan
         let profile = mode == .followScan ? followProfile : nil
         let angularTolerance = profile?.angularTolerance ?? (pulsed ? RoverConfig.scanTurnYawTolerance : 0.05)
+        let ownedGeneration = operationGeneration
         var hasSentCommand = false
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
         while !Task.isCancelled {
-            guard let pose = currentPose() else {
+            let evidence = FollowMotionTaskScope.evidence
+            let trace = evidence?.scanTrace
+            var lastAck: Date?
+            if mode == .followScan {
+                trace?.enter("ack_read")
+                lastAck = await currentLastAck()
+                guard !Task.isCancelled, evidence?.fenced != true, !stopUnconfirmed,
+                      operationGeneration == ownedGeneration else { break }
+            }
+            let sourceTime = mode == .followScan ? sourceNow() : 0
+            let controlSample = mode == .followScan ? readFollowPose() : .legacy(currentPose())
+            guard mode != .followScan || controlSample.rejection(at: sourceTime, expectedGeneration: sourceGeneration) == nil,
+                  let pose = controlSample.pose else {
                 if let evidence = FollowMotionTaskScope.evidence {
-                    evidence.scanTrace?.unavailablePost(evidence: evidence, latch: stopUnconfirmed)
+                    let rejected = currentPoseSample == nil ? nil : RotationPoseDiagnosticSample(
+                        sample: controlSample, uptime: sourceTime, expectedGeneration: sourceGeneration)
+                    evidence.scanTrace?.unavailablePost(sample: rejected, evidence: evidence, latch: stopUnconfirmed)
                 }
                 try? await rotationStop(origin: "cleanup")
                 let result = NavigationResult.failed(.trackingLost)
@@ -897,9 +945,9 @@ public final class NavigationController {
                 return result
             }
             let error = normalizeAngle(targetYaw - pose.yaw)
-            let evidence = FollowMotionTaskScope.evidence
-            let trace = evidence?.scanTrace
-            let sample = trace?.sample(yaw: pose.yaw)
+            let sample = currentPoseSample != nil && mode == .followScan
+                ? RotationPoseDiagnosticSample(sample: controlSample, uptime: sourceTime, expectedGeneration: sourceGeneration)
+                : trace?.sample(yaw: pose.yaw)
             if let evidence, let sample {
                 trace?.evaluation(sample, snapshot: progressWatchdog.diagnosticSnapshot(distanceToGoal: abs(error), now: now()),
                     evidence: evidence, latch: stopUnconfirmed)
@@ -912,8 +960,10 @@ public final class NavigationController {
                 return result
             }
 
-            trace?.enter("ack_read")
-            let lastAck = await currentLastAck()
+            if mode != .followScan {
+                trace?.enter("ack_read")
+                lastAck = await currentLastAck()
+            }
             if evidence != nil && (Task.isCancelled || evidence?.fenced == true || stopUnconfirmed) { break }
             let now = now()
             let decision = guardLayer.evaluate(forwardClearance: currentForwardClearance(),
@@ -953,8 +1003,8 @@ public final class NavigationController {
 
             let cmd: WheelCommand
             if let profile {
-                // Follow-only slow search: deliberately bypass the generic .25 m/s floor.
-                let speed = min(profile.wheelCap, abs(error) * profile.yawGain)
+                // Follow-only fixed breakaway pulse, including just outside tolerance.
+                let speed = profile.wheelCap
                 let signed = error > 0 ? speed : -speed
                 cmd = WheelCommand(left: -signed, right: signed)
             } else {

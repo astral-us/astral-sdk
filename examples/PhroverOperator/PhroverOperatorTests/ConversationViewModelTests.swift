@@ -5,6 +5,36 @@ import RoverNav
 
 @MainActor
 final class ConversationViewModelTests: XCTestCase {
+    func testClearanceLabelUsesConfiguredGateRoundedUpIncludingExactTenth() {
+        var gate = 1.41
+        let model = ConversationViewModel(followState: { .waitingForClearance }, readySignalClearance: { gate })
+        XCTAssertEqual(model.status, "Step back to at least 1.5 m — waiting to signal ready.")
+        gate = 1.4
+        XCTAssertEqual(model.status, "Step back to at least 1.4 m — waiting to signal ready.")
+        model.configure(submit: { _ in .accepted }, stop: { .accepted }, followState: { .waitingForClearance },
+                        readySignalClearance: { 2.01 })
+        XCTAssertEqual(model.status, "Step back to at least 2.1 m — waiting to signal ready.")
+    }
+    func testOldClearanceStopCompletionCannotClearNewerSubmissionGuidance() async {
+        var acknowledgement: CheckedContinuation<OperatorSubmission, Never>?
+        let model = ConversationViewModel(submit: { _ in .rejected("New session guidance") },
+            stop: { await withCheckedContinuation { acknowledgement = $0 } }, followState: { .waitingForClearance })
+        let stopping = Task { await model.stopFollowing() }
+        while acknowledgement == nil { await Task.yield() }
+        await model.submitFinalSpeech("follow me")
+        acknowledgement?.resume(returning: .accepted)
+        await stopping.value
+        XCTAssertEqual(model.errorMessage, "New session guidance")
+    }
+    func testClearanceWaitExplainsStepBackAndLocalStopNeverThinks() async {
+        var state = FollowMeState.waitingForClearance
+        let model = ConversationViewModel(stop: { state = .stopped; return .accepted }, followState: { state })
+        XCTAssertEqual(model.status, "Step back to at least 1.4 m — waiting to signal ready.")
+        XCTAssertTrue(model.showsStopFollowing)
+        await model.stopFollowing()
+        XCTAssertEqual(model.missionPhase, .idle)
+        XCTAssertEqual(model.status, "Stopped")
+    }
     func testRealAgentOldBrainCallbackCannotResetSecondMissionUIAfterLocalStop() async {
         let firstBrain = HeldConversationBrain()
         let secondBrain = HeldConversationBrain()
@@ -126,10 +156,10 @@ final class ConversationViewModelTests: XCTestCase {
     }
 
     func testStopButtonStaysVisibleWhenMotorStopWasNotConfirmed() {
-        let model = ConversationViewModel(followState: {
-            .failed("Rover stop could not be confirmed.")
-        })
-        XCTAssertTrue(model.showsStopFollowing)
+        for message in ["Rover stop could not be confirmed.", "Motor stop could not be confirmed. Motion is blocked."] {
+            let model = ConversationViewModel(followState: { .failed(message) })
+            XCTAssertTrue(model.showsStopFollowing)
+        }
     }
 }
 

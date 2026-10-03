@@ -41,11 +41,12 @@ public struct FollowFrameBatch: @unchecked Sendable {
     public let trackingReason: FollowTrackingReason?
     /// Detector wall-clock duration in seconds; nil means not measured.
     public let inferenceDuration: TimeInterval?
+    public let perceptionDiagnostics: FollowPerceptionDiagnostics?
 
     public init(frameID: ARFrameID, timestamp: TimeInterval, pose: Pose2D?,
                 depthAvailable: Bool, people: [FollowPersonObservation],
                 trackingQuality: ARTrackingQuality? = nil, trackingReason: FollowTrackingReason? = nil,
-                inferenceDuration: TimeInterval? = nil) {
+                inferenceDuration: TimeInterval? = nil, perceptionDiagnostics: FollowPerceptionDiagnostics? = nil) {
         self.frameID = frameID
         self.timestamp = timestamp
         self.pose = pose
@@ -54,6 +55,7 @@ public struct FollowFrameBatch: @unchecked Sendable {
         self.trackingQuality = trackingQuality
         self.trackingReason = trackingReason
         self.inferenceDuration = inferenceDuration
+        self.perceptionDiagnostics = perceptionDiagnostics
     }
 }
 
@@ -89,9 +91,12 @@ protocol FollowMeContextualMotion: FollowMeMotion {
 }
 
 extension FollowMeMotion {
-    func performContextual(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
-        if let contextual = self as? any FollowMeContextualMotion { return await contextual.perform(request, context: context) }
-        return await performLegacy(request, context: context)
+    func performContextual(_ request: FollowMotionRequest, context: FollowMotionRequestContext,
+                           admission: FollowReadyAdmission? = nil) async -> FollowMotionResult {
+        await FollowReadyAdmissionScope.$current.withValue(admission ?? FollowReadyAdmissionScope.current) {
+            if let contextual = self as? any FollowMeContextualMotion { return await contextual.perform(request, context: context) }
+            return await performLegacy(request, context: context)
+        }
     }
 
     fileprivate func performLegacy(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
@@ -99,7 +104,12 @@ extension FollowMeMotion {
         switch request {
         case .scan(let angle): result = await rotateForScan(by: angle)
         case .alignment(let angle): result = await alignTowardPerson(by: angle)
-        case .ready: result = await signalReady()
+        case .ready:
+            if let admission = FollowReadyAdmissionScope.current, !admission.admit() {
+                return .init(result: .cancelled, context: .init(request: context, controllerOperationID: nil,
+                    purpose: nil, profile: nil), failure: nil, deferred: admission.deferred)
+            }
+            result = await signalReady()
         case .following(let goal, let clearance): result = await navigate(to: goal, stoppingAtForwardClearance: clearance)
         }
         let operation = FollowMotionOperationContext(request: context, controllerOperationID: nil, purpose: nil,

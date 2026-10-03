@@ -75,6 +75,12 @@ struct FollowMotionFailureDelivery: Sendable {
 }
 
 struct FollowMotionResult: Sendable {
+    var outcome: FollowMotionOutcome {
+        if let deferred, failure == nil, stopOutcome != .failed { return .notStarted(deferred) }
+        return .navigation(result)
+    }
+    /// Explicit not-started outcome; the legacy NavigationResult remains compatible.
+    let deferred: FollowReadyDeferral?
     let result: NavigationResult
     let context: FollowMotionOperationContext
     let failure: FollowMotionFailureDelivery?
@@ -83,7 +89,8 @@ struct FollowMotionResult: Sendable {
     let stopReceipt: RoverCommandDiagnosticReceipt?
     init(result: NavigationResult, context: FollowMotionOperationContext, failure: FollowMotionFailureDelivery?,
          stopOutcome: FollowMotionStopOutcome = .unknown, commandReceipt: RoverCommandDiagnosticReceipt? = nil,
-         stopReceipt: RoverCommandDiagnosticReceipt? = nil) {
+         stopReceipt: RoverCommandDiagnosticReceipt? = nil, deferred: FollowReadyDeferral? = nil) {
+        self.deferred = deferred
         self.result = result
         self.context = context
         self.failure = failure
@@ -131,7 +138,8 @@ final class FollowMotionOperationEvidence {
     }
     func result(_ result: NavigationResult) -> FollowMotionResult {
         .init(result: result, context: context, failure: failure(source: .result),
-            stopOutcome: stopOutcome, commandReceipt: commandReceipt, stopReceipt: stopReceipt)
+            stopOutcome: stopOutcome, commandReceipt: commandReceipt, stopReceipt: stopReceipt,
+            deferred: primaryFailure == nil && stopOutcome != .failed ? FollowReadyAdmissionScope.current?.deferred : nil)
     }
 }
 
@@ -153,6 +161,10 @@ struct FollowScanRotationProfile: Sendable, Equatable {
     let wheelCap: Double
     let yawGain: Double
     let angularTolerance: Double
+    var wheelFloor: Double { wheelCap }
+    var commandLaw: String { "fixed_signed_magnitude" }
+    // Historical tuning metadata; fixed pulses do not use proportional gain.
+    var yawGainActive: Bool { false }
 }
 
 /// Immutable correlation captured at the owning serialized boundary.
@@ -193,15 +205,36 @@ struct RotationPoseDiagnosticSample: Sendable {
     let frameID: String?
     let observationAge: Double?
     let pairing: RotationPosePairing
+    let sourceTimestamp: Double?
+    let sourceGeneration: UInt64?
+    let sourceAge: Double?
+    let sourceIdentity: String?
+    let sourceAvailability: String?
 
     init(yaw: Double?, readMonotonic: Double, trackingState: String? = nil,
-         frameID: String? = nil, observationAge: Double? = nil, pairing: RotationPosePairing = .unknown) {
+          frameID: String? = nil, observationAge: Double? = nil, pairing: RotationPosePairing = .unknown,
+          sourceTimestamp: Double? = nil, sourceGeneration: UInt64? = nil, sourceAge: Double? = nil,
+          sourceIdentity: String? = nil, sourceAvailability: String? = nil) {
         self.yaw = yaw
         self.readMonotonic = readMonotonic
         self.trackingState = trackingState
         self.frameID = frameID
         self.observationAge = observationAge
         self.pairing = pairing
+        self.sourceTimestamp = sourceTimestamp
+        self.sourceGeneration = sourceGeneration
+        self.sourceAge = sourceAge
+        self.sourceIdentity = sourceIdentity
+        self.sourceAvailability = sourceAvailability
+    }
+
+    init(sample: NavigationPoseSample, uptime: Double, expectedGeneration: UInt64?) {
+        self.init(yaw: sample.pose?.yaw, readMonotonic: uptime,
+            trackingState: sample.trackingQuality.map { String(describing: $0) },
+            frameID: sample.frameID.map { "\($0.generation):\($0.sequence)" },
+            sourceTimestamp: sample.sourceTimestamp, sourceGeneration: sample.frameID?.generation,
+            sourceAge: sample.sourceTimestamp.map { uptime - $0 }, sourceIdentity: sample.source,
+            sourceAvailability: sample.rejection(at: uptime, expectedGeneration: expectedGeneration) ?? "available")
     }
 
     var finiteYaw: Double? { yaw.flatMap { $0.isFinite ? $0 : nil } }
@@ -227,9 +260,17 @@ struct RotationDiagnosticMeasurement: Sendable {
     }
     var payload: [String: FollowDiagnosticValue] {
         let metadata = post ?? pre
+        let pairing: RotationPosePairing
+        if let before = pre?.frameID, let after = post?.frameID {
+            pairing = before == after ? .sameFrame : .independentlySampled
+        } else { pairing = metadata?.pairing ?? .unknown }
         var result: [String: FollowDiagnosticValue] = [
-            "pose_source_timestamp": .null, "pose_source_age_status": .string("unknown"),
-            "pose_pairing": .string(metadata?.pairing.rawValue ?? "unknown"),
+            "pose_source_timestamp": metadata?.sourceTimestamp.map { .number($0) } ?? .null,
+            "pose_source_age_status": .string(metadata?.sourceAge.map { $0.isFinite ? "available" : "nonfinite" } ?? "unknown"),
+            "pose_pairing": .string(pairing.rawValue),
+            "pose_pairing_scope": .string("controller_pre_post"),
+            "pose_source_clock": .string(metadata?.sourceTimestamp == nil ? "unknown" : "ar_system_uptime"),
+            "pose_read_clock": .string(metadata?.sourceIdentity == nil ? "host_monotonic" : "ar_system_uptime"),
             "tracking_state": metadata?.trackingState.map { .string($0) } ?? .null,
             "tracking_state_availability": .string(metadata?.trackingState == nil ? "unknown" : "available"),
             "perception_frame_id": metadata?.frameID.map { .string($0) } ?? .null,
@@ -243,6 +284,15 @@ struct RotationDiagnosticMeasurement: Sendable {
             "pre_pose_read_monotonic_s": pre.map { .number($0.readMonotonic) } ?? .null,
             "post_pose_read_monotonic_s": post.map { .number($0.readMonotonic) } ?? .null
         ]
+        for (prefix, sample) in [("pre", pre), ("post", post)] {
+            result[prefix + "_source_frame_id"] = sample?.frameID.map { .string($0) } ?? .null
+            result[prefix + "_source_generation"] = sample?.sourceGeneration.map { .number(Double($0)) } ?? .null
+            result[prefix + "_source_timestamp_s"] = sample?.sourceTimestamp.map { .number($0) } ?? .null
+            result[prefix + "_source_age_s"] = sample?.sourceAge.map { .number($0) } ?? .null
+            result[prefix + "_source_identity"] = sample?.sourceIdentity.map { .string($0) } ?? .null
+            result[prefix + "_tracking_state"] = sample?.trackingState.map { .string($0) } ?? .null
+            result[prefix + "_source_availability"] = .string(sample?.sourceAvailability ?? "unknown")
+        }
         let delta: Double?
         if let before = pre?.finiteYaw, let after = post?.finiteYaw {
             delta = Self.normalize(after - before)

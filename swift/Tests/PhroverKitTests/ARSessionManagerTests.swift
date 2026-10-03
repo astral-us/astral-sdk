@@ -6,6 +6,58 @@ import XCTest
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testSnapshotIngestionRetainsSelectedDepthConfidencePairAndClearsItOnNextFrame() async throws {
+        let manager = ARSessionManager()
+        var iterator = manager.snapshots().makeAsyncIterator()
+        let depth = makeDepth(2)
+        var map: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 8, 6, kCVPixelFormatType_OneComponent8, nil, &map)
+        let confidence = try XCTUnwrap(map)
+        manager.ingestForTesting(image: makeImage(), timestamp: 10, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+            depthMap: depth, trackingQuality: .normal, depthConfidenceMap: confidence, depthSource: .smoothedSceneDepth)
+        let selectedValue = await iterator.next()
+        let selected = try XCTUnwrap(selectedValue)
+        XCTAssertTrue(selected.depthMap === depth)
+        XCTAssertTrue(selected.depthConfidenceMap === confidence)
+        XCTAssertEqual(selected.depthSource, .smoothedSceneDepth)
+        manager.ingestForTesting(image: makeImage(), timestamp: 11, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+            depthMap: nil, trackingQuality: .normal)
+        let nextValue = await iterator.next()
+        let next = try XCTUnwrap(nextValue)
+        XCTAssertNil(next.depthConfidenceMap)
+        XCTAssertNil(next.depthSource)
+        XCTAssertTrue(selected.depthConfidenceMap === confidence, "Retained frame cannot pick up later data")
+    }
+
+    func testSnapshotUptimeAndResetGenerationFenceRealFollowController() async {
+        let manager = ARSessionManager()
+        manager.resetForTesting()
+        manager.ingestForTesting(image: makeImage(), timestamp: 100, cameraTransform: transform(x: 1, z: 2),
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+            depthMap: nil, trackingQuality: .normal)
+        let gate = FollowDiagnosticSuspension()
+        var commands = 0
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 },
+            plan: { _, goal in [goal] }, lastAckAt: { await gate.suspend(); return Date() },
+            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in },
+            poseSample: { manager.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }, sourceNow: { 100.5 })
+        let scan = Task { await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3) }
+        await gate.waitUntilEntered() // Exactly 500 ms old snapshot passed preflight in the uptime domain.
+        manager.resetForTesting()
+        XCTAssertNil(manager.latestSnapshot)
+        manager.ingestForTesting(image: makeImage(), timestamp: 100.5, cameraTransform: transform(x: 1, z: 2),
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+            depthMap: nil, trackingQuality: .normal)
+        gate.release()
+        let result = await scan.value
+        XCTAssertEqual(result, .failed(.trackingLost), "A fresh reset snapshot cannot join the old AR operation")
+        XCTAssertEqual(commands, 0)
+        XCTAssertEqual(manager.latestSnapshot?.id, ARFrameID(generation: 2, sequence: 1))
+        XCTAssertEqual(manager.latestSnapshot?.timestamp, 100.5)
+    }
+
     func testResetAdvancesGenerationAndFramesAdvanceSequenceOnce() throws {
         let manager = ARSessionManager()
 

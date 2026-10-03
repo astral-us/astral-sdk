@@ -7,6 +7,34 @@ import simd
 @testable import PhroverKit
 
 final class DetectorTests: XCTestCase {
+    func testFollowReceiptCapturesActualRightOrientationWithoutFallbackOnEmptyOrError() {
+        let snapshot = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 100,
+            image: makeImage(), cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil,
+            pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        for scenario in 0..<3 {
+            var attempts: [CGImagePropertyOrientation] = []
+            let detector = Detector(supportedLabels: ["person"], visionHandler: { _, orientation in
+                attempts.append(orientation)
+                if scenario == 2 && orientation == .right { throw URLError(.cannotDecodeContentData) }
+                if scenario == 0 && orientation == .right { return [] }
+                return [.init(label: "person", confidence: 0.99,
+                    boundingBox: CGRect(x: 0.2, y: 0.3, width: 0.2, height: 0.3))]
+            })
+            let receipt = detector.evaluateForFollow(snapshot)
+            XCTAssertEqual(attempts, [.right])
+            XCTAssertEqual(receipt.status, scenario == 2 ? .failed : .executed)
+            XCTAssertEqual(receipt.orientation, scenario == 2 ? nil : .right)
+            XCTAssertEqual(receipt.frame.detections.count, scenario == 1 ? 1 : 0)
+            XCTAssertEqual(receipt.failureReason, scenario == 2 ? .inferenceFailed : nil)
+            attempts.removeAll()
+            let generic = detector.evaluate(snapshot)
+            XCTAssertEqual(attempts, scenario == 1 ? [.right] : [.right, .up])
+            XCTAssertEqual(generic.status, .executed)
+            XCTAssertEqual(generic.orientation, scenario == 1 ? .right : .up)
+            XCTAssertEqual(generic.frame.detections.count, 1)
+        }
+    }
     func testModelResourcePrefersCompiledModelBundle() {
         let url = Detector.modelResourceURL(modelName: "RoverYOLO")
 

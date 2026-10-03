@@ -2,10 +2,72 @@ import XCTest
 import CoreVideo
 import simd
 import RoverNav
+import ImageIO
 @testable import PhroverKit
 
 @MainActor
 final class ARFollowMePerceptionSourceTests: XCTestCase {
+    func testLiveFollowDoesNotProjectAsymmetricFallbackBoxUsingRightInverse() async throws {
+        var orientations: [CGImagePropertyOrientation] = []
+        let detector = Detector(supportedLabels: ["person"], visionHandler: { _, orientation in
+            orientations.append(orientation)
+            return orientation == .right ? [] : [
+                .init(label: "person", confidence: 0.99,
+                    boundingBox: CGRect(x: 0.2, y: 0.3, width: 0.2, height: 0.3))]
+        })
+        var image: CVPixelBuffer?
+        var depth: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 100, 80, kCVPixelFormatType_32BGRA, nil, &image)
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 16, kCVPixelFormatType_DepthFloat32, nil, &depth)
+        let map = try XCTUnwrap(depth)
+        CVPixelBufferLockBaseAddress(map, [])
+        let base = CVPixelBufferGetBaseAddress(map)!.assumingMemoryBound(to: Float.self)
+        for row in 0..<16 { for col in 0..<20 {
+            // Upright-up feet and right-inverse feet see different coherent surfaces.
+            base[row * CVPixelBufferGetBytesPerRow(map) / 4 + col] = col < 10 ? 1 : 3
+        } }
+        CVPixelBufferUnlockBaseAddress(map, [])
+        let ar = ARSessionManager()
+        let source = ARFollowMePerceptionSource(ar: ar, detector: detector)
+        var iterator = source.events().makeAsyncIterator()
+        ar.ingestForTesting(image: try XCTUnwrap(image), timestamp: 3,
+            cameraTransform: simd_float4x4(1), intrinsics: simd_float3x3(columns: (
+                SIMD3<Float>(50, 0, 0), SIMD3<Float>(0, 40, 0), SIMD3<Float>(50, 40, 1))),
+            imageResolution: CGSize(width: 100, height: 80), depthMap: map, trackingQuality: .normal)
+        guard case .frame(let batch)? = await iterator.next() else { return XCTFail("Expected live batch") }
+        XCTAssertEqual(orientations, [.right])
+        XCTAssertTrue(batch.people.isEmpty, "An up-oriented box must not become a right-oriented world observation")
+        XCTAssertEqual(batch.perceptionDiagnostics?.rawPersonCount, 0)
+        XCTAssertEqual(batch.perceptionDiagnostics?.projectionAttemptedCount, 0)
+        // The generic API still supports fallback, demonstrating a valid but incompatible box.
+        orientations.removeAll()
+        let generic = detector.detect(try XCTUnwrap(image))
+        XCTAssertEqual(orientations, [.right, .up])
+        XCTAssertEqual(generic.count, 1)
+        let wrong = ARFollowMePerceptionSource.batch(from: try XCTUnwrap(ar.latestSnapshot), detections: generic)
+        XCTAssertEqual(wrong.people.count, 1)
+        XCTAssertEqual(try XCTUnwrap(wrong.people.first).position.x, 1.2, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(wrong.people.first).position.y, -3, accuracy: 0.001)
+    }
+    func testFailedInferenceHasUnknownCountsAndDoesNotProjectSuppliedCandidates() throws {
+        var image: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        let snapshot = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 1,
+            image: try XCTUnwrap(image), cameraTransform: simd_float4x4(1), cameraIntrinsics: simd_float3x3(1),
+            imageResolution: CGSize(width: 20, height: 20), depthMap: nil,
+            pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        let output = ARFollowMePerceptionSource.batch(from: snapshot, detections: [
+            .init(label: "person", confidence: 0.9, boundingBox: CGRect(x: 0.4, y: 0.2, width: 0.2, height: 0.6))],
+            inferenceStatus: .failed)
+        let facts = try XCTUnwrap(output.perceptionDiagnostics)
+        XCTAssertEqual(facts.inferenceStatus, .failed)
+        XCTAssertNil(facts.rawDetectorCount)
+        XCTAssertNil(facts.projectionAttemptedCount)
+        XCTAssertNil(facts.projectionAcceptedCount)
+        XCTAssertNil(facts.projectionRejectedCount)
+        XCTAssertTrue(facts.candidates.isEmpty)
+    }
+
     func testPersonFeetProjectFromTheSameSnapshot() {
         var image: CVPixelBuffer?
         CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
@@ -108,6 +170,8 @@ final class ARFollowMePerceptionSourceTests: XCTestCase {
                             trackingQuality: .normal)
         guard case .frame(let normal)? = await iterator.next() else { return XCTFail("Expected normal batch") }
         XCTAssertEqual(normal.trackingQuality, .normal)
+        XCTAssertEqual(normal.perceptionDiagnostics?.inferenceStatus, .executed)
+        XCTAssertEqual(normal.perceptionDiagnostics?.rawDetectorCount, 0)
         XCTAssertGreaterThanOrEqual(try XCTUnwrap(normal.inferenceDuration), 0.02)
         XCTAssertEqual(inferenceCount, 1)
         ar.ingestForTesting(image: buffer, timestamp: 4,
@@ -117,7 +181,10 @@ final class ARFollowMePerceptionSourceTests: XCTestCase {
         guard case .frame(let limited)? = await iterator.next() else { return XCTFail("Expected limited batch") }
         XCTAssertEqual(limited.trackingQuality, .limited)
         XCTAssertNil(limited.pose)
-        XCTAssertEqual(limited.inferenceDuration, 0)
+        XCTAssertNil(limited.inferenceDuration)
+        XCTAssertEqual(limited.perceptionDiagnostics?.inferenceStatus, .skippedTracking)
+        XCTAssertNil(limited.perceptionDiagnostics?.rawPersonCount)
+        XCTAssertNil(limited.perceptionDiagnostics?.projectionAttemptedCount)
         XCTAssertEqual(inferenceCount, 1)
     }
 }

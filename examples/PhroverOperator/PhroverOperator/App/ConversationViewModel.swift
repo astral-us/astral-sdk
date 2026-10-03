@@ -11,31 +11,37 @@ final class ConversationViewModel {
     private var submit: (String) async -> OperatorSubmission
     private var stop: () async -> OperatorSubmission
     private var followState: () -> FollowMeState
+    private var readySignalClearance: () -> Double
     private var inhibit: () -> Void
 
     init(submit: @escaping (String) async -> OperatorSubmission = { _ in .rejected("Rover is starting. Try again.") },
          stop: @escaping () async -> OperatorSubmission = { .accepted },
          followState: @escaping () -> FollowMeState = { .idle },
+         readySignalClearance: @escaping () -> Double = { FollowMeConfiguration().readySignalClearance },
          inhibit: @escaping () -> Void = {}) {
         self.submit = submit
         self.stop = stop
         self.followState = followState
+        self.readySignalClearance = readySignalClearance
         self.inhibit = inhibit
     }
 
     func configure(submit: @escaping (String) async -> OperatorSubmission,
                    stop: @escaping () async -> OperatorSubmission,
                    followState: @escaping () -> FollowMeState,
+                   readySignalClearance: @escaping () -> Double = { FollowMeConfiguration().readySignalClearance },
                    inhibit: @escaping () -> Void = {}) {
         self.submit = submit
         self.stop = stop
         self.followState = followState
+        self.readySignalClearance = readySignalClearance
         self.inhibit = inhibit
     }
 
     var showsStopFollowing: Bool {
         if followState().isActive { return true }
         if case .failed("Rover stop could not be confirmed.") = followState() { return true }
+        if case .failed("Motor stop could not be confirmed. Motion is blocked.") = followState() { return true }
         return errorMessage == "Rover stop could not be confirmed."
     }
     var status: String {
@@ -43,6 +49,9 @@ final class ConversationViewModel {
         case .idle: return ""
         case .pausing: return "Pausing — five seconds"
         case .aligning: return "Aligning toward you…"
+        case .waitingForClearance:
+            let requirement = ceil(readySignalClearance() * 10) / 10
+            return "Step back to at least \(String(format: "%.1f", requirement)) m — waiting to signal ready."
         case .signalingReady: return "Signaling ready — moving 10 cm…"
         case .waitingForMovement: return "Ready — walk away to begin following"
         case .searching: return "Searching for you…"
@@ -76,10 +85,13 @@ final class ConversationViewModel {
 
     func stopFollowing() async {
         submissionGeneration &+= 1
+        let generation = submissionGeneration
         acceptsMissionPhase = false
         missionPhase = .idle
         inhibit()
-        switch await stop() {
+        let result = await stop()
+        guard generation == submissionGeneration else { return }
+        switch result {
         case .accepted: errorMessage = nil
         case .rejected(let message): errorMessage = message
         }
