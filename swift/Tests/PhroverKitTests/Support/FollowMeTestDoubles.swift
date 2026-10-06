@@ -39,7 +39,11 @@ final class FollowPerceptionFake: FollowMePerception {
 }
 
 @MainActor
-final class FollowMotionFake: FollowMeMotion {
+final class FollowMotionFake: FollowMeSourceClockMotion {
+    private var syntheticClock: ManualFollowClock?
+    var sourceUptime: TimeInterval? { syntheticClock?.now }
+    init(clock: ManualFollowClock? = nil) { syntheticClock = clock }
+    func useSourceClock(_ clock: ManualFollowClock) { syntheticClock = clock }
     private(set) var readySignals = 0
     var suspendReadySignal = false
     var readySignalResult: NavigationResult = .arrived
@@ -94,6 +98,11 @@ final class FollowMotionFake: FollowMeMotion {
         stops += 1
         if suspendStop { await withCheckedContinuation { stopWaiter = $0 } }
         if stopError { throw StopError.unconfirmed }
+        if let syntheticClock {
+            FollowMotionTaskScope.stopReceiptCapture?.recordSourceFence(.init(identity: UUID(),
+                operationGeneration: 0, context: .unknown, acknowledgementUptime: syntheticClock.now,
+                sourceGeneration: 1, highestSequence: nil, highestSourceTimestamp: nil))
+        }
     }
     func releaseStop() { stopWaiter?.resume(); stopWaiter = nil }
     func releaseRotation() { rotationWaiter?.resume(); rotationWaiter = nil }
@@ -109,6 +118,7 @@ final class FollowMotionFake: FollowMeMotion {
 @MainActor
 final class ContextualFollowMotionFake: FollowMeContextualMotion {
     let legacy = FollowMotionFake()
+    var sourceUptime: TimeInterval? { legacy.sourceUptime }
     private(set) var requests: [FollowMotionRequest] = []
     private(set) var contexts: [FollowMotionRequestContext] = []
     private(set) var legacySubscriptions = 0

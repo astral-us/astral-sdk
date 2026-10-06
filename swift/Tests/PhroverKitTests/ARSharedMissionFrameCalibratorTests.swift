@@ -200,10 +200,10 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         ])
     }
 
-    func testExpectedMarkerDetectionIsObservedBeforeGroundingStarts() async {
+    func testExpectedMarkerDetectionIsEnqueuedBeforeGroundingStarts() async {
         let manager = ARSessionManager()
-        let collector = CalibrationEventCollector()
         let probe = GroundingOrderProbe()
+        let grounded = expectation(description: "Grounder entry inspected the stream")
         let corners = OrientedMarkerCorners(
             topLeft: Vec2(0.6, 0.6), topRight: Vec2(0.6, 0.4),
             bottomLeft: Vec2(0.4, 0.6), bottomRight: Vec2(0.4, 0.4)
@@ -217,7 +217,8 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
         let calibrator = ARSharedMissionFrameCalibrator(
             sessionManager: manager,
             grounder: { _, _, _, _ in
-                probe.record(eventsObserved: collector.events, expectedDetection: detection)
+                probe.record()
+                grounded.fulfill()
                 return .failure(.missingDepthMap)
             }
         ) { frame in
@@ -228,9 +229,8 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
             )]
         }
         let stream = calibrator.events(markerID: "SILENT_SEARCH_01", sessionGeneration: 0)
-        let consumer = Task {
-            for await event in stream { collector.append(event) }
-        }
+        probe.stream = stream
+        defer { calibrator.cancel() }
         await Task.yield()
 
         manager.ingestForTesting(
@@ -238,15 +238,18 @@ final class ARSharedMissionFrameCalibratorTests: XCTestCase {
             intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 100, height: 100),
             depthMap: nil, trackingQuality: .normal
         )
-        await eventually { probe.wasInvoked }
-        await eventually { collector.events.count == 2 }
+        await fulfillment(of: [grounded], timeout: 1)
 
-        XCTAssertTrue(probe.detectionWasObserved)
-        XCTAssertEqual(Array(collector.events.prefix(2)), [
-            detection,
+        XCTAssertTrue(probe.eventWasAvailableAtEntry)
+        XCTAssertEqual(probe.firstEvent, detection)
+        // The entry probe consumed exactly one event. Drain after production
+        // finishes so later feedback cannot satisfy the entry assertion.
+        calibrator.cancel()
+        var remaining: [SilentSearchCalibrationEvent] = []
+        for await event in stream { remaining.append(event) }
+        XCTAssertEqual(remaining, [
             .feedback(.groundingFailed(context: context, reason: .missingDepthMap)),
         ])
-        consumer.cancel()
     }
 
     func testFallbackSuccessEmitsBackendDiagnosticBeforeQRDetectedFeedback() async {
@@ -946,15 +949,37 @@ private final class CalibrationEventCollector {
 
 @MainActor
 private final class GroundingOrderProbe {
-    private(set) var wasInvoked = false
-    private(set) var detectionWasObserved = false
+    var stream: AsyncStream<SilentSearchCalibrationEvent>?
+    private(set) var eventWasAvailableAtEntry = false
+    private(set) var firstEvent: SilentSearchCalibrationEvent?
 
-    func record(
-        eventsObserved: [SilentSearchCalibrationEvent],
-        expectedDetection: SilentSearchCalibrationEvent
-    ) {
-        wasInvoked = true
-        detectionWasObserved = eventsObserved.last == expectedDetection
+    func record() {
+        guard let stream else { return }
+        let receipt = BufferedCalibrationEventReceipt()
+        let delivered = DispatchSemaphore(value: 0)
+        let reader = Task.detached {
+            var iterator = stream.makeAsyncIterator()
+            receipt.record(await iterator.next())
+            delivered.signal()
+        }
+        defer { reader.cancel() }
+        // Intentionally hold the synchronous MainActor grounder at entry.
+        // Only the independent reader can run: production cannot enqueue a
+        // late detection (or grounding result) until this method returns.
+        // This bounded wait tests producer ordering, not consumer scheduling.
+        eventWasAvailableAtEntry = delivered.wait(timeout: .now() + 1) == .success
+        firstEvent = receipt.event
+    }
+}
+
+private final class BufferedCalibrationEventReceipt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var received: SilentSearchCalibrationEvent?
+
+    var event: SilentSearchCalibrationEvent? { lock.withLock { received } }
+
+    func record(_ event: SilentSearchCalibrationEvent?) {
+        lock.withLock { received = event }
     }
 }
 

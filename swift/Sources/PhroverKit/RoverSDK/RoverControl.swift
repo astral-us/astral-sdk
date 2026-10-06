@@ -13,6 +13,7 @@ public enum RoverCommandLinkReadiness: Equatable, Sendable {
 public actor RoverControl {
     private let baseURL: URL
     private let session: URLSession
+    private let retrySleep: @Sendable (TimeInterval) async -> Void
 
     /// Timestamp of the last successful command; the comms watchdog reads this.
     public private(set) var lastAckAt: Date?
@@ -20,12 +21,27 @@ public actor RoverControl {
     public init(host: String = RoverConfig.defaultHost, session: URLSession = .shared) {
         self.baseURL = URL(string: "http://\(host)")!
         self.session = session
+        self.retrySleep = { try? await Task.sleep(for: .seconds($0)) }
+    }
+
+    init(host: String = RoverConfig.defaultHost, session: URLSession,
+         retrySleep: @escaping @Sendable (TimeInterval) async -> Void) {
+        self.baseURL = URL(string: "http://\(host)")!
+        self.session = session
+        self.retrySleep = retrySleep
     }
 
     // MARK: - Motion
 
     func sendNavigationWithReceipt(_ cmd: WheelCommand) async -> RoverCommandDiagnosticResult {
-        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left])
+        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left],
+            authorization: cmd.left != 0 || cmd.right != 0 ? FollowTurnBurstTransportScope.authorization : nil)
+    }
+
+    func sendNavigationWithReceipt(_ cmd: WheelCommand,
+                                   authorization: FollowTurnBurstAuthorization) async -> RoverCommandDiagnosticResult {
+        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left],
+            authorization: cmd.left != 0 || cmd.right != 0 ? authorization : nil)
     }
 
     func stopWithReceipt() async -> RoverCommandDiagnosticResult {
@@ -92,7 +108,8 @@ public actor RoverControl {
         _ = try await sendJSONDiagnostic(payload).get()
     }
 
-    private func sendJSONDiagnostic(_ payload: [String: Any]) async -> RoverCommandDiagnosticResult {
+    private func sendJSONDiagnostic(_ payload: [String: Any],
+                                    authorization: FollowTurnBurstAuthorization? = nil) async -> RoverCommandDiagnosticResult {
         let data: Data
         do { data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) }
         catch { return .init(receipt: .unknown, failure: error) }
@@ -113,8 +130,31 @@ public actor RoverControl {
 
         let attempts = max(1, RoverConfig.commandRetryAttempts)
         var lastError: Error?
+        var lastStatusCode: Int?
 
         for attempt in 1...attempts {
+            if let authorization {
+                let attemptAuthorized = await authorization.authorizeAttempt?() ?? true
+                // No suspension between these final gates and creation of the HTTP task.
+                if Task.isCancelled {
+                    return .init(receipt: .init(httpStatus: lastStatusCode, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: attempt - 1, outcome: "cancelled"),
+                        failure: FollowTurnBurstTransportDenial.cancelled)
+                }
+                let time = authorization.uptime()
+                if !time.isFinite || !authorization.deadline.isFinite || time >= authorization.deadline {
+                    return .init(receipt: .init(httpStatus: lastStatusCode, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: attempt - 1, outcome: "expired"),
+                        failure: FollowTurnBurstTransportDenial.expired)
+                }
+                if !attemptAuthorized || !authorization.isAuthorized() {
+                    return .init(receipt: .init(httpStatus: lastStatusCode, acknowledged: false,
+                        acknowledgementUTC: nil, attempts: attempt - 1, outcome: "fenced"),
+                        failure: FollowTurnBurstTransportDenial.fenced)
+                }
+                authorization.didEnterAttempt?(.init(operationID: authorization.operationID,
+                    attempt: attempt, entryUptime: time))
+            }
             var didLogResponse = false
             var statusCode: Int?
             do {
@@ -135,6 +175,7 @@ public actor RoverControl {
                                                                                               error: nil))
                 didLogResponse = true
                 statusCode = http.statusCode
+                lastStatusCode = http.statusCode
                 guard (200...299).contains(http.statusCode) else {
                     throw RoverControlError.serverError(http.statusCode)
                 }
@@ -157,12 +198,27 @@ public actor RoverControl {
                         outcome: cancelled ? "cancelled" : "failed"), failure: error)
                 }
 
+                if let authorization {
+                    let time = authorization.uptime()
+                    let denial: FollowTurnBurstTransportDenial?
+                    let outcome: String
+                    if Task.isCancelled { denial = .cancelled; outcome = "cancelled" }
+                    else if !time.isFinite || !authorization.deadline.isFinite || time >= authorization.deadline {
+                        denial = .expired; outcome = "expired"
+                    } else if !authorization.isAuthorized() { denial = .fenced; outcome = "fenced" }
+                    else { denial = nil; outcome = "unknown" }
+                    if let denial {
+                        return .init(receipt: .init(httpStatus: statusCode, acknowledged: false,
+                            acknowledgementUTC: nil, attempts: attempt, outcome: outcome), failure: denial)
+                    }
+                }
+
                 RuntimeFileLog.append("rover_command_retry", fields: [
                     "attempt": "\(attempt)",
                     "max": "\(attempts)",
                     "error": error.localizedDescription
                 ])
-                try? await Task.sleep(for: .seconds(RoverConfig.commandRetryBackoff))
+                await retrySleep(RoverConfig.commandRetryBackoff)
             }
         }
 

@@ -3,6 +3,28 @@ import XCTest
 
 @MainActor
 final class FollowDiagnosticEventTests: XCTestCase {
+    func testMeasuredHostLatencyWithoutYawCannotBeReportedAsObservedRateOrZeroCoast() throws {
+        let profile = FollowTurnBurstPlanner.Profile(purpose: .alignment)
+        let calibration = FollowTurnBurstPlanner.Calibration(operationID: 41, generation: 3, targetYaw: 0.3,
+            clockDomain: "ar_system_uptime")
+        let response = FollowTurnBurstPlanner.Response(operationID: 41, generation: 3, targetYaw: 0.3,
+            clockDomain: "ar_system_uptime", requestedBudget: 0.080, sendEntryUptime: 10,
+            sendResponseUptime: 10.020, stopObligationUptime: 10.020, stopAcknowledgementUptime: 10.030, samples: [])
+        let trace = FollowTurnBurstDiagnosticTrace()
+        trace.reduction(response, FollowTurnBurstPlanner.recording(response, in: calibration, profile: profile))
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "missing-yaw", monotonic: { 300 }, utc: { Date() }, sink: sink.append)
+        emitter.emit(.init(event: "follow_scan.burst_response", payload: trace.fields))
+        let record = try decode(try XCTUnwrap(sink.records.first?.fields))
+        XCTAssertEqual(record["latency_confidence"] as? String, "measured_host_maxima")
+        XCTAssertEqual(record["response_rate_confidence"] as? String, "provisional_reference")
+        XCTAssertTrue(record["net_source_rate_rad_s"] is NSNull)
+        XCTAssertTrue(record["effective_budget_response_rate_rad_s"] is NSNull)
+        XCTAssertTrue(record["observed_post_ack_travel_rad"] is NSNull)
+        XCTAssertEqual(record["post_ack_travel_confidence"] as? String, "unknown")
+        XCTAssertEqual(record["bracket_response_confidence"] as? String, "unknown_missing_endpoints")
+    }
+
     func testRecoveryFactsUseExistingPrecisePrimitiveEnvelopeAndPrivacyFilter() throws {
         let memory = FollowReliableMemory(position: nil, pairedPose: nil, bearing: 0.123456789123,
             frameID: .init(generation: 3, sequence: 4), timestamp: 7, association: .continued, pairedYaw: 0.4)

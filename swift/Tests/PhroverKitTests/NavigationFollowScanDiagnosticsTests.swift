@@ -4,22 +4,218 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowScanDiagnosticsTests: XCTestCase {
+    func testNextBurstKeepsOperationMaximaButDoesNotRelabelPreviousResponseAsCurrent() async throws {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        let sink = FollowDiagnosticRecordingSink()
+        var sends = 0
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 }, plan: { _, _ in nil },
+            lastAckAt: { Date() }, sendCommand: { _ in sends += 1; source.uptime += 0.001 },
+            stopRover: { source.uptime += 0.002 }, sleep: { duration in
+                if sends > 0, Self.seconds(duration) >= 0.299 { source.pose = .init(position: .zero, yaw: sends == 1 ? 0.2 : 0.8) }
+                await source.advance(duration)
+            }, diagnosticEmitter: .init(streamID: "two-bursts", monotonic: { 100 }, utc: { Date() }, sink: sink.append),
+            poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.alignment(0.8), context:
+            .init(sessionGeneration: 9, requestToken: 905, purpose: .followAlignment, phase: "aligning"))
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(sends, 2)
+        let all = try records(sink)
+        let second = try XCTUnwrap(all.first { $0["event"] as? String == "follow_scan.send_begin" && $0["burst_index"] as? Int == 2 })
+        XCTAssertEqual(try XCTUnwrap(second["retained_response_rate_rad_s"] as? Double), 2.5, accuracy: 1e-12)
+        XCTAssertEqual(second["requested_host_budget_s"] as? Double, 0.080)
+        XCTAssertTrue(second["bracket_sample_count"] is NSNull)
+        XCTAssertTrue(second["post_ack_sample_endpoints"] is NSNull)
+        XCTAssertTrue(second["send_response_uptime_s"] is NSNull)
+        XCTAssertTrue(second["sender_outcome"] is NSNull)
+        let final = try XCTUnwrap(all.last { $0["event"] as? String == "follow_scan.burst_response" })
+        XCTAssertEqual(try XCTUnwrap(final["retained_response_rate_rad_s"] as? Double), 7.5, accuracy: 1e-12)
+    }
+
+    func testThreeDegreeProbeTraceUsesReferenceOnlyAndSubMillisecondExcessWithoutInventedFloor() async throws {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        let sink = FollowDiagnosticRecordingSink()
+        var reads = 0
+        var sends = 0
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 }, plan: { _, _ in nil },
+            lastAckAt: { Date() }, sendCommand: { _ in sends += 1; source.uptime += 0.100 }, stopRover: {},
+            sleep: { duration in
+                if sends > 0 { source.pose = .init(position: .zero, yaw: .pi / 60) }
+                await source.advance(duration)
+            }, diagnosticEmitter: .init(streamID: "small-probe", monotonic: { 300 }, utc: { Date() }, sink: sink.append),
+            poseSample: { reads += 1; return source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+            sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.alignment(.pi / 60), context:
+            .init(sessionGeneration: 9, requestToken: 904, purpose: .followAlignment, phase: "aligning"))
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(sends, 1)
+        XCTAssertEqual(reads, 1)
+        let plan = try XCTUnwrap(try records(sink).first { $0["event"] as? String == "follow_scan.burst_plan" })
+        XCTAssertEqual(try XCTUnwrap(plan["selected_budget_s"] as? Double), 0.0011267585362157, accuracy: 1e-14)
+        XCTAssertEqual(try XCTUnwrap(plan["excess_rad"] as? Double), 0.00235987755982988, accuracy: 1e-14)
+        XCTAssertEqual(plan["tolerance_rad"] as? Double, 0.05)
+        XCTAssertEqual(plan["response_rate_confidence"] as? String, "provisional_reference")
+        XCTAssertTrue(plan["latency_allowance_s"] is NSNull)
+        XCTAssertTrue(plan["minimum_host_budget_s"] is NSNull)
+        XCTAssertEqual(plan["budget_floor_policy"] as? String, "no_hard_floor")
+        XCTAssertEqual(plan["reference_rate_provenance"] as? String, "provisional_120deg_per_s_not_certified")
+    }
+
+    func testDroppedResponseFrameCannotBecomeObservedRateOrCoastInTelemetry() async throws {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        let sink = FollowDiagnosticRecordingSink()
+        var sends = 0
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 }, plan: { _, _ in nil },
+            lastAckAt: { Date() }, sendCommand: { _ in
+                sends += 1
+                source.uptime += 0.100
+                source.snapshot = .init(pose: .init(position: .zero, yaw: 0.2),
+                    frameID: .init(generation: 4, sequence: 14), sourceTimestamp: source.uptime,
+                    trackingQuality: .normal, source: "dropped_frame_fixture")
+                source.controller?.ingestFollowTurnSource(source.snapshot)
+            }, stopRover: {}, sleep: { duration in
+                if sends > 0 { source.pose = .init(position: .zero, yaw: 0.3) }
+                await source.advance(duration)
+            }, diagnosticEmitter: .init(streamID: "invalid-bracket", monotonic: { 100 }, utc: { Date() }, sink: sink.append),
+            poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+            sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context:
+            .init(sessionGeneration: 9, requestToken: 903, purpose: .followScan, phase: "scanning"))
+        XCTAssertEqual(result.result, .arrived, "Fresh stopped arrival is independent of a dropped calibration frame")
+        XCTAssertEqual(sends, 1)
+        let rejected = try XCTUnwrap(try records(sink).first { $0["event"] as? String == "follow_scan.burst_response" })
+        XCTAssertEqual(rejected["bracket_rejection_reason"] as? String, "incomplete_or_ambiguous")
+        XCTAssertEqual(rejected["bracket_valid"] as? Bool, false)
+        XCTAssertEqual(rejected["bracket_complete_for_rate"] as? Bool, false)
+        XCTAssertTrue(rejected["effective_budget_response_rate_rad_s"] is NSNull)
+        XCTAssertTrue(rejected["observed_post_ack_travel_rad"] is NSNull)
+        XCTAssertEqual(rejected["response_rate_confidence"] as? String, "provisional_reference")
+        let intervals = try XCTUnwrap(rejected["source_intervals"] as? [[String: Any]])
+        XCTAssertTrue(intervals.allSatisfy { $0["valid"] as? Bool == false && $0["observed_rate_rad_s"] is NSNull })
+        XCTAssertNil(result.failure)
+    }
+
+    func testOvershootTraceRetainsMeasuredAllowancesAndUnknownCoastThroughResolutionFailure() async throws {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "model", monotonic: { 500 }, utc: { Date() }, sink: sink.append)
+        var sends = 0
+        let controller = NavigationController(currentPose: { XCTFail("No legacy reads"); return nil },
+            forwardClearance: { 2 }, plan: { _, _ in nil }, lastAckAt: { Date() },
+            sendCommand: { _ in sends += 1; source.uptime += 0.100 },
+            stopRover: { if sends > 0 { source.uptime += 0.020 } }, sleep: { duration in
+                if sends > 0 { source.pose = .init(position: .zero, yaw: 0.5) }
+                await source.advance(duration)
+            }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context:
+            .init(sessionGeneration: 9, requestToken: 902, purpose: .followScan, phase: "scanning"))
+        XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient))
+        XCTAssertEqual(sends, 1)
+        let events = try records(sink)
+        XCTAssertEqual(result.failure?.turnDiagnosticFields["controller_phase"], .string("stopped_planning"))
+        XCTAssertEqual(result.failure?.turnDiagnosticFields["profile_maximum_host_budget_s"], .number(0.080))
+        XCTAssertEqual(result.failure?.turnDiagnosticFields["episode_id"], .null)
+        XCTAssertEqual(result.failure?.turnDiagnosticFields["stage_index"], .null)
+        XCTAssertEqual(result.failure?.turnDiagnosticFields["segment_index"], .null)
+        let planned = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.burst_plan" })
+        XCTAssertEqual(planned["response_rate_confidence"] as? String, "provisional_reference")
+        XCTAssertTrue(planned["maximum_send_duration_s"] is NSNull)
+        let measured = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.burst_response" })
+        XCTAssertEqual(measured["bracket_valid"] as? Bool, true)
+        XCTAssertEqual(try XCTUnwrap(measured["retained_response_rate_rad_s"] as? Double), 6.25, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(measured["maximum_send_duration_s"] as? Double), 0.1, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(measured["maximum_stop_duration_s"] as? Double), 0.04, accuracy: 1e-12)
+        XCTAssertEqual(measured["post_ack_travel_confidence"] as? String, "unknown")
+        XCTAssertTrue(measured["observed_post_ack_travel_rad"] is NSNull)
+        XCTAssertEqual(try XCTUnwrap(measured["overshoot_ceiling_s"] as? Double), 0.02845231237766351, accuracy: 1e-12)
+        XCTAssertEqual(measured["post_source_frame_id"] as? String, "4:12")
+        let failure = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.failure" })
+        XCTAssertEqual(failure["reason"] as? String, "rotation_resolution_insufficient")
+        XCTAssertEqual(failure["controller_phase"] as? String, "stopped_planning")
+        XCTAssertEqual(failure["stop_outcome"] as? String, "confirmed")
+    }
+
+    func testRuntimeBurstTraceCapturesLateAckAndOnlyActuallyEnteredWaits() async throws {
+        for purpose in [FollowMotionPurpose.followScan, .followAlignment] {
+            let source = FollowRecoveryDiagnosticSourceFixture()
+            let sink = FollowDiagnosticRecordingSink()
+            let emitter = FollowDiagnosticEmitter(streamID: "runtime-burst", monotonic: { source.uptime },
+                utc: { Date(timeIntervalSince1970: 100) }, sink: sink.append)
+            var reads = 0
+            var sends = 0
+            let controller = NavigationController(currentPose: { XCTFail("No legacy reads"); return nil },
+                forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
+                sendCommand: { _ in sends += 1; source.uptime += 0.100 }, stopRover: {},
+                sleep: { duration in
+                    if sends > 0 { source.pose = .init(position: .zero, yaw: 0.3) }
+                    await source.advance(duration)
+                }, diagnosticEmitter: emitter, poseSample: { reads += 1; return source.snapshot },
+                sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+                sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
+            let context = FollowMotionRequestContext(sessionGeneration: 9, requestToken: 901,
+                purpose: purpose, phase: "reacquiring")
+            let request: FollowMotionRequest = purpose == .followScan ? .scan(0.3) : .alignment(0.3)
+            let result = await NavigationFollowMeMotion(navigation: controller).perform(request, context: context)
+            XCTAssertEqual(result.result, .arrived)
+            XCTAssertEqual(sends, 1)
+            XCTAssertEqual(reads, 1, "Tracing must reuse ingress captures")
+            let events = try records(sink)
+            let pulse = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.pulse_complete" })
+            XCTAssertEqual(pulse["purpose"] as? String, purpose.rawValue)
+            XCTAssertEqual(pulse["pre_source_frame_id"] as? String, "4:11")
+            XCTAssertEqual(pulse["post_source_frame_id"] as? String, "4:12")
+            XCTAssertEqual(pulse["post_yaw_rad"] as? Double, 0.3)
+            XCTAssertEqual(pulse["profile_pulse_wait_s"] as? Double, 0.080,
+                "Compatibility field describes the configured maximum, not a fixed motor wait")
+            XCTAssertEqual(pulse["profile_angular_tolerance_rad"] as? Double,
+                purpose == .followScan ? 7 * .pi / 180 : 0.05)
+            XCTAssertEqual(RoverConfig.followScanRotationProfile.pulseWait, 0.200,
+                "Historical configuration remains inactive metadata")
+            let ack = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.send_ack" })
+            XCTAssertEqual(try XCTUnwrap(ack["send_host_duration_s"] as? Double), 0.100, accuracy: 1e-12)
+            XCTAssertEqual(try XCTUnwrap(ack["requested_host_budget_s"] as? Double), 0.080, accuracy: 1e-12)
+            XCTAssertEqual(try XCTUnwrap(ack["ack_overrun_s"] as? Double), 0.020, accuracy: 1e-12)
+            XCTAssertEqual(ack["requested_additional_wait_s"] as? Double, 0)
+            XCTAssertEqual(ack["remaining_budget_at_response_s"] as? Double, 0)
+            XCTAssertEqual(ack["physical_motor_duration_confidence"] as? String, "unknown")
+            XCTAssertEqual(ack["burst_clock"] as? String, "ar_system_uptime")
+            XCTAssertEqual(ack["profile_historical_pulse_wait_active"] as? Bool, false)
+            let obligation = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.burst_stop_obligation" })
+            XCTAssertEqual(try XCTUnwrap(obligation["stop_obligation_observed_uptime_s"] as? Double), 8.4, accuracy: 1e-12)
+            XCTAssertEqual(try XCTUnwrap(obligation["stop_obligation_uptime_s"] as? Double), 8.38, accuracy: 1e-12)
+            XCTAssertFalse(events.contains { ($0["event"] as? String)?.hasPrefix("follow_scan.pulse_wait") == true },
+                "Expired ACK cannot fabricate a wait stage")
+            XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.settle_begin" }.count, 2)
+            XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.settle_end" }.count, 2)
+            XCTAssertEqual(events.last?["outcome"] as? String, "completed")
+            XCTAssertEqual(events.last?["stop_outcome"] as? String, "confirmed")
+        }
+    }
+
     func testRecoveryDiagnosticsRejectSourceAndDeadlineWithoutInventingResolvedMovement() async throws {
         for fault in ["generation", "missing", "expired_feedback"] {
             let sink = FollowDiagnosticRecordingSink()
             let emitter = FollowDiagnosticEmitter(streamID: "rejected", monotonic: { 50 }, utc: { Date() }, sink: sink.append)
             var time = 8.0
             var reads = 0
+            let events = AsyncStream<NavigationPoseSample>.makeStream()
+            let snapshot: NavigationPoseSample = fault == "missing" ? .unavailable : .init(
+                pose: .init(position: Vec2(2, 3), yaw: 0.4),
+                frameID: .init(generation: fault == "generation" ? 5 : 4, sequence: 10),
+                sourceTimestamp: 8, trackingQuality: .normal, source: "synthetic_ar")
             let controller = NavigationController(currentPose: { .init(position: .zero, yaw: 0.4) },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
                     if fault == "expired_feedback" { time = 12 }; return Date()
                 }, sendCommand: { _ in XCTFail("Rejected recovery cannot send") }, stopRover: {}, sleep: { _ in },
                 diagnosticEmitter: emitter, poseSample: {
                     reads += 1
-                    return fault == "missing" ? .unavailable : .init(pose: .init(position: Vec2(2, 3), yaw: 0.4),
-                        frameID: .init(generation: fault == "generation" ? 5 : 4, sequence: 10),
-                        sourceTimestamp: 8, trackingQuality: .normal, source: "synthetic_ar")
-                }, sourceNow: { time })
+                    return snapshot
+                }, sourceNow: { time }, sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
             let request = FollowRecoveryHeadingRequest(stageHeading: 1.2,
                 authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { time }, canContinue: { true }))
             let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request,
@@ -48,43 +244,47 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     }
 
     func testRecoveryDiagnosticStreamUsesCapturedControllerReadsAndActualFinalYaw() async throws {
-        var yaw = 0.0
+        let source = FollowRecoveryDiagnosticSourceFixture()
         var reads = 0
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "recovery-source", monotonic: { 50 },
             utc: { Date(timeIntervalSince1970: 50) }, sink: sink.append)
-        let controller = NavigationController(currentPose: { .init(position: .zero, yaw: yaw) },
+        let controller = NavigationController(currentPose: { source.pose },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
-            sendCommand: { _ in yaw = 0.35 }, stopRover: {}, sleep: { _ in },
+            sendCommand: { _ in source.pose = .init(position: Vec2(2, 3), yaw: 0.35) },
+            stopRover: {}, sleep: source.advance,
             diagnosticEmitter: emitter, poseSample: {
                 reads += 1
-                return .init(pose: .init(position: Vec2(2, 3), yaw: yaw),
-                    frameID: .init(generation: 4, sequence: UInt64(reads)), sourceTimestamp: 8,
-                    trackingQuality: .normal, source: "synthetic_ar")
-            }, sourceNow: { 8.1 })
+                return source.snapshot
+            }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let episodeID = UUID()
         let request = FollowRecoveryHeadingRequest(stageHeading: 0.3,
-            authorization: .init(episodeID: episodeID, expectedGeneration: 4, deadline: 12, now: { 8.1 }, canContinue: { true }))
+            authorization: .init(episodeID: episodeID, expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }),
+            stageIndex: 2, segmentIndex: 1)
         let context = FollowMotionRequestContext(sessionGeneration: 7, requestToken: 13, purpose: .followScan, phase: "reacquiring")
         let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
         XCTAssertEqual(result.result, .arrived)
-        XCTAssertEqual(reads, 4, "Diagnostics must not sample the pose provider")
+        XCTAssertEqual(reads, 1, "Diagnostics must not sample the pose provider")
         let record = try XCTUnwrap(sink.records.last { $0.event == "follow_scan.operation_complete" })
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(record.fields["payload"]).utf8)) as? [String: Any])
         XCTAssertEqual(json["episode_id"] as? String, episodeID.uuidString)
+        XCTAssertEqual(json["stage_index"] as? Int, 2)
+        XCTAssertEqual(json["segment_index"] as? Int, 1)
         XCTAssertEqual(json["deadline_s"] as? Double, 12)
         XCTAssertEqual(json["deadline_clock"] as? String, "system_uptime")
-        XCTAssertEqual(json["authorization_checked_uptime_s"] as? Double, 8.1)
+        XCTAssertEqual(json["authorization_checked_uptime_s"] as? Double, source.uptime)
         XCTAssertEqual(json["authorization_outcome"] as? String, "authorized")
-        XCTAssertEqual(try XCTUnwrap(json["authorization_remaining_s"] as? Double), 3.9, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(json["authorization_remaining_s"] as? Double), 12 - source.uptime, accuracy: 1e-12)
         XCTAssertEqual(json["request_token"] as? Int, 13)
         XCTAssertEqual(json["session_generation"] as? Int, 7)
-        XCTAssertEqual(json["controller_post_stop_frame_id"] as? String, "4:1")
-        XCTAssertEqual(json["controller_resolution_frame_id"] as? String, "4:2")
-        XCTAssertEqual(json["controller_arrival_frame_id"] as? String, "4:4")
-        XCTAssertEqual(json["controller_arrival_read_uptime_s"] as? Double, 8.1)
-        XCTAssertEqual(json["controller_arrival_timestamp_s"] as? Double, 8)
-        XCTAssertEqual(json["controller_arrival_source_identity"] as? String, "synthetic_ar")
+        XCTAssertEqual(json["controller_post_stop_frame_id"] as? String, "4:11")
+        XCTAssertEqual(json["controller_resolution_frame_id"] as? String, "4:11")
+        XCTAssertEqual(json["controller_arrival_frame_id"] as? String, "4:13")
+        XCTAssertEqual(json["controller_arrival_read_uptime_s"] as? Double, source.uptime)
+        XCTAssertEqual(json["controller_arrival_timestamp_s"] as? Double, source.snapshot.sourceTimestamp)
+        XCTAssertGreaterThan(source.snapshot.sourceTimestamp ?? 0, try XCTUnwrap(result.turnStopFence?.acknowledgementUptime))
+        XCTAssertEqual(json["controller_arrival_source_identity"] as? String, source.snapshot.source)
         XCTAssertEqual(json["requested_movement_rad"] as? Double, 0.3)
         XCTAssertEqual(json["measured_movement_rad"] as? Double, 0.35)
         XCTAssertEqual(try XCTUnwrap(json["stage_error_rad"] as? Double), -0.05, accuracy: 1e-12)
@@ -98,18 +298,20 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         var results: [NavigationResult] = []
         for request in [FollowMotionRequest.alignment(0.3), .ready] {
             let gate = FollowDiagnosticSuspension()
-            var pose = Pose2D(position: .zero, yaw: 0)
+            let source = FollowRecoveryDiagnosticSourceFixture()
             var stops = 0
-            let controller = NavigationController(currentPose: { pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
+            let controller = NavigationController(currentPose: { source.pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
                 lastAckAt: { Date() }, sendCommand: { _ in
-                    pose = .init(position: Vec2(0.1, 0), yaw: request.purpose == .followAlignment ? 0.3 : 0)
+                    source.pose = .init(position: Vec2(0.1, 0), yaw: request.purpose == .followAlignment ? 0.3 : 0)
+                    source.capture(after: 0.001)
                 }, stopRover: {
                     stops += 1
-                    if stops == (request.purpose == .followAlignment ? 3 : 2) { await gate.suspend() }
-                }, sleep: { _ in }, poseSample: { .init(pose: pose, frameID: .init(generation: 4, sequence: 10), sourceTimestamp: 8,
-                    trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { 8 })
+                    if stops == 2 { await gate.suspend() }
+                }, sleep: source.advance, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let authorization = FollowRecoveryAuthorization(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
-                now: { 8 }, canContinue: { true })
+                now: { source.uptime }, canContinue: { true })
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 14, purpose: request.purpose, phase: "recovery")
             let caller = Task { await NavigationFollowMeMotion(navigation: controller).performContextual(request, context: context, recovery: authorization) }
             await gate.waitUntilEntered()
@@ -122,43 +324,55 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(results, [.cancelled, .cancelled])
     }
 
-    func testOrdinaryRelativeAlignmentRetainsYawOnlyLegacyBehavior() async {
+    func testOrdinaryRelativeAlignmentRejectsYawOnlyLegacyProvenance() async {
         var yaw = 0.0
         let controller = NavigationController(currentPose: { .init(position: Vec2(.nan, .nan), yaw: yaw) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
             sendCommand: { _ in yaw = 0.3 }, stopRover: {}, sleep: { _ in })
         let result = await controller.rotateForFollowAlignment(by: 0.3)
-        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(result, .failed(.trackingLost))
+        XCTAssertEqual(yaw, 0, "Missing follow source cannot authorize a command")
     }
 
     func testRecoveryArrivalUsesOneFinalPostStopSampleForResultAndEvidence() async {
-        var yaw = 0.0
+        let source = FollowRecoveryDiagnosticSourceFixture()
         var reads = 0
-        let controller = NavigationController(currentPose: { .init(position: .zero, yaw: yaw) },
+        var sent = false
+        let controller = NavigationController(currentPose: { source.pose },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
-            sendCommand: { _ in yaw = 0.3 }, stopRover: {}, sleep: { _ in }, poseSample: {
+            sendCommand: { _ in sent = true }, stopRover: {}, sleep: { duration in
+                if sent, Self.seconds(duration) >= 0.299 { source.pose = .init(position: .zero, yaw: 0.3) }
+                await source.advance(duration)
+            }, poseSample: {
                 reads += 1
-                return .init(pose: .init(position: .zero, yaw: yaw), frameID: .init(generation: reads <= 4 ? 4 : 5, sequence: UInt64(reads)),
-                    sourceTimestamp: 8, trackingQuality: .normal, source: "synthetic_ar")
-            }, sourceNow: { 8 })
+                if reads > 1 { return .init(pose: source.pose, frameID: .init(generation: 5, sequence: 99),
+                    sourceTimestamp: source.uptime, trackingQuality: .normal) }
+                return source.snapshot
+            }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let request = FollowRecoveryHeadingRequest(stageHeading: 0.3,
-            authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { 8 }, canContinue: { true }))
+            authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }))
         let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 13, purpose: .followScan, phase: "reacquiring")
         let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
         XCTAssertTrue(result.result == .arrived && result.recovery?.stageArrived == true
-            && result.recovery?.arrivalSource?.frameID?.sequence == 4 && reads == 4)
+            && result.recovery?.arrivalSource?.frameID == source.snapshot.frameID && reads == 1)
+        XCTAssertGreaterThan(source.snapshot.sourceTimestamp ?? 0, result.turnStopFence?.acknowledgementUptime ?? .infinity)
     }
 
     func testInterruptedRecoveryReportsUnknownUnresolvedSegmentWithoutInventedRelativeRequest() async {
         let gate = FollowDiagnosticSuspension()
         let clock = FollowDiagnosticTestClock()
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.pose = .init(position: Vec2(2, 3), yaw: 0.4)
+        source.capture(after: 0)
         let controller = NavigationController(currentPose: { .init(position: Vec2(2, 3), yaw: 0.4) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { await gate.suspend(); return Date() },
-            sendCommand: { _ in XCTFail("Interrupted feedback cannot send") }, stopRover: {}, sleep: { _ in },
-            poseSample: { .init(pose: .init(position: Vec2(2, 3), yaw: 0.4), frameID: .init(generation: 4, sequence: 10),
-                sourceTimestamp: 8, trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { 8 })
+            sendCommand: { _ in XCTFail("Interrupted feedback cannot send") }, stopRover: {}, sleep: source.advance,
+            poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let request = FollowRecoveryHeadingRequest(stageHeading: 1.2,
-            authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { 8 }, canContinue: { clock.monotonic == 0 }))
+            authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { clock.monotonic == 0 }))
         let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 12, purpose: .followScan, phase: "reacquiring")
         let caller = Task { await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context) }
         await gate.waitUntilEntered()
@@ -171,28 +385,36 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     }
 
     func testAbsoluteRecoveryKeepsSegmentTargetThroughOppositeSignCorrectionAndInclusiveTolerance() async {
-        var observations: [Double] = []
         for withinTolerance in [false, true] {
-            var yaw = 0.0
+            let source = FollowRecoveryDiagnosticSourceFixture()
             var commands: [Double] = []
             var waits: [Double] = []
-            var settles = 0
-            let controller = NavigationController(currentPose: { .init(position: .zero, yaw: yaw) },
+            let controller = NavigationController(currentPose: { source.pose },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
                 sendCommand: { commands.append($0.right) }, stopRover: {}, sleep: { duration in
                     waits.append(Self.seconds(duration))
-                    if Self.seconds(duration) == 0.3 { settles += 1; yaw = settles == 1 ? 0.7 : .pi / 6 }
-                }, poseSample: { .init(pose: .init(position: .zero, yaw: yaw), frameID: .init(generation: 4, sequence: 10),
-                    sourceTimestamp: 8, trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { 8 })
+                    if Self.seconds(duration) >= 0.299, !commands.isEmpty {
+                        source.pose = .init(position: .zero, yaw: commands.count == 1 ? 0.7 : .pi / 6)
+                    }
+                    await source.advance(duration)
+                }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let request = FollowRecoveryHeadingRequest(stageHeading: withinTolerance ? 7 * .pi / 180 : 1.2,
-                authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { 8 }, canContinue: { true }))
+                authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }))
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 10, purpose: .followScan, phase: "reacquiring")
             let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
-            observations += [Double(commands.count), result.recovery?.segmentHeading ?? -1,
-                result.recovery?.stageArrived == withinTolerance ? 1 : 0]
-            if !withinTolerance { observations += commands + waits }
+            XCTAssertEqual(result.result, .arrived)
+            XCTAssertEqual(result.recovery?.segmentHeading, withinTolerance ? 0 : .pi / 6)
+            XCTAssertEqual(result.recovery?.stageArrived, withinTolerance)
+            XCTAssertEqual(commands, withinTolerance ? [] : [0.25, -0.25])
+            if !withinTolerance {
+                XCTAssertEqual(waits.count, 5)
+                XCTAssertEqual(waits[1], 0.080, accuracy: 1e-12)
+                XCTAssertGreaterThan(waits[3], 0)
+                XCTAssertLessThan(waits[3], waits[1], "Measured overshoot must shrink the opposite correction")
+            }
         }
-        XCTAssertEqual(observations, [2, .pi / 6, 1, 0.25, -0.25, 0.2, 0.3, 0.2, 0.3, 0, 0, 1])
     }
 
     func testAbsoluteRecoveryCallerCancellationDrainsStopAndRetainsFailedLatch() async {
@@ -200,6 +422,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         for boundary in ["pre_stop", "feedback", "pulse_wait"] {
             for failStop in [false, true] {
                 let gate = FollowDiagnosticSuspension()
+                let source = FollowRecoveryDiagnosticSourceFixture()
                 var sends = 0
                 var stops = 0
                 let controller = NavigationController(currentPose: { .init(position: .zero, yaw: 0) },
@@ -210,11 +433,15 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                         if boundary == "pre_stop", stops == 1 { await gate.suspend() }
                         if Task.isCancelled { throw CancellationError() }
                         if failStop, FollowMotionTaskScope.evidence?.fenced == true { throw URLError(.cannotConnectToHost) }
-                    }, sleep: { duration in if boundary == "pulse_wait", Self.seconds(duration) == 0.2 { await gate.suspend() } },
-                    poseSample: { .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 4, sequence: 10),
-                        sourceTimestamp: 8, trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { 8 })
+                    }, sleep: { duration in
+                        if boundary == "pulse_wait", sends == 1, stops == 1, !gate.entered { await gate.suspend() }
+                        await source.advance(duration)
+                    }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                    sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+                source.controller = controller
                 let request = FollowRecoveryHeadingRequest(stageHeading: 0.3,
-                    authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12, now: { 8 }, canContinue: { true }))
+                    authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
+                        now: { source.uptime }, canContinue: { true }))
                 let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 11, purpose: .followScan, phase: "reacquiring")
                 let motion = NavigationFollowMeMotion(navigation: controller)
                 let caller = Task { await motion.performRecoveryHeading(request, context: context) }
@@ -238,18 +465,23 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testRecoveryRevalidatesSourceAgeImmediatelyBeforeEachMotorSend() async {
         var counts: [Int] = []
         for purpose in [FollowMotionPurpose.followScan, .followAlignment, .followReady] {
-            var pose = Pose2D(position: .zero, yaw: 0)
-            var time = 8.0
+            let source = FollowRecoveryDiagnosticSourceFixture()
             var sends = 0
-            let controller = NavigationController(currentPose: { pose }, forwardClearance: { time = 8.501; return 2 },
+            var guardReads = 0
+            let expireOnRead = purpose == .followReady ? 1 : 3
+            let controller = NavigationController(currentPose: { source.pose }, forwardClearance: {
+                guardReads += 1
+                if guardReads == expireOnRead { source.uptime += 0.501 }
+                return 2
+            },
                 plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in
-                    sends += 1; pose = .init(position: Vec2(0.1, 0), yaw: purpose == .followReady ? 0 : 0.3)
-                }, stopRover: {}, sleep: { _ in }, poseSample: {
-                    .init(pose: pose, frameID: .init(generation: 4, sequence: 10), sourceTimestamp: 8,
-                        trackingQuality: .normal, source: "synthetic_ar")
-                }, sourceNow: { time })
+                    sends += 1
+                    source.pose = .init(position: Vec2(0.1, 0), yaw: purpose == .followReady ? 0 : 0.3)
+                }, stopRover: {}, sleep: source.advance, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let authorization = FollowRecoveryAuthorization(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
-                now: { time }, canContinue: { true })
+                now: { source.uptime }, canContinue: { true })
             let motion = NavigationFollowMeMotion(navigation: controller)
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 9, purpose: purpose, phase: "recovery")
             if purpose == .followScan {
@@ -258,6 +490,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                 _ = await motion.performContextual(purpose == .followReady ? .ready : .alignment(0.3), context: context, recovery: authorization)
             }
             counts.append(sends)
+            XCTAssertGreaterThanOrEqual(guardReads, expireOnRead, "Must reach the intended pre-send guard")
         }
         XCTAssertEqual(counts, [0, 0, 0])
     }
@@ -265,19 +498,26 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testIncompleteRecoveryCannotRestoreFromGenerationChangedDuringFinalStop() async {
         var results: [NavigationResult] = []
         for request in [FollowMotionRequest.alignment(0.3), .ready] {
-            var pose = Pose2D(position: .zero, yaw: 0)
-            var generation: UInt64 = 4
+            let source = FollowRecoveryDiagnosticSourceFixture()
             var stops = 0
-            let controller = NavigationController(currentPose: { pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
+            var sends = 0
+            let controller = NavigationController(currentPose: { source.pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
                 lastAckAt: { Date() }, sendCommand: { _ in
-                    pose = .init(position: Vec2(0.1, 0), yaw: request.purpose == .followAlignment ? 0.3 : 0)
-                }, stopRover: { stops += 1; await Task.yield(); if stops >= 2 { generation = 5 } }, sleep: { _ in },
-                poseSample: { .init(pose: pose, frameID: .init(generation: generation, sequence: 10), sourceTimestamp: 8,
-                    trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { 8 })
+                    sends += 1
+                    source.pose = .init(position: Vec2(0.1, 0), yaw: request.purpose == .followAlignment ? 0.3 : 0)
+                    source.capture(after: 0.001)
+                }, stopRover: {
+                    stops += 1; await Task.yield()
+                    if stops >= 2 { source.generation = 5; source.capture(after: 0.001) }
+                }, sleep: source.advance, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let authorization = FollowRecoveryAuthorization(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
-                now: { 8 }, canContinue: { true })
+                now: { source.uptime }, canContinue: { true })
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 8, purpose: request.purpose, phase: "recovery")
             results.append(await NavigationFollowMeMotion(navigation: controller).performContextual(request, context: context, recovery: authorization).result)
+            XCTAssertEqual(sends, 1)
+            XCTAssertEqual(stops, 2, "Generation fault must reach the actual terminal stop")
         }
         XCTAssertEqual(results, [.failed(.trackingLost), .failed(.trackingLost)])
     }
@@ -285,30 +525,37 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testRecoveryCannotClaimArrivalFromSourceInvalidatedDuringFinalStop() async {
         var outcomes: [Bool] = []
         for fault in ["age", "generation", "future"] {
-            var yaw = 0.0
-            var time = 8.0
-            var sourceTime = 8.0
-            var generation: UInt64 = 4
+            let source = FollowRecoveryDiagnosticSourceFixture()
             var stops = 0
-            let controller = NavigationController(currentPose: { .init(position: .zero, yaw: yaw) },
+            var sends = 0
+            let controller = NavigationController(currentPose: { source.pose },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
-                sendCommand: { _ in yaw = 0.3 }, stopRover: {
+                sendCommand: { _ in
+                    sends += 1
+                    source.pose = .init(position: .zero, yaw: 0.3)
+                    source.capture(after: 0.001)
+                }, stopRover: {
                     stops += 1; await Task.yield()
-                    if stops == 4 {
-                        if fault == "age" { time = 8.501 }
-                        if fault == "generation" { generation = 5 }
-                        if fault == "future" { sourceTime = 8.001 }
+                    if stops == 2 {
+                        if fault == "age" { source.uptime += 0.501 }
+                        if fault == "generation" { source.generation = 5; source.capture(after: 0.001) }
+                        if fault == "future" {
+                            source.snapshot = .init(pose: source.pose, frameID: .init(generation: 4, sequence: 99),
+                                sourceTimestamp: source.uptime + 0.001, trackingQuality: .normal)
+                            source.controller?.ingestFollowTurnSource(source.snapshot)
+                        }
                     }
-                }, sleep: { _ in }, poseSample: {
-                    .init(pose: .init(position: .zero, yaw: yaw), frameID: .init(generation: generation, sequence: 10),
-                        sourceTimestamp: sourceTime, trackingQuality: .normal, source: "synthetic_ar")
-                }, sourceNow: { time })
+                }, sleep: source.advance, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let request = FollowRecoveryHeadingRequest(stageHeading: 0.3, authorization: .init(episodeID: UUID(),
-                expectedGeneration: 4, deadline: 12, now: { time }, canContinue: { true }))
+                expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }))
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 7, purpose: .followScan, phase: "reacquiring")
             let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
             outcomes.append(result.result == .failed(.trackingLost) && result.recovery?.stageArrived == nil
                 && result.recovery?.segmentArrived == false && result.stopOutcome == .confirmed)
+            XCTAssertEqual(sends, 1)
+            XCTAssertEqual(stops, 2)
         }
         XCTAssertEqual(outcomes, [true, true, true])
     }
@@ -330,29 +577,31 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         var outcomes: [Int] = []
         for request in [FollowMotionRequest.alignment(0.3), .ready] {
             for fault in ["deadline", "ownership", "source_generation"] {
-                var pose = Pose2D(position: .zero, yaw: 0)
-                var time = 8.0
+                let source = FollowRecoveryDiagnosticSourceFixture()
                 var allowed = true
-                var generation: UInt64 = 4
                 var sends = 0
-                let controller = NavigationController(currentPose: { pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
+                var feedbackReads = 0
+                let controller = NavigationController(currentPose: { source.pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
                     lastAckAt: {
                         await Task.yield()
-                        if fault == "deadline" { time = 12 }
+                        feedbackReads += 1
+                        if fault == "deadline" { source.uptime = 12 }
                         if fault == "ownership" { allowed = false }
-                        if fault == "source_generation" { generation = 5 }
+                        if fault == "source_generation" { source.generation = 5; source.capture(after: 0.001) }
                         return Date()
                     }, sendCommand: { _ in
                         sends += 1
-                        pose = .init(position: Vec2(0.1, 0), yaw: request.purpose == .followAlignment ? 0.3 : 0)
-                    }, stopRover: {}, sleep: { _ in },
-                    poseSample: { .init(pose: pose, frameID: .init(generation: generation, sequence: 10), sourceTimestamp: time,
-                        trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { time })
+                        source.pose = .init(position: Vec2(0.1, 0), yaw: request.purpose == .followAlignment ? 0.3 : 0)
+                    }, stopRover: {}, sleep: source.advance,
+                    poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                    sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+                source.controller = controller
                 let authorization = FollowRecoveryAuthorization(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
-                    now: { time }, canContinue: { allowed })
+                    now: { source.uptime }, canContinue: { allowed })
                 let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 5, purpose: request.purpose, phase: "recovery")
                 _ = await NavigationFollowMeMotion(navigation: controller).performContextual(request, context: context, recovery: authorization)
                 outcomes.append(sends)
+                XCTAssertGreaterThan(feedbackReads, 0, "Fault must occur at the actual feedback await")
             }
         }
         XCTAssertEqual(outcomes, [0, 0, 0, 0, 0, 0])
@@ -362,6 +611,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         var outcomes: [Int] = []
         for boundary in ["pre_stop", "feedback", "detection", "send", "pulse_wait", "settle", "final_stop", "nonfinite_heading"] {
             var time = 8.0
+            let source = FollowRecoveryDiagnosticSourceFixture()
             var allowed = true
             var yaw = 0.0
             var stops = 0
@@ -376,13 +626,19 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                 stopRover: {
                     stops += 1; await Task.yield()
                     if boundary == "pre_stop", stops == 1 { time = 12 }
-                    if boundary == "final_stop", stops == 3 { time = 12 }
+                    if boundary == "final_stop", stops == 2 { time = 12 }
                 }, sleep: { duration in
                     await Task.yield()
-                    if (boundary == "pulse_wait" && Self.seconds(duration) == 0.2)
-                        || (boundary == "settle" && Self.seconds(duration) == 0.3) { time = 12 }
-                }, poseSample: { .init(pose: .init(position: .zero, yaw: yaw), frameID: .init(generation: 4, sequence: 10),
-                    sourceTimestamp: time, trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { time })
+                    if sends > 0, (boundary == "pulse_wait" && Self.seconds(duration) <= 0.080 + 1e-12)
+                        || (boundary == "settle" && Self.seconds(duration) >= 0.299) { time = 12 }
+                    let durationSeconds = Self.seconds(duration)
+                    time += durationSeconds
+                    source.uptime = time - durationSeconds
+                    source.pose = .init(position: .zero, yaw: yaw)
+                    source.capture(after: durationSeconds)
+                }, poseSample: { source.snapshot }, sourceNow: { time },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let request = FollowRecoveryHeadingRequest(stageHeading: boundary == "nonfinite_heading" ? .nan : 0.3,
                 authorization: .init(episodeID: UUID(), expectedGeneration: 4, deadline: 12,
                     now: { time }, canContinue: { allowed }))
@@ -397,27 +653,29 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testRecoveryRequiresRealFreshExpectedGenerationAtStopAndAfterFeedback() async {
         var counts: [Int] = []
         for fault in ["wrong_generation", "generation_after_feedback", "aged_after_feedback", "future", "nonfinite", "legacy", "limited"] {
-            var yaw = 0.0
-            var time = 8.0
-            var generation: UInt64 = fault == "wrong_generation" ? 5 : 4
+            let source = FollowRecoveryDiagnosticSourceFixture()
+            source.snapshot = fault == "legacy" ? .legacy(source.pose) : .init(pose: source.pose,
+                frameID: .init(generation: fault == "wrong_generation" ? 5 : 4, sequence: 10),
+                sourceTimestamp: fault == "future" ? 8.001 : (fault == "nonfinite" ? .nan : 8),
+                trackingQuality: fault == "limited" ? .limited : .normal, source: "synthetic_ar")
             var sends = 0
-            let controller = NavigationController(currentPose: { .init(position: .zero, yaw: yaw) },
+            var feedbackReads = 0
+            let controller = NavigationController(currentPose: { source.pose },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
-                    if fault == "generation_after_feedback" { generation = 5 }
-                    if fault == "aged_after_feedback" { time = 8.501 }
+                    feedbackReads += 1
+                    if fault == "generation_after_feedback" { source.generation = 5; source.capture(after: 0.001) }
+                    if fault == "aged_after_feedback" { source.uptime = 8.501 }
                     return Date()
-                }, sendCommand: { _ in sends += 1; yaw = 0.3 }, stopRover: {}, sleep: { _ in },
-                poseSample: {
-                    if fault == "legacy" { return .legacy(.init(position: .zero, yaw: yaw)) }
-                    return .init(pose: .init(position: .zero, yaw: yaw), frameID: .init(generation: generation, sequence: 10),
-                        sourceTimestamp: fault == "future" ? 8.001 : (fault == "nonfinite" ? .nan : 8),
-                        trackingQuality: fault == "limited" ? .limited : .normal, source: "synthetic_ar")
-                }, sourceNow: { time })
+                }, sendCommand: { _ in sends += 1; source.pose = .init(position: .zero, yaw: 0.3) }, stopRover: {}, sleep: source.advance,
+                poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let request = FollowRecoveryHeadingRequest(stageHeading: 0.3, authorization: .init(episodeID: UUID(),
-                expectedGeneration: 4, deadline: 12, now: { time }, canContinue: { true }))
+                expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }))
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 3, purpose: .followScan, phase: "reacquiring")
             _ = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
             counts.append(sends)
+            if fault.hasSuffix("after_feedback") { XCTAssertGreaterThan(feedbackReads, 0) }
         }
         XCTAssertEqual(counts, [0, 0, 0, 0, 0, 0, 0])
     }
@@ -428,40 +686,57 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         var pose = Pose2D(position: .zero, yaw: 0)
         var stops = 0
         var sentYaws: [Double] = []
+        let source = FollowRecoveryDiagnosticSourceFixture()
         let controller = NavigationController(currentPose: { pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
             lastAckAt: { if !feedbackGate.entered { await feedbackGate.suspend() }; return Date() },
             sendCommand: { _ in sentYaws.append(pose.yaw) }, stopRover: {
                 stops += 1; if stops == 1 { await stopGate.suspend() }
-            }, sleep: { duration in if Self.seconds(duration) == 0.3 { pose = .init(position: Vec2(3, 4), yaw: 1.2) } },
-            poseSample: { .init(pose: pose, frameID: .init(generation: 4, sequence: 10), sourceTimestamp: 8,
-                trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { 8 })
+            }, sleep: { duration in
+                if !sentYaws.isEmpty, Self.seconds(duration) >= 0.299 { pose = .init(position: Vec2(3, 4), yaw: 1.2) }
+                source.pose = pose
+                await source.advance(duration)
+            }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let request = FollowRecoveryHeadingRequest(stageHeading: 1.2, authorization: .init(episodeID: UUID(),
-            expectedGeneration: 4, deadline: 12, now: { 8 }, canContinue: { true }))
+            expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }))
         let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "reacquiring")
         let task = Task { await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context) }
         await stopGate.waitUntilEntered()
         pose = .init(position: Vec2(1, 2), yaw: 0.2)
+        source.pose = pose
+        source.capture(after: 0.001)
         stopGate.release()
         await feedbackGate.waitUntilEntered()
         pose = .init(position: Vec2(2, 3), yaw: 0.8)
+        source.pose = pose
+        source.capture(after: 0.001)
         feedbackGate.release()
         let result = await task.value
         XCTAssertEqual(sentYaws + [result.recovery?.postStopSource.pose?.yaw ?? -1,
             result.recovery?.postStopSource.pose?.position.x ?? -1, result.recovery?.postStopSource.pose?.position.y ?? -1,
             result.recovery?.resolutionSource?.pose?.position.x ?? -1, result.recovery?.resolutionSource?.pose?.position.y ?? -1,
-            result.recovery?.segmentHeading ?? -1], [0.8, 0.2, 1, 2, 2, 3, 1.2],
+            result.recovery?.segmentHeading ?? -1], [0.8, 0.8, 2, 3, 2, 3, 1.2],
             "Fixed stage must use actual post-stop and post-feedback source geometry")
     }
 
     func testRecoveryResultReportsActualSegmentArrivalWithoutClaimingStageArrival() async {
         var pose = Pose2D(position: Vec2(2, 3), yaw: 0)
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.pose = pose
+        source.capture(after: 0)
+        var sent = false
         let controller = NavigationController(currentPose: { pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
-            lastAckAt: { Date() }, sendCommand: { _ in }, stopRover: {},
-            sleep: { duration in if Self.seconds(duration) == 0.3 { pose = .init(position: Vec2(4, 5), yaw: .pi / 6) } },
-            poseSample: { .init(pose: pose, frameID: .init(generation: 4, sequence: 10), sourceTimestamp: 8,
-                trackingQuality: .normal, source: "synthetic_ar") }, sourceNow: { 8 })
+            lastAckAt: { Date() }, sendCommand: { _ in sent = true }, stopRover: {},
+            sleep: { duration in
+                if sent, Self.seconds(duration) >= 0.299 { pose = .init(position: Vec2(4, 5), yaw: .pi / 6) }
+                source.pose = pose
+                await source.advance(duration)
+            }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let request = FollowRecoveryHeadingRequest(stageHeading: 1.2, authorization: .init(episodeID: UUID(),
-            expectedGeneration: 4, deadline: 12, now: { 8 }, canContinue: { true }))
+            expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }))
         let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 2, purpose: .followScan, phase: "reacquiring")
         let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
         XCTAssertEqual([result.recovery?.postStopSource.pose?.position.x, result.recovery?.postStopSource.pose?.position.y,
@@ -518,6 +793,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                 let scanGate = FollowDiagnosticSuspension()
                 let stopGate = FollowDiagnosticSuspension()
                 let replacementSendGate = FollowDiagnosticSuspension()
+                let source = FollowRecoveryDiagnosticSourceFixture()
                 let emitter = FollowDiagnosticEmitter(streamID: "generic-replacement", monotonic: { clock.monotonic },
                     utc: { clock.utc }, sink: sink.append)
                 var pose = Pose2D(position: .zero, yaw: 0)
@@ -536,7 +812,10 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                             await stopGate.suspend()
                             if failStop { throw CancellationError() }
                         }
-                    }, sleep: { _ in await Task.yield() }, diagnosticEmitter: emitter)
+                    }, sleep: source.advance, diagnosticEmitter: emitter,
+                    poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                    sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+                source.controller = controller
                 let caller = Task { await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3) }
                 await scanGate.waitUntilEntered()
                 caller.cancel()
@@ -576,20 +855,29 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         var replacement: Task<FollowMotionResult, Never>?
         var yaw = 0.0
         var oldIndependentStops = 0
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        var newSends = 0
         let emitter = FollowDiagnosticEmitter(streamID: "queued-cancellation", monotonic: { clock.monotonic },
             utc: { clock.utc }, sink: { event, fields in
                 sink.append(event, fields: fields)
                 if event == "follow_scan.cancel" { beginReplacement?(); beginReplacement = nil }
             })
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
-            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil }, sendCommand: { _ in
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in
                 if FollowMotionTaskScope.evidence?.context.request?.requestToken == 801 { await sendGate.suspend() }
+                else { newSends += 1 }
             }, stopRover: {
                 if Task.isCancelled { throw CancellationError() }
                 if FollowMotionTaskScope.evidence?.context.request?.requestToken == 801 { oldIndependentStops += 1 }
                 if FollowMotionTaskScope.evidence?.context.request?.requestToken == 802,
                    !replacementStopGate.entered { await replacementStopGate.suspend() }
-            }, sleep: { duration in if Self.seconds(duration) == 0.3 { yaw = 0.3 } }, diagnosticEmitter: emitter)
+            }, sleep: { duration in
+                if newSends > 0, Self.seconds(duration) >= 0.299 { yaw = 0.3 }
+                source.pose = .init(position: .zero, yaw: yaw)
+                await source.advance(duration)
+            }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let motion = NavigationFollowMeMotion(navigation: controller)
         let oldContext = FollowMotionRequestContext(sessionGeneration: 41, requestToken: 801,
             purpose: .followScan, phase: "searching")
@@ -633,6 +921,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                 var pose = Pose2D(position: .zero, yaw: 0)
                 var sends = 0
                 var independentStops = 0
+                let source = FollowRecoveryDiagnosticSourceFixture()
                 let controller = NavigationController(currentPose: { pose }, forwardClearance: { 2 },
                     plan: { _, goal in [goal] }, lastAckAt: {
                         if boundary == "ack", !gate.entered { await gate.suspend() }
@@ -650,7 +939,10 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     }, stopRover: {
                         if Task.isCancelled { throw CancellationError() }
                         if FollowMotionTaskScope.evidence?.fenced == true { independentStops += 1 }
-                    }, sleep: { _ in await Task.yield() })
+                    }, sleep: { duration in source.pose = pose; await source.advance(duration) },
+                    poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                    sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+                source.controller = controller
                 let context = FollowMotionRequestContext(sessionGeneration: 32, requestToken: 702,
                     purpose: request.purpose, phase: "captured-phase")
                 let caller = Task { await NavigationFollowMeMotion(navigation: controller).perform(request, context: context) }
@@ -675,6 +967,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let sink = FollowDiagnosticRecordingSink()
             let gate = FollowDiagnosticSuspension()
             let stopGate = FollowDiagnosticSuspension()
+            let source = FollowRecoveryDiagnosticSourceFixture()
             let emitter = FollowDiagnosticEmitter(streamID: boundary, monotonic: { clock.monotonic },
                 utc: { clock.utc }, sink: sink.append)
             var yaw = 0.0
@@ -686,7 +979,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
                     if boundary == "ack_read", !gate.entered { await gate.suspend() }
-                    return nil
+                    return Date()
                 },
                 sendCommand: { _ in
                     sends += 1
@@ -695,7 +988,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     stops += 1
                     let fencedAtEntry = FollowMotionTaskScope.evidence?.fenced == true
                     if (boundary == "pulse_stop" && stops == 2)
-                        || (boundary == "final_confirmation" && stops == 5) { await gate.suspend() }
+                         || (boundary == "final_confirmation" && stops == 3) { await gate.suspend() }
                     // A cancelled loop's cleanup is deliberately not an acknowledgement.
                     if Task.isCancelled { throw CancellationError() }
                     if fencedAtEntry {
@@ -703,20 +996,29 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                         if failIndependentStop { throw CancellationError() }
                     }
                 }, sleep: { duration in
+                    if boundary == "ack_read", gate.entered {
+                        // Read-only safety deadline, not a motor/settle stage.
+                        try? await Task.sleep(for: duration)
+                        return
+                    }
                     let seconds = Self.seconds(duration)
                     waits.append(seconds)
-                    if (boundary == "pulse_wait" && seconds == 0.2 && waits.count == 1)
-                        || (boundary == "settle" && seconds == 0.3 && settles == 0) {
+                    if (boundary == "pulse_wait" && sends == 1 && stops == 1)
+                        || (boundary == "settle" && seconds >= 0.299 && stops == 2) {
                         await gate.suspend()
                     }
                     // Bound the unfixed loop: it naturally arrives on its second pulse,
                     // so missing propagation fails assertions instead of hanging red.
-                    if seconds == 0.3 { settles += 1; if settles == 2 { yaw = 0.3 } }
-                }, diagnosticEmitter: emitter)
+                    if seconds >= 0.299 { settles += 1; if settles >= 2 { yaw = settles == 2 ? 0.25 : 0.6 } }
+                    source.pose = .init(position: .zero, yaw: yaw)
+                    await source.advance(duration)
+                }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let request = FollowMotionRequestContext(sessionGeneration: 31, requestToken: 701,
                 purpose: .followScan, phase: "reacquiring")
             let caller = Task {
-                let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context: request)
+                let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.6), context: request)
                 completed = true
                 return result
             }
@@ -734,15 +1036,20 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             stopGate.release()
             let result = await caller.value
             XCTAssertEqual(result.context.request, request)
-            XCTAssertEqual(result.context.profile?.pulseWait, 0.2)
+            XCTAssertEqual(result.context.profile?.pulseWait, 0.080)
             let expectedSends = boundary == "ack_read" ? 0 : (boundary == "final_confirmation" ? 2 : 1)
             XCTAssertEqual(sends, expectedSends, "Caller cancellation alone inhibits subsequent nonzero commands: \(boundary)")
             XCTAssertEqual(result.result, failIndependentStop ? .failed(.commandFailed) : .cancelled)
             XCTAssertEqual(result.stopOutcome, failIndependentStop ? .failed : .confirmed)
-            if boundary == "send" || boundary == "ack_read" { XCTAssertTrue(waits.isEmpty) }
-            if boundary == "pulse_wait" || boundary == "pulse_stop" { XCTAssertEqual(waits, [0.2]) }
-            if boundary == "settle" { XCTAssertEqual(waits, [0.2, 0.3]) }
-            if boundary == "final_confirmation" { XCTAssertEqual(waits, [0.2, 0.3, 0.2, 0.3]) }
+            if boundary == "ack_read" { XCTAssertTrue(waits.isEmpty) }
+            if boundary == "send" {
+                XCTAssertFalse(try records(sink).contains { $0["event"] as? String == "follow_scan.pulse_wait_begin" },
+                    "Pending budget monitors are not an added motor wait")
+            }
+            if boundary == "pulse_wait" || boundary == "pulse_stop" { XCTAssertEqual(waits.count, 2) }
+            if boundary == "settle" { XCTAssertEqual(waits.count, 3) }
+            if boundary == "final_confirmation" { XCTAssertEqual(waits.count, 4) }
+            for wait in waits where wait < 0.299 { XCTAssertGreaterThan(wait, 0); XCTAssertLessThanOrEqual(wait, 0.080 + 1e-12) }
             let events = try records(sink)
             let response = try XCTUnwrap(events.last { $0["event"] as? String == "follow_scan.stop_response" })
             XCTAssertEqual(response["stop_origin"] as? String, "independent")
@@ -797,53 +1104,71 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
 
     func testWatchdogCheckpointTimeIsObservationBoundaryNotEarlierPoseRead() async throws {
         let clock = FollowDiagnosticTestClock()
+        let source = FollowRecoveryDiagnosticSourceFixture()
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "checkpoint-latency", monotonic: { clock.monotonic },
             utc: { clock.utc }, sink: sink.append)
         var yaw = 0.0
+        var reads = 0
+        var sent = false
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
-                clock.monotonic += 0.4
-                return nil
-            }, sendCommand: { _ in }, stopRover: {}, sleep: { duration in
+                reads += 1
+                if reads == 3 { clock.monotonic += 0.4 }
+                return clock.utc.addingTimeInterval(clock.monotonic)
+            }, sendCommand: { _ in sent = true }, stopRover: {}, sleep: { duration in
                 clock.monotonic += Self.seconds(duration)
-                if Self.seconds(duration) == 0.3 { yaw = 0.3 }
-            }, now: { Date(timeIntervalSince1970: clock.monotonic) }, diagnosticEmitter: emitter)
+                if sent, Self.seconds(duration) >= 0.299 { yaw = 0.3 }
+                source.pose = .init(position: .zero, yaw: yaw)
+                await source.advance(duration)
+            }, now: { clock.utc.addingTimeInterval(clock.monotonic) }, diagnosticEmitter: emitter,
+            poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+            sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
         XCTAssertEqual(result, .arrived)
         let pulse = try XCTUnwrap(records(sink).first { $0["event"] as? String == "follow_scan.pulse_begin" })
-        XCTAssertEqual(try XCTUnwrap(pulse["watchdog_checkpoint_monotonic_s"] as? Double), 0.4, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(pulse["watchdog_checkpoint_monotonic_s"] as? Double), 0.3, accuracy: 1e-12)
         XCTAssertEqual(pulse["watchdog_checkpoint_yaw_rad"] as? Double, 0)
-        XCTAssertEqual(pulse["watchdog_elapsed_s"] as? Double, 0)
+        XCTAssertEqual(try XCTUnwrap(pulse["watchdog_elapsed_s"] as? Double), 0.4, accuracy: 1e-6,
+            "Post-checkpoint feedback await consumes the unchanged epoch")
     }
 
     func testCompletedPulseTraceUsesExistingSamplesExactHostTimingAndCapturedContext() async throws {
         let clock = FollowDiagnosticTestClock()
+        let source = FollowRecoveryDiagnosticSourceFixture()
         let sink = FollowDiagnosticRecordingSink()
-        let emitter = FollowDiagnosticEmitter(streamID: "controller-test", monotonic: { clock.monotonic },
+        let emitter = FollowDiagnosticEmitter(streamID: "controller-test", monotonic: { source.uptime },
             utc: { clock.utc }, sink: sink.append)
-        var yaw = 0.0
         var reads = 0
-        let controller = NavigationController(currentPose: {
-            reads += 1; return Pose2D(position: .zero, yaw: yaw)
-        }, forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil },
-            sendCommand: { _ in clock.monotonic += 0.04 }, stopRover: { clock.monotonic += 0.01 },
-            sleep: { clock.monotonic += Self.seconds($0); if Self.seconds($0) == 0.3 { yaw = 0.3 } },
-            diagnosticEmitter: emitter)
+        var sends = 0
+        let controller = NavigationController(currentPose: { XCTFail("Enriched trace cannot read legacy pose"); return nil },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
+            sendCommand: { _ in sends += 1; source.uptime += 0.04 }, stopRover: { source.uptime += 0.01 },
+            sleep: { duration in
+                if sends > 0, Self.seconds(duration) >= 0.299 { source.pose = .init(position: .zero, yaw: 0.3) }
+                await source.advance(duration)
+            }, diagnosticEmitter: emitter, poseSample: { reads += 1; return source.snapshot },
+            sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let request = FollowMotionRequestContext(sessionGeneration: 9, requestToken: 901,
             purpose: .followScan, phase: "reacquiring", scanUsed: 1.2, scanRemaining: nil)
         let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context: request)
         XCTAssertEqual(result.result, .arrived)
-        XCTAssertEqual(reads, 3, "Telemetry must reuse start, pre-pulse and next evaluation samples")
+        XCTAssertEqual(reads, 1, "Telemetry must reuse the captured ingress samples")
         let events = try records(sink)
         XCTAssertEqual(events.compactMap { $0["event"] as? String }, [
             "follow_scan.operation_begin", "follow_scan.stop_begin", "follow_scan.stop_response",
+            "follow_scan.settle_begin", "follow_scan.stopped_source_rejected", "follow_scan.stopped_source_accepted", "follow_scan.settle_end",
+            "follow_scan.burst_plan",
             "follow_scan.pulse_begin", "follow_scan.send_begin", "follow_scan.send_ack",
-            "follow_scan.pulse_wait_begin", "follow_scan.pulse_wait_end",
+            "follow_scan.pulse_wait_begin", "follow_scan.burst_wait_end", "follow_scan.pulse_wait_end",
+            "follow_scan.burst_stop_obligation",
             "follow_scan.stop_begin", "follow_scan.stop_response",
-            "follow_scan.settle_begin", "follow_scan.settle_end", "follow_scan.pulse_complete",
-            "follow_scan.stop_begin", "follow_scan.stop_response",
-            "follow_scan.stop_begin", "follow_scan.stop_response", "follow_scan.operation_complete"
+            "follow_scan.burst_stop_confirmed",
+            "follow_scan.settle_begin", "follow_scan.stopped_source_rejected", "follow_scan.stopped_source_accepted", "follow_scan.settle_end", "follow_scan.pulse_complete",
+            "follow_scan.burst_response", "follow_scan.burst_plan",
+            "follow_scan.operation_complete"
         ])
         for event in events {
             XCTAssertEqual(event["session_generation"] as? Int, 9)
@@ -859,25 +1184,26 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(pulse["signed_yaw_delta_rad"] as? Double, 0.3)
         XCTAssertEqual(pulse["error_improvement_rad"] as? Double, 0.3)
         XCTAssertEqual(pulse["post_yaw_rad_display"] as? String, "+0.300000")
-        XCTAssertEqual(pulse["profile_pulse_wait_s"] as? Double, 0.2)
+        XCTAssertEqual(pulse["profile_pulse_wait_s"] as? Double, 0.080)
         XCTAssertEqual(pulse["profile_settle_s"] as? Double, 0.3)
         XCTAssertEqual(pulse["profile_wheel_cap_mps"] as? Double, 0.25)
         XCTAssertEqual(pulse["profile_wheel_floor_mps"] as? Double, 0.25)
         XCTAssertEqual(pulse["profile_command_law"] as? String, "fixed_signed_magnitude")
         XCTAssertEqual(pulse["profile_yaw_gain_active"] as? Bool, false)
         XCTAssertEqual(pulse["profile_yaw_gain"] as? Double, 0.3)
-        XCTAssertEqual(pulse["pose_source_age_status"] as? String, "unknown")
-        XCTAssertEqual(pulse["pose_source_clock"] as? String, "unknown")
-        XCTAssertEqual(pulse["pose_read_clock"] as? String, "host_monotonic")
-        XCTAssertTrue(pulse["pose_source_timestamp"] is NSNull)
-        XCTAssertEqual(pulse["watchdog_progress_rad"] as? Double, 0.3)
+        XCTAssertEqual(pulse["pose_source_age_status"] as? String, "available")
+        XCTAssertEqual(pulse["pose_source_clock"] as? String, "ar_system_uptime")
+        XCTAssertEqual(pulse["pose_read_clock"] as? String, "ar_system_uptime")
+        XCTAssertEqual(pulse["pose_source_timestamp"] as? Double, source.snapshot.sourceTimestamp)
+        XCTAssertEqual(pulse["watchdog_progress_rad"] as? Double, 0,
+            "The actual healthy 0.3-rad advance moved the original checkpoint")
         XCTAssertEqual(pulse["watchdog_required_progress_rad"] as? Double, 0.05)
         XCTAssertEqual(pulse["watchdog_interval_s"] as? Double, 2.5)
         let ack = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.send_ack" })
         XCTAssertEqual(try XCTUnwrap(ack["host_duration_s"] as? Double), 0.04, accuracy: 1e-12)
         XCTAssertTrue(ack["http_status"] is NSNull)
         let wait = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.pulse_wait_end" })
-        XCTAssertEqual(try XCTUnwrap(wait["host_duration_s"] as? Double), 0.2, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(wait["host_duration_s"] as? Double), 0.04, accuracy: 1e-12)
         XCTAssertEqual(events.last?["outcome"] as? String, "completed")
         XCTAssertEqual(events.last?["stop_outcome"] as? String, "confirmed")
         XCTAssertEqual(events.last?["stop_unconfirmed"] as? Bool, false)
@@ -895,6 +1221,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let clock = FollowDiagnosticTestClock()
             let sink = FollowDiagnosticRecordingSink()
             let gate = FollowDiagnosticSuspension()
+            let source = FollowRecoveryDiagnosticSourceFixture()
             let emitter = FollowDiagnosticEmitter(streamID: boundary, monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
             var yaw = 0.0
             var sends = 0
@@ -902,24 +1229,29 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             var waits: [Double] = []
             let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
-                    if boundary == "ack_read" { await gate.suspend() }; return nil
+                    if boundary == "ack_read", !gate.entered { await gate.suspend() }; return Date()
                 }, sendCommand: { _ in
                     sends += 1; if boundary == "send" { await gate.suspend() }
                 }, stopRover: {
                     stops += 1
                     if (boundary == "pre_stop" && stops == 1) || (boundary == "pulse_stop" && stops == 2)
-                        || (boundary == "arrival_stop" && stops == 3) || (boundary == "final_confirmation" && stops == 4) {
+                         || (["arrival_stop", "final_confirmation"].contains(boundary) && stops == 2) {
                         await gate.suspend()
                     }
                 }, sleep: {
                     let duration = Self.seconds($0)
                     waits.append(duration)
-                    if (boundary == "pulse_wait" && duration == 0.2) || (boundary == "settle" && duration == 0.3) {
+                    if (boundary == "pulse_wait" && sends > 0 && stops == 1)
+                        || (boundary == "settle" && duration >= 0.299 && stops == 2) {
                         await gate.suspend()
                     }
                     clock.monotonic += duration
-                    if duration == 0.3 { yaw = 0.3 }
-                }, diagnosticEmitter: emitter)
+                    if duration >= 0.299, sends > 0 { yaw = 0.3 }
+                    source.pose = .init(position: .zero, yaw: yaw)
+                    await source.advance($0)
+                }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let request = FollowMotionRequestContext(sessionGeneration: 10, requestToken: 950, purpose: .followScan, phase: "searching")
             let operation = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context: request) }
             await gate.waitUntilEntered()
@@ -942,14 +1274,17 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             XCTAssertEqual(cancel?["cancel_origin"] as? String, "independent", boundary)
             XCTAssertEqual(events.last(where: { $0["event"] as? String == "follow_scan.operation_complete" })?["outcome"] as? String, "cancelled", boundary)
             if ["pre_stop", "ack_read"].contains(boundary) { XCTAssertEqual(sends, 0, boundary) }
-            if boundary == "send" { XCTAssertEqual(waits, [], "Cancelled send cannot enter pulse wait") }
+            if boundary == "send" {
+                XCTAssertFalse(events.contains { $0["event"] as? String == "follow_scan.pulse_wait_begin" })
+            }
             if ["pulse_wait", "pulse_stop"].contains(boundary) {
-                XCTAssertEqual(waits, [0.2], "Cancelled pulse cannot enter settle")
+                XCTAssertEqual(waits.count, 2, "Initial settle and one burst budget only")
+                XCTAssertEqual(waits[1], 0.080, accuracy: 1e-12)
             }
             if ["pulse_wait", "settle"].contains(boundary) {
                 let name = boundary == "settle" ? "settle" : "pulse_wait"
-                XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.\(name)_end" }.count, 1)
-                XCTAssertEqual(events.first { $0["event"] as? String == "follow_scan.\(name)_end" }?["outcome"] as? String, "interrupted")
+                XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.\(name)_end" }.count, name == "settle" ? 2 : 1)
+                XCTAssertEqual(events.last { $0["event"] as? String == "follow_scan.\(name)_end" }?["outcome"] as? String, "interrupted")
             }
             XCTAssertFalse(events.contains { $0["event"] as? String == "follow_scan.pulse_complete" && $0["stale"] as? Bool == true }, boundary)
             XCTAssertEqual(controller.safetyState, .idle, boundary)
@@ -959,15 +1294,20 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testFailureTracesRetainFailedStageReceiptPrimaryReasonAndLatch() async throws {
         for boundary in ["send", "pulse_stop", "independent_stop", "watchdog"] {
             let clock = FollowDiagnosticTestClock()
+            let source = FollowRecoveryDiagnosticSourceFixture()
             let sink = FollowDiagnosticRecordingSink()
             let emitter = FollowDiagnosticEmitter(streamID: boundary, monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
             var stops = 0
             var sends = 0
             let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { clock.utc.addingTimeInterval(clock.monotonic) },
-                sendCommand: { _ in }, stopRover: {}, sleep: { clock.monotonic += Self.seconds($0) },
+                sendCommand: { _ in }, stopRover: {}, sleep: {
+                    clock.monotonic += Self.seconds($0)
+                    await source.advance($0)
+                },
                 now: { clock.utc.addingTimeInterval(clock.monotonic) }, sendCommandReceipt: { _ in
                     sends += 1
+                    if boundary == "watchdog" { clock.monotonic += 2.5 }
                     let failed = boundary == "send"
                     return .init(receipt: .init(httpStatus: failed ? 503 : 204, acknowledged: !failed,
                         acknowledgementUTC: failed ? nil : clock.utc, attempts: 1, outcome: failed ? "failed" : "acknowledged"),
@@ -978,7 +1318,9 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     return .init(receipt: .init(httpStatus: failed ? 503 : 200, acknowledged: !failed,
                         acknowledgementUTC: failed ? nil : clock.utc, attempts: 1, outcome: failed ? "failed" : "acknowledged"),
                         failure: failed ? RoverControlError.serverError(503) : nil)
-                }, diagnosticEmitter: emitter)
+                }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let result = await controller.rotateForFollowScan(by: 0.3)
             XCTAssertEqual(result, .failed(boundary == "watchdog" ? .stalled : .commandFailed))
             let events = try records(sink)
@@ -1017,28 +1359,39 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
 
     func testPulseSummaryRetainsStageTimingsReceiptClockAndNullableStopCorrelation() async throws {
         let clock = FollowDiagnosticTestClock()
+        let source = FollowRecoveryDiagnosticSourceFixture()
         let sink = FollowDiagnosticRecordingSink()
-        let emitter = FollowDiagnosticEmitter(streamID: "summary", monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
+        let emitter = FollowDiagnosticEmitter(streamID: "summary", monotonic: { source.uptime }, utc: { clock.utc }, sink: sink.append)
         var yaw = 3.10
+        source.pose = .init(position: .zero, yaw: yaw)
+        source.capture(after: 0)
+        var sent = false
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
-            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil }, sendCommand: { _ in }, stopRover: {},
-            sleep: { clock.monotonic += Self.seconds($0); if Self.seconds($0) == 0.3 { yaw = -2.883185307179586 } },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in }, stopRover: {},
+            sleep: { duration in
+                if sent, Self.seconds(duration) >= 0.299 { yaw = -2.883185307179586 }
+                source.pose = .init(position: .zero, yaw: yaw)
+                await source.advance(duration)
+            },
             sendCommandReceipt: { _ in
-                clock.monotonic += 0.04
+                sent = true
+                source.uptime += 0.04
                 return .init(receipt: .init(httpStatus: 202, acknowledged: true,
                     acknowledgementUTC: clock.utc.addingTimeInterval(-0.125), attempts: 2, outcome: "acknowledged"), failure: nil)
-            }, diagnosticEmitter: emitter)
+            }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let result = await controller.rotateForFollowScan(by: 0.3)
         XCTAssertEqual(result, .arrived)
         let events = try records(sink)
         let complete = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.pulse_complete" })
         XCTAssertEqual(try XCTUnwrap(complete["signed_yaw_delta_rad"] as? Double), 0.3, accuracy: 1e-12)
         XCTAssertEqual(try XCTUnwrap(complete["error_improvement_rad"] as? Double), 0.3, accuracy: 1e-12)
-        XCTAssertEqual(complete["watchdog_checkpoint_yaw_rad_display"] as? String, "+3.100000")
-        for (key, expected) in [("send_start_monotonic_s", 0.0), ("send_end_monotonic_s", 0.04),
-                                ("send_host_duration_s", 0.04), ("pulse_wait_start_monotonic_s", 0.04),
-                                ("pulse_wait_end_monotonic_s", 0.24), ("pulse_wait_host_duration_s", 0.2),
-                                ("settle_start_monotonic_s", 0.24), ("settle_end_monotonic_s", 0.54),
+        XCTAssertEqual(complete["watchdog_checkpoint_yaw_rad_display"] as? String, "-2.883185")
+        for (key, expected) in [("send_start_monotonic_s", 8.3), ("send_end_monotonic_s", 8.34),
+                                ("send_host_duration_s", 0.04), ("pulse_wait_start_monotonic_s", 8.34),
+                                ("pulse_wait_end_monotonic_s", 8.38), ("pulse_wait_host_duration_s", 0.04),
+                                ("settle_start_monotonic_s", 8.38), ("settle_end_monotonic_s", 8.68),
                                 ("settle_host_duration_s", 0.3)] {
             XCTAssertEqual(try XCTUnwrap(complete[key] as? Double, key), expected, accuracy: 1e-12)
         }
@@ -1057,14 +1410,25 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         let clock = FollowDiagnosticTestClock()
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "lost", monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
-        var available = true
-        let controller = NavigationController(currentPose: { available ? Pose2D(position: .zero, yaw: 0) : nil },
-            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil }, sendCommand: { _ in }, stopRover: {},
-            sleep: { clock.monotonic += Self.seconds($0); if Self.seconds($0) == 0.3 { available = false } }, diagnosticEmitter: emitter)
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        var sent = false
+        let controller = NavigationController(currentPose: { source.pose },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in sent = true }, stopRover: {},
+            sleep: { duration in
+                clock.monotonic += Self.seconds(duration)
+                if sent, Self.seconds(duration) >= 0.299 {
+                    source.uptime += Self.seconds(duration)
+                    source.snapshot = .init(pose: nil, frameID: .init(generation: 4, sequence: 13),
+                        sourceTimestamp: source.uptime, trackingQuality: .normal)
+                    source.controller?.ingestFollowTurnSource(source.snapshot)
+                } else { await source.advance(duration) }
+            }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let result = await controller.rotateForFollowScan(by: 0.3)
         XCTAssertEqual(result, .failed(.trackingLost))
         let events = try records(sink)
-        let end = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.settle_end" })
+        let end = try XCTUnwrap(events.last { $0["event"] as? String == "follow_scan.settle_end" })
         XCTAssertEqual(end["outcome"] as? String, "completed")
         XCTAssertTrue(end["post_yaw_rad"] is NSNull)
         let failure = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.failure" })
@@ -1083,10 +1447,12 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let emitter = FollowDiagnosticEmitter(streamID: "watchdog", monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
             var yaw = 0.0
             var pulses = 0
+            var sends = 0
+            let source = FollowRecoveryDiagnosticSourceFixture()
             let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { clock.utc.addingTimeInterval(clock.monotonic) },
-                sendCommand: { _ in }, stopRover: {}, sleep: {
-                    if Self.seconds($0) == 0.3 {
+                sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { duration in
+                    if sends > 0, Self.seconds(duration) >= 0.299 {
                         pulses += 1
                         if !adequate {
                             clock.monotonic = pulses == 1 ? 2.499 : 2.5
@@ -1095,8 +1461,21 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                             clock.monotonic = pulses == 1 ? 2.5 : (pulses == 2 ? 4.999 : 5)
                             yaw = pulses == 1 ? 0.05 : 0
                         }
+                    } else if sends > 0 {
+                        clock.monotonic += Self.seconds(duration)
+                        let terminalTick = adequate ? 5.0 : 2.5
+                        if abs(clock.monotonic - terminalTick) < 1e-12 {
+                            // Publish the exact simulated Date deadline tick;
+                            // sub-ULP uptime arithmetic cannot drive this clock.
+                            clock.monotonic = terminalTick
+                        }
                     }
-                }, now: { clock.utc.addingTimeInterval(clock.monotonic) }, diagnosticEmitter: emitter)
+                    source.pose = .init(position: .zero, yaw: yaw)
+                    await source.advance(duration)
+                }, now: { clock.utc.addingTimeInterval(clock.monotonic) }, diagnosticEmitter: emitter,
+                poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+                sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let result = await controller.rotateForFollowScan(by: 1)
             XCTAssertEqual(result, .failed(.stalled))
             let events = try records(sink)
@@ -1111,7 +1490,8 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                 XCTAssertEqual(starts[1]["watchdog_checkpoint_yaw_rad"] as? Double, 0.05)
                 XCTAssertEqual(starts[1]["watchdog_elapsed_s"] as? Double, 0)
                 let completions = events.filter { $0["event"] as? String == "follow_scan.pulse_complete" }
-                XCTAssertEqual(try XCTUnwrap(completions[1]["error_improvement_rad"] as? Double), -0.05, accuracy: 1e-12)
+                XCTAssertGreaterThanOrEqual(completions.count, 2)
+                if completions.count >= 2 { XCTAssertEqual(try XCTUnwrap(completions[1]["error_improvement_rad"] as? Double), -0.05, accuracy: 1e-12) }
             } else {
                 XCTAssertEqual(try XCTUnwrap(starts[1]["watchdog_elapsed_s"] as? Double), 2.499, accuracy: 1e-12)
             }
@@ -1126,13 +1506,16 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let gate = FollowDiagnosticSuspension()
             var stops = 0
             var sends = 0
+            let source = FollowRecoveryDiagnosticSourceFixture()
             let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
-                forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil }, sendCommand: { _ in sends += 1 },
+                forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in sends += 1 },
                 stopRover: {
                     stops += 1
                     if stops == 2 { await gate.suspend(); throw URLError(.cancelled) }
                     if stops == 3 && independentFails { throw URLError(.cannotConnectToHost) }
-                }, sleep: { _ in }, diagnosticEmitter: emitter)
+                }, sleep: source.advance, diagnosticEmitter: emitter, poseSample: { source.snapshot },
+                sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let scan = Task { await controller.rotateForFollowScan(by: 0.3) }
             await gate.waitUntilEntered()
             var stopEntered = false
@@ -1236,9 +1619,8 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "detection", monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
         let gate = FollowDiagnosticSuspension()
-        let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
-            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil }, sendCommand: { _ in }, stopRover: {},
-            sleep: { if Self.seconds($0) == 0.2 { await gate.suspend() } }, diagnosticEmitter: emitter)
+        let controller = makeFollowController(pose: { 0 }, send: { _ in },
+            sleep: { if Self.seconds($0) <= 0.080 + 1e-12 { await gate.suspend() } }, diagnosticEmitter: emitter)
         let motion = NavigationFollowMeMotion(navigation: controller)
         let scan = Task { await motion.rotateForScan(by: 0.3) }
         await gate.waitUntilEntered()
@@ -1266,9 +1648,10 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "availability", monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
         var yaw = 0.0
-        let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
-            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil }, sendCommand: { _ in }, stopRover: {},
-            sleep: { clock.monotonic += Self.seconds($0); if Self.seconds($0) == 0.3 { yaw = 0.3 } }, diagnosticEmitter: emitter)
+        let controller = makeFollowController(pose: { yaw }, send: { _ in }, sleep: {
+            clock.monotonic += Self.seconds($0)
+            if Self.seconds($0) >= 0.299 { yaw = 0.3 }
+        }, diagnosticEmitter: emitter)
         let result = await controller.rotateForFollowScan(by: 0.3)
         XCTAssertEqual(result, .arrived)
         let events = try records(sink)
@@ -1283,7 +1666,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(ack["acknowledged_availability"] as? String, "unknown")
         XCTAssertEqual(ack["command_ack_age_s_availability"] as? String, "unknown")
         let complete = try XCTUnwrap(events.last)
-        XCTAssertEqual(complete["last_reached_stage"] as? String, "final_stop")
+        XCTAssertEqual(complete["last_reached_stage"] as? String, "settle", "No unentered wrapper stop may be reported")
         XCTAssertEqual(complete["final_yaw_rad_display"] as? String, "+0.300000")
         XCTAssertEqual(complete["final_error_rad_display"] as? String, "+0.000000")
         XCTAssertEqual(complete["profile_angular_tolerance_rad_display"] as? String, "+0.122173")
@@ -1319,15 +1702,18 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
 
     func testPulseStopFailureDeliveryCapturesAuthoritativeUnconfirmedLatch() async {
         var stops = 0
+        let source = FollowRecoveryDiagnosticSourceFixture()
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
-            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil },
-            sendCommand: { _ in }, stopRover: {}, sleep: { _ in }, stopRoverReceipt: {
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
+            sendCommand: { _ in }, stopRover: {}, sleep: source.advance, stopRoverReceipt: {
                 stops += 1
                 let failed = stops == 2
                 return .init(receipt: .init(httpStatus: failed ? 503 : 200, acknowledged: !failed,
                     acknowledgementUTC: failed ? nil : Date(), attempts: 1, outcome: failed ? "failed" : "acknowledged"),
                     failure: failed ? RoverControlError.serverError(503) : nil)
-            })
+            }, poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+            sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let motion = NavigationFollowMeMotion(navigation: controller)
         let stream = motion.motionFailures()
         let first = Task { () -> FollowMotionFailureDelivery? in
@@ -1425,8 +1811,8 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(second.result, .failed(.commandFailed))
         XCTAssertEqual(first.context.request, older)
         XCTAssertEqual(second.context.request, newer)
-        XCTAssertEqual(first.context.profile?.pulseWait, 0.200)
-        XCTAssertNil(second.context.profile)
+        XCTAssertEqual(first.context.profile?.pulseWait, 0.080)
+        XCTAssertEqual(second.context.profile?.angularTolerance, 0.05)
         XCTAssertNil(first.context.targetYaw)
         XCTAssertNil(second.context.targetYaw)
         XCTAssertTrue(first.failure?.stale == true)
@@ -1438,19 +1824,22 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
 
     func testNonzeroAckDoesNotReusePreStopConfirmationAndStopFailureRetainsStall() async {
         var elapsed = 0.0
+        let source = FollowRecoveryDiagnosticSourceFixture()
         let epoch = Date(timeIntervalSince1970: 1000)
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { epoch.addingTimeInterval(elapsed) },
-            sendCommand: { _ in }, stopRover: {}, sleep: { elapsed += Self.seconds($0) },
+            sendCommand: { _ in }, stopRover: {}, sleep: { elapsed += Self.seconds($0); await source.advance($0) },
             now: { epoch.addingTimeInterval(elapsed) },
-            sendCommandReceipt: { _ in .init(receipt: .init(httpStatus: 200, acknowledged: true,
+            sendCommandReceipt: { _ in elapsed += 2.5; return .init(receipt: .init(httpStatus: 200, acknowledged: true,
                 acknowledgementUTC: epoch.addingTimeInterval(elapsed), attempts: 1, outcome: "acknowledged"), failure: nil) },
             stopRoverReceipt: {
                 let failed = elapsed >= 2.5
                 return .init(receipt: .init(httpStatus: failed ? 503 : 200, acknowledged: !failed,
                     acknowledgementUTC: failed ? nil : epoch.addingTimeInterval(elapsed), attempts: 1,
                     outcome: failed ? "failed" : "acknowledged"), failure: failed ? RoverControlError.serverError(503) : nil)
-            })
+            }, poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+            sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let motion = NavigationFollowMeMotion(navigation: controller)
         let stream = motion.motionFailures()
         let first = Task { () -> FollowMotionFailureDelivery? in
@@ -1489,7 +1878,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(result.result, .cancelled)
         XCTAssertEqual(result.context.request, request)
         XCTAssertEqual(result.context.purpose, .followScan)
-        XCTAssertEqual(result.context.profile?.pulseWait, 0.200)
+        XCTAssertEqual(result.context.profile?.pulseWait, 0.080)
         XCTAssertEqual(result.context.requestedRotation, -0.3)
         XCTAssertNil(result.context.targetYaw)
         XCTAssertNotNil(result.context.controllerOperationID)
@@ -1516,11 +1905,11 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(first.result, .cancelled)
         XCTAssertEqual(first.context.request, older)
         XCTAssertEqual(first.context.purpose, .followScan)
-        XCTAssertEqual(first.context.profile?.pulseWait, 0.200)
-        XCTAssertEqual(second.result, .failed(.noPose))
+        XCTAssertEqual(first.context.profile?.pulseWait, 0.080)
+        XCTAssertEqual(second.result, .failed(.trackingLost))
         XCTAssertEqual(second.context.request, newer)
         XCTAssertEqual(second.context.purpose, .followAlignment)
-        XCTAssertNil(second.context.profile)
+        XCTAssertEqual(second.context.profile?.angularTolerance, 0.05)
         XCTAssertNotEqual(first.context.controllerOperationID, second.context.controllerOperationID)
     }
 
@@ -1538,19 +1927,23 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                 purpose: request.purpose, phase: "captured_phase")
             let result = await motion.perform(request, context: context)
             let delivery = await streamed.value
-            XCTAssertEqual(result.result, .failed(.noPose))
+            let reason: NavigationFailure = request.purpose == .followScan || request.purpose == .followAlignment
+                ? .trackingLost : .noPose
+            XCTAssertEqual(result.result, .failed(reason))
             XCTAssertEqual(result.context.request, context)
             XCTAssertEqual(result.context.purpose, request.purpose)
-            XCTAssertEqual(result.context.profile != nil, request.purpose == .followScan)
+            XCTAssertEqual(result.context.profile != nil, request.purpose == .followScan || request.purpose == .followAlignment)
             XCTAssertEqual(result.context.requestedRotation, request.requestedRotation)
             XCTAssertNil(result.context.targetYaw)
             XCTAssertEqual(result.context, delivery?.context)
-            XCTAssertEqual(delivery?.reason, .noPose)
+            XCTAssertEqual(delivery?.reason, reason)
         }
     }
 
     func testControllerUsesReturnedReceiptSnapshotsWithoutCallingVoidTransport() async {
         var yaw = 0.0
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        var sent = false
         var legacySends = 0
         var legacyStops = 0
         let commandAck = Date(timeIntervalSince1970: 123)
@@ -1558,11 +1951,18 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
             sendCommand: { _ in legacySends += 1 }, stopRover: { legacyStops += 1 },
-            sleep: { _ in yaw = 0.3 },
-            sendCommandReceipt: { _ in .init(receipt: .init(httpStatus: 204, acknowledged: true,
+            sleep: { duration in
+                if sent, Self.seconds(duration) >= 0.299 { yaw = 0.3 }
+                source.pose = .init(position: .zero, yaw: yaw)
+                await source.advance(duration)
+            },
+            sendCommandReceipt: { _ in sent = true; return .init(receipt: .init(httpStatus: 204, acknowledged: true,
                 acknowledgementUTC: commandAck, attempts: 2, outcome: "acknowledged"), failure: nil) },
             stopRoverReceipt: { .init(receipt: .init(httpStatus: 200, acknowledged: true,
-                acknowledgementUTC: stopAck, attempts: 1, outcome: "acknowledged"), failure: nil) })
+                acknowledgementUTC: stopAck, attempts: 1, outcome: "acknowledged"), failure: nil) },
+            poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+            sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let request = FollowMotionRequestContext(sessionGeneration: 4, requestToken: 80, purpose: .followScan, phase: "searching")
         let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context: request)
         XCTAssertEqual(result.result, .arrived)
@@ -1580,7 +1980,9 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
 
     func testVoidControllerTransportReportsUnknownMetadataDespiteConfirmedStop() async {
         var yaw = 0.0
-        let controller = makeController(pose: { yaw }, send: { _ in }, sleep: { _ in yaw = 0.3 })
+        let controller = makeFollowController(pose: { yaw }, send: { _ in }, sleep: {
+            if Self.seconds($0) >= 0.299 { yaw = 0.3 }
+        })
         let request = FollowMotionRequestContext(sessionGeneration: 4, requestToken: 81, purpose: .followScan, phase: "searching")
         let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context: request)
         XCTAssertEqual(result.result, .arrived)
@@ -1615,7 +2017,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertNotNil(result.context.controllerOperationID)
         XCTAssertNotEqual(result.context.controllerOperationID, request.requestToken)
         XCTAssertEqual(result.context.purpose, .followScan)
-        XCTAssertEqual(result.context.profile?.pulseWait, 0.200)
+        XCTAssertEqual(result.context.profile?.pulseWait, 0.080)
         XCTAssertEqual(streamed?.context, result.context)
         XCTAssertEqual(result.failure?.stopOutcome, .failed)
         XCTAssertEqual(result.failure?.source, .result)
@@ -1635,18 +2037,20 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(result.failure?.stopOutcome, .unknown)
     }
 
-    func testFollowAdapterSearchAndReacquisitionRequest200msThen300ms() async {
+    func testFollowAdapterSearchAndReacquisitionRequestAtMost80msThen300ms() async {
         for angle in [0.3, -0.3] {
             var yaw = 0.0
             var waits: [Double] = []
             var commands: [WheelCommand] = []
-            let controller = makeController(pose: { yaw }, send: { commands.append($0) }, sleep: {
+            let controller = makeFollowController(pose: { yaw }, send: { commands.append($0) }, sleep: {
                 waits.append(Self.seconds($0))
                 if waits.count == 2 { yaw = angle }
             })
             let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: angle)
             XCTAssertEqual(result, .arrived)
-            XCTAssertEqual(waits, [0.200, 0.300], "Follow scan must request the longer pulse before settling")
+            XCTAssertEqual(waits.count, 2)
+            XCTAssertEqual(waits.first ?? 0, 0.080, accuracy: 1e-12)
+            XCTAssertEqual(waits.last ?? 0, 0.300, accuracy: 1e-12)
             XCTAssertEqual(commands.count, 1)
             XCTAssertEqual(commands.first?.left ?? 0, angle > 0 ? -0.25 : 0.25, accuracy: 1e-12)
             XCTAssertEqual(commands.first?.right ?? 0, angle > 0 ? 0.25 : -0.25, accuracy: 1e-12)
@@ -1686,7 +2090,9 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         for angle in [0.52, -0.52, 0.13, -0.13] {
             var yaw = 0.0
             var commands: [WheelCommand] = []
-            let controller = makeController(pose: { yaw }, send: { commands.append($0) }, sleep: { _ in yaw = angle })
+            let controller = makeFollowController(pose: { yaw }, send: { commands.append($0) }, sleep: {
+                if Self.seconds($0) >= 0.299 { yaw = angle }
+            })
             let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: angle)
             XCTAssertEqual(result, .arrived)
             XCTAssertEqual(commands.count, 1)
@@ -1694,25 +2100,35 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             XCTAssertEqual(commands.first?.right ?? 0, angle > 0 ? 0.25 : -0.25, accuracy: 1e-12)
         }
         var commands = 0
-        let withinTolerance = makeController(pose: { 0 }, send: { _ in commands += 1 }, sleep: { _ in })
+        let withinTolerance = makeFollowController(pose: { 0 }, send: { _ in commands += 1 }, sleep: { _ in })
         let result = await withinTolerance.rotateForFollowScan(by: 0.12)
         XCTAssertEqual(result, .arrived)
         XCTAssertEqual(commands, 0, "The existing seven-degree scan tolerance remains unchanged")
     }
 
-    func testGenericAndFollowAlignmentRemainContinuous() async {
+    func testGenericAlignmentRemainsContinuousAndFollowAlignmentUsesBursts() async {
         for follow in [false, true] {
             var yaw = 0.0
             var waits: [Double] = []
             var commands: [WheelCommand] = []
-            let controller = makeController(pose: { yaw }, send: { commands.append($0) }, sleep: {
-                waits.append(Self.seconds($0)); yaw = 0.3
-            })
+            let controller: NavigationController
+            if follow {
+                controller = makeFollowController(pose: { yaw }, send: { commands.append($0) }, sleep: {
+                    waits.append(Self.seconds($0))
+                    if Self.seconds($0) >= 0.299 { yaw = 0.3 }
+                })
+            } else {
+                controller = makeController(pose: { yaw }, send: { commands.append($0) }, sleep: {
+                    waits.append(Self.seconds($0)); yaw = 0.3
+                })
+            }
             let result: NavigationResult
             if follow { result = await NavigationFollowMeMotion(navigation: controller).alignTowardPerson(by: 0.3) }
             else { result = await controller.rotateAndWait(by: 0.3) }
             XCTAssertEqual(result, .arrived)
-            XCTAssertEqual(waits, [0.1])
+            XCTAssertEqual(waits.count, follow ? 2 : 1)
+            XCTAssertEqual(waits[0], follow ? 0.080 : 0.1, accuracy: 1e-12)
+            if follow { XCTAssertEqual(waits[1], 0.300, accuracy: 1e-12) }
             XCTAssertEqual(abs(commands.first?.left ?? 0), 0.25, accuracy: 1e-12)
         }
     }
@@ -1721,13 +2137,17 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         for angle in [7 * Double.pi / 180, -7 * Double.pi / 180] {
             var sends = 0
             var stops = 0
+            let source = FollowRecoveryDiagnosticSourceFixture()
             let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
                 forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
-                sendCommand: { _ in sends += 1 }, stopRover: { stops += 1 }, sleep: { _ in })
+                sendCommand: { _ in sends += 1 }, stopRover: { stops += 1 }, sleep: source.advance,
+                poseSample: { source.snapshot }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream },
+                sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: angle)
             XCTAssertEqual(result, .arrived)
             XCTAssertEqual(sends, 0)
-            XCTAssertGreaterThanOrEqual(stops, 2)
+            XCTAssertEqual(stops, 1, "A fresh initial stopped evaluation arrives without another motor command")
         }
     }
 
@@ -1800,16 +2220,19 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     }
 
     func testARGenerationChangeInhibitsNextPulse() async {
-        var generation: UInt64 = 8
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.generation = 8
+        source.capture(after: 0)
         var sends = 0
-        var yaw = 0.0
+        let yaw = 0.0
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
             sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { duration in
-                if Self.seconds(duration) == 0.3 { generation = 9; if sends == 2 { yaw = 0.3 } }
-            }, poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: yaw),
-                frameID: ARFrameID(generation: generation, sequence: 1), sourceTimestamp: 100,
-                trackingQuality: .normal) }, sourceNow: { 100 })
+                if sends > 0, Self.seconds(duration) >= 0.299 { source.generation = 9 }
+                await source.advance(duration)
+            }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
         XCTAssertEqual(result, .failed(.trackingLost))
         XCTAssertEqual(sends, 1)
@@ -1817,23 +2240,22 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
 
     func testFrozenFrameExpiresWhileChangingFreshFramesWithFlatYawStillStall() async {
         for frozen in [true, false] {
-            var uptime = 100.0
-            var sequence: UInt64 = 1
+            let source = FollowRecoveryDiagnosticSourceFixture()
+            source.uptime = 100
+            source.capture(after: 0)
             var sends = 0
             let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 },
-                plan: { _, goal in [goal] }, lastAckAt: { Date(timeIntervalSince1970: uptime) },
+                plan: { _, goal in [goal] }, lastAckAt: { Date(timeIntervalSince1970: source.uptime) },
                 sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { duration in
-                    uptime += Self.seconds(duration)
-                    if !frozen { sequence += 1 }
-                }, now: { Date(timeIntervalSince1970: uptime) }, poseSample: {
-                    NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
-                        frameID: ARFrameID(generation: 8, sequence: sequence),
-                        sourceTimestamp: frozen ? 100 : uptime, trackingQuality: .normal)
-                }, sourceNow: { uptime })
+                    if frozen, sends > 0 { source.uptime += Self.seconds(duration) }
+                    else { await source.advance(duration) }
+                }, now: { Date(timeIntervalSince1970: source.uptime) }, poseSample: { source.snapshot },
+                sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
             XCTAssertEqual(result, .failed(frozen ? .trackingLost : .stalled))
-            XCTAssertEqual(sends, frozen ? 2 : 5)
-            XCTAssertEqual(uptime, frozen ? 101 : 102.5, accuracy: 1e-10)
+            XCTAssertEqual(sends, frozen ? 1 : 7)
+            XCTAssertEqual(source.uptime, frozen ? 100.8 : 102.8, accuracy: 1e-6)
         }
     }
 
@@ -1842,13 +2264,17 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let gate = FollowDiagnosticSuspension()
             var yaw = 0.0
             var commands: [WheelCommand] = []
+            let source = FollowRecoveryDiagnosticSourceFixture()
             let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 },
                 plan: { _, goal in [goal] }, lastAckAt: {
                     if !gate.entered { await gate.suspend() }; return Date()
-                }, sendCommand: { commands.append($0) }, stopRover: {}, sleep: { _ in yaw = -0.3 },
-                poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: yaw),
-                    frameID: ARFrameID(generation: 80, sequence: 1), sourceTimestamp: 100,
-                    trackingQuality: .normal) }, sourceNow: { 100 })
+                }, sendCommand: { commands.append($0) }, stopRover: {}, sleep: { duration in
+                    if !commands.isEmpty, Self.seconds(duration) >= 0.299 { yaw = -0.3 }
+                    source.pose = .init(position: .zero, yaw: yaw)
+                    await source.advance(duration)
+                }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
             let motion = NavigationFollowMeMotion(navigation: controller)
             let older = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 1, purpose: request.purpose, phase: "old")
             let newer = FollowMotionRequestContext(sessionGeneration: 2, requestToken: 2, purpose: .followScan, phase: "new")
@@ -1868,19 +2294,25 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
 
     func testSuspendedFeedbackCannotAuthorizeExpiredSourcePose() async {
         let gate = FollowDiagnosticSuspension()
-        var timestamp = 100.0
-        var yaw = 0.0
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.uptime = 100
+        source.capture(after: 0)
         var sends = 0
-        let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: yaw) },
+        let controller = NavigationController(currentPose: { source.pose },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
                 if !gate.entered { await gate.suspend() }; return Date()
-            }, sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { _ in yaw = 0.3 },
-            poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: yaw),
-                frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: timestamp,
-                trackingQuality: .normal) }, sourceNow: { 100 })
+            }, sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { duration in
+                if gate.entered { try? await Task.sleep(for: duration) }
+                else { await source.advance(duration) }
+            },
+            poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let scan = Task { await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3) }
         await gate.waitUntilEntered()
-        timestamp = 99.499
+        source.snapshot = .init(pose: source.pose, frameID: .init(generation: 4, sequence: 12),
+            sourceTimestamp: 99.499, trackingQuality: .normal)
+        controller.ingestFollowTurnSource(source.snapshot)
         gate.release()
         let result = await scan.value
         XCTAssertEqual(result, .failed(.trackingLost))
@@ -1890,20 +2322,26 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testSuspendedFeedbackUsesCurrentYawForToleranceAndPulseSign() async {
         for updatedYaw in [0.3, 0.43, -0.13] {
             let gate = FollowDiagnosticSuspension()
-            var yaw = 0.0
-            var sequence: UInt64 = 1
+            let source = FollowRecoveryDiagnosticSourceFixture()
             var commands: [WheelCommand] = []
             let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 },
                 plan: { _, goal in [goal] }, lastAckAt: {
                     if !gate.entered { await gate.suspend() }; return Date()
-                }, sendCommand: { commands.append($0) }, stopRover: {}, sleep: { _ in yaw = 0.3 },
-                poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: yaw),
-                    frameID: ARFrameID(generation: 8, sequence: sequence), sourceTimestamp: 100,
-                    trackingQuality: .normal) }, sourceNow: { 100 })
-            let scan = Task { await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3) }
+                }, sendCommand: { commands.append($0) }, stopRover: {}, sleep: { duration in
+                    if !commands.isEmpty, Self.seconds(duration) >= 0.299 { source.pose = .init(position: .zero, yaw: 0.3) }
+                    await source.advance(duration)
+                }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+            source.controller = controller
+            // A fixed absolute stage allows feedback to change the actual error;
+            // relative turns now resolve only after this stopped-source boundary.
+            let request = FollowRecoveryHeadingRequest(stageHeading: 0.3, authorization: .init(episodeID: UUID(),
+                expectedGeneration: 4, deadline: 12, now: { source.uptime }, canContinue: { true }))
+            let scan = Task { await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request,
+                context: .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "recovery")).result }
             await gate.waitUntilEntered()
-            yaw = updatedYaw
-            sequence = 2
+            source.pose = .init(position: .zero, yaw: updatedYaw)
+            source.capture(after: 0.001)
             gate.release()
             let result = await scan.value
             XCTAssertEqual(result, .arrived)
@@ -1917,35 +2355,42 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         let clock = FollowDiagnosticTestClock()
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "source", monotonic: { clock.monotonic }, utc: { clock.utc }, sink: sink.append)
-        var yaw = 0.0
-        var sequence: UInt64 = 1
-        var uptime = 100.0
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.generation = 8
+        source.uptime = 100
+        source.snapshot = .init(pose: source.pose, frameID: .init(generation: 8, sequence: 1),
+            sourceTimestamp: 99.75, trackingQuality: .normal)
+        var sent = false
+        var stops = 0
+        var stopUptime = source.uptime
         var reads = 0
         let controller = NavigationController(currentPose: { XCTFail("Enriched path must not read legacy pose"); return nil },
-            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil },
-            sendCommand: { _ in }, stopRover: {}, sleep: { duration in
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
+            sendCommand: { _ in sent = true }, stopRover: { stops += 1; stopUptime = source.uptime }, sleep: { duration in
                 clock.monotonic += Self.seconds(duration)
-                if Self.seconds(duration) == 0.3 { yaw = 0.3; sequence = 2; uptime = 100.5 }
+                if sent, stops >= 2, source.uptime + Self.seconds(duration) >= stopUptime + 0.300 {
+                    source.pose = .init(position: .zero, yaw: 0.3)
+                }
+                source.capture(after: Self.seconds(duration), age: 0.25)
             }, diagnosticEmitter: emitter, poseSample: {
                 reads += 1
-                return NavigationPoseSample(pose: Pose2D(position: .zero, yaw: yaw),
-                    frameID: ARFrameID(generation: 8, sequence: sequence), sourceTimestamp: uptime - 0.25,
-                    trackingQuality: .normal)
-            }, sourceNow: { uptime })
+                return source.snapshot
+            }, sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
         XCTAssertEqual(result, .arrived)
-        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(reads, 1)
         let pulse = try XCTUnwrap(records(sink).first { $0["event"] as? String == "follow_scan.pulse_complete" })
-        XCTAssertEqual(pulse["pre_source_frame_id"] as? String, "8:1")
-        XCTAssertEqual(pulse["post_source_frame_id"] as? String, "8:2")
+        XCTAssertEqual(pulse["pre_source_frame_id"] as? String, "8:3")
+        XCTAssertEqual(pulse["post_source_frame_id"] as? String, "8:6")
         XCTAssertEqual(pulse["pre_source_generation"] as? Double, 8)
         XCTAssertEqual(pulse["post_source_generation"] as? Double, 8)
-        XCTAssertEqual(pulse["pre_source_timestamp_s"] as? Double, 99.75)
-        XCTAssertEqual(pulse["post_source_timestamp_s"] as? Double, 100.25)
+        XCTAssertEqual(try XCTUnwrap(pulse["pre_source_timestamp_s"] as? Double), 100.05, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(pulse["post_source_timestamp_s"] as? Double), 100.43, accuracy: 1e-12)
         XCTAssertEqual(pulse["pre_source_age_s"] as? Double, 0.25)
         XCTAssertEqual(pulse["post_source_age_s"] as? Double, 0.25)
-        XCTAssertEqual(pulse["pre_pose_read_monotonic_s"] as? Double, 100)
-        XCTAssertEqual(pulse["post_pose_read_monotonic_s"] as? Double, 100.5)
+        XCTAssertEqual(try XCTUnwrap(pulse["pre_pose_read_monotonic_s"] as? Double), 100.3, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(pulse["post_pose_read_monotonic_s"] as? Double), 100.68, accuracy: 1e-12)
         XCTAssertEqual(pulse["pose_pairing"] as? String, "independently_sampled")
         XCTAssertEqual(pulse["pose_source_age_status"] as? String, "available")
         XCTAssertEqual(pulse["post_tracking_state"] as? String, "normal")
@@ -1955,17 +2400,27 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testExpiredPostSampleTraceRetainsActualSourceAndRejectionReason() async throws {
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "expired", monotonic: { 0 }, utc: { Date() }, sink: sink.append)
-        var timestamp = 100.0
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.uptime = 100
+        source.capture(after: 0)
+        var sent = false
+        var pre: NavigationPoseSample?
         let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 },
-            plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in }, stopRover: {},
-            sleep: { duration in if Self.seconds(duration) == 0.3 { timestamp = 99.499 } },
-            diagnosticEmitter: emitter, poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
-                frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: timestamp,
-                trackingQuality: .normal) }, sourceNow: { 100 })
+            plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in sent = true; pre = source.snapshot }, stopRover: {},
+            sleep: { duration in
+                if sent, Self.seconds(duration) >= 0.299 {
+                    source.uptime += Self.seconds(duration)
+                    source.snapshot = .init(pose: source.pose, frameID: pre?.frameID,
+                        sourceTimestamp: 99.499, trackingQuality: .normal)
+                    source.controller?.ingestFollowTurnSource(source.snapshot)
+                } else { await source.advance(duration) }
+            }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
         XCTAssertEqual(result, .failed(.trackingLost))
         let failure = try XCTUnwrap(records(sink).first { $0["event"] as? String == "follow_scan.failure" })
-        XCTAssertEqual(failure["post_source_frame_id"] as? String, "8:1")
+        XCTAssertEqual(failure["post_source_frame_id"] as? String, "4:12")
         XCTAssertEqual(failure["post_source_timestamp_s"] as? Double, 99.499)
         XCTAssertEqual(failure["post_source_availability"] as? String, "stale_source")
         XCTAssertEqual(failure["pose_pairing"] as? String, "same_frame")
@@ -1975,11 +2430,13 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testPreflightRejectionLogsAvailableSourceFacts() async throws {
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "preflight", monotonic: { 0 }, utc: { Date() }, sink: sink.append)
+        let events = AsyncStream<NavigationPoseSample>.makeStream()
+        let snapshot = NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
+            frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: 99, trackingQuality: .normal)
         let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
             lastAckAt: { nil }, sendCommand: { _ in XCTFail("Stale preflight cannot send") }, stopRover: {}, sleep: { _ in },
-            diagnosticEmitter: emitter, poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
-                frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: 99,
-                trackingQuality: .normal) }, sourceNow: { 100 })
+            diagnosticEmitter: emitter, poseSample: { snapshot }, sourceNow: { 100 },
+            sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
         let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
         XCTAssertEqual(result, .failed(.trackingLost))
         let failure = try XCTUnwrap(records(sink).first { $0["event"] as? String == "follow_scan.failure" })
@@ -1991,11 +2448,13 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     func testNonfiniteSourceTraceCannotClaimAvailableSourceAge() async throws {
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "nonfinite", monotonic: { 0 }, utc: { Date() }, sink: sink.append)
+        let events = AsyncStream<NavigationPoseSample>.makeStream()
+        let snapshot = NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
+            frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: .nan, trackingQuality: .normal)
         let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
             lastAckAt: { nil }, sendCommand: { _ in XCTFail("Invalid source cannot send") }, stopRover: {}, sleep: { _ in },
-            diagnosticEmitter: emitter, poseSample: { NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
-                frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: .nan,
-                trackingQuality: .normal) }, sourceNow: { 100 })
+            diagnosticEmitter: emitter, poseSample: { snapshot }, sourceNow: { 100 },
+            sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
         let result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
         XCTAssertEqual(result, .failed(.trackingLost))
         let failure = try XCTUnwrap(records(sink).first { $0["event"] as? String == "follow_scan.failure" })
@@ -2005,15 +2464,21 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
     }
 
     private func scanWithSource(timestamp: Double, tracking: ARTrackingQuality = .normal,
-                                pose: Pose2D? = Pose2D(position: .zero, yaw: 0)) async -> (NavigationResult, [WheelCommand]) {
+                                 pose: Pose2D? = Pose2D(position: .zero, yaw: 0)) async -> (NavigationResult, [WheelCommand]) {
         var commands: [WheelCommand] = []
-        var settled = false
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.generation = 8
+        source.uptime = 100
+        source.snapshot = .init(pose: pose, frameID: .init(generation: 8, sequence: 1),
+            sourceTimestamp: timestamp, trackingQuality: tracking)
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date() },
-            sendCommand: { commands.append($0) }, stopRover: {}, sleep: { _ in settled = true },
-            poseSample: { NavigationPoseSample(pose: settled ? Pose2D(position: .zero, yaw: 0.3) : pose,
-                frameID: ARFrameID(generation: 8, sequence: 1), sourceTimestamp: timestamp,
-                trackingQuality: tracking) }, sourceNow: { 100 })
+            sendCommand: { commands.append($0) }, stopRover: {}, sleep: { duration in
+                if !commands.isEmpty, Self.seconds(duration) >= 0.299 { source.pose = .init(position: .zero, yaw: 0.3) }
+                await source.advance(duration)
+            }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         return (await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3), commands)
     }
 
@@ -2023,8 +2488,8 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             var commands: [WheelCommand] = []
             var settles = 0
             let target = sign * -2.883185307179586
-            let controller = makeController(pose: { yaw }, send: { commands.append($0) }, sleep: {
-                if Self.seconds($0) == 0.3 {
+            let controller = makeFollowController(pose: { yaw }, send: { commands.append($0) }, sleep: {
+                if Self.seconds($0) >= 0.299 {
                     settles += 1
                     yaw = settles == 1 ? target + sign * 0.13 : target
                 }
@@ -2044,7 +2509,58 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             sendCommand: send, stopRover: {}, sleep: sleep)
     }
 
+    /// Follow-only simulated captures. Reads never advance source provenance;
+    /// movement begins only after a real nonzero sender has been invoked.
+    private func makeFollowController(pose: @escaping () -> Double,
+                                      send: @escaping (WheelCommand) async throws -> Void,
+                                      sleep: @escaping (Duration) async -> Void,
+                                      diagnosticEmitter: FollowDiagnosticEmitter? = nil) -> NavigationController {
+        let source = FollowRecoveryDiagnosticSourceFixture()
+        source.pose = .init(position: .zero, yaw: pose())
+        source.capture(after: 0)
+        var sent = false
+        let controller = NavigationController(currentPose: { source.pose }, forwardClearance: { 2 },
+            plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: {
+                sent = true
+                try await send($0)
+            }, stopRover: {}, sleep: { duration in
+                if sent {
+                    await sleep(duration)
+                    source.pose = .init(position: .zero, yaw: pose())
+                }
+                await source.advance(duration)
+            }, diagnosticEmitter: diagnosticEmitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
+        return controller
+    }
+
     private static func seconds(_ duration: Duration) -> Double {
         Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+    }
+}
+
+@MainActor
+private final class FollowRecoveryDiagnosticSourceFixture {
+    weak var controller: NavigationController?
+    var uptime = 8.0
+    var generation: UInt64 = 4
+    let events = AsyncStream<NavigationPoseSample>.makeStream()
+    var pose = Pose2D(position: .zero, yaw: 0)
+    var snapshot = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+        frameID: .init(generation: 4, sequence: 10), sourceTimestamp: 7.99, trackingQuality: .normal)
+
+    func advance(_ duration: Duration) async {
+        await Task.yield()
+        guard !Task.isCancelled else { return }
+        capture(after: Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
+    }
+
+    func capture(after elapsed: Double, age: Double = 0) {
+        uptime += elapsed
+        snapshot = .init(pose: pose,
+            frameID: .init(generation: generation, sequence: snapshot.frameID!.sequence + 1),
+            sourceTimestamp: uptime - age, trackingQuality: .normal)
+        controller?.ingestFollowTurnSource(snapshot)
     }
 }

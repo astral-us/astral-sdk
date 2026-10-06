@@ -65,6 +65,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
             let perception = FollowPerceptionFake()
             let motion = AbsoluteRecoveryMotionFake()
             let clock = ManualFollowClock()
+            motion.legacy.useSourceClock(clock)
             var config = FollowMeConfiguration()
             config.stationaryPauseSeconds = 0
             if range != 0.6 { config.departureRangeIncrease = 0 }
@@ -79,15 +80,15 @@ final class FollowMeCoordinatorTests: XCTestCase {
             perception.send(frame(3, people: [person(3, x: range, y: 0)]))
             await drain()
             XCTAssertFalse(sink.records.contains { $0.event == "follow_recovery.cleared" })
-            perception.send(frame(4, people: [person(4, x: range, y: 0)]))
-            await drain()
+            await matchedBoundaryFrame(4, perception, clock, yaw: 0, x: range, y: 0)
+            if range == 0.6 { await matchedBoundaryFrame(5, perception, clock, yaw: 0, x: range, y: 0) }
             let expected = range == 0.6 ? "waitingForClearance" : (range == 1.5 ? "holdingDistance" : "following")
             let cleared = try XCTUnwrap(sink.records.first { $0.event == "follow_recovery.cleared" })
             let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(cleared.fields["payload"]).utf8)) as? [String: Any])
             XCTAssertEqual(json["phase"] as? String, expected)
-            XCTAssertEqual(json["restored_frame_id"] as? String, "1:4")
+            XCTAssertEqual(json["restored_frame_id"] as? String, range == 0.6 ? "1:5" : "1:4")
             XCTAssertEqual(json["anchor_frame_id"] as? String, "1:1")
-            XCTAssertEqual(json["reliable_frame_id"] as? String, "1:4")
+            XCTAssertEqual(json["reliable_frame_id"] as? String, range == 0.6 ? "1:5" : "1:4")
             XCTAssertEqual(json["stop_outcome"] as? String, "confirmed")
             _ = await coordinator.stop()
         }
@@ -178,6 +179,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
             let motion = AbsoluteRecoveryMotionFake()
             motion.autoArrive = true
             let clock = ManualFollowClock()
+            motion.legacy.useSourceClock(clock)
             var config = FollowMeConfiguration()
             config.stationaryPauseSeconds = 0
             let sink = FollowDiagnosticRecordingSink()
@@ -210,8 +212,8 @@ final class FollowMeCoordinatorTests: XCTestCase {
             if ending == "cleared" {
                 perception.send(frame(3, people: [person(3, x: 4, y: 0)]))
                 await drain()
-                perception.send(frame(4, people: [person(4, x: 4, y: 0)]))
-                await drain()
+                await matchedBoundaryFrame(4, perception, clock, yaw: 0, x: 4, y: 0)
+                await matchedBoundaryFrame(5, perception, clock, yaw: 0, x: 4, y: 0)
                 let signaling = try XCTUnwrap(records("follow_phase").last)
                 XCTAssertEqual(signaling["phase"] as? String, "signalingReady")
                 XCTAssertEqual(signaling["recovery_active"] as? Bool, true)
@@ -219,19 +221,17 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 let ready = try XCTUnwrap(records("follow_ready.completed").last)
                 XCTAssertEqual(ready["deadline_s"] as? Double, 10)
                 XCTAssertEqual(ready["recovery_active"] as? Bool, true)
-                perception.send(frame(5, people: [person(5, x: 4, y: 0)]))
-                await drain()
+                await matchedBoundaryFrame(6, perception, clock, yaw: 0, x: 4, y: 0)
                 XCTAssertEqual(coordinator.state, .waitingForMovement)
                 let cleared = try XCTUnwrap(records("follow_recovery.cleared").first)
-                XCTAssertEqual(cleared["restored_frame_id"] as? String, "1:5")
+                XCTAssertEqual(cleared["restored_frame_id"] as? String, "1:6")
                 XCTAssertEqual(cleared["phase"] as? String, "waitingForMovement")
                 XCTAssertEqual(cleared["anchor_frame_id"] as? String, "1:1")
                 XCTAssertEqual(cleared["stop_outcome"] as? String, "confirmed")
                 XCTAssertEqual(cleared["recovery_active"] as? Bool, false)
                 XCTAssertEqual(cleared["deadline_active"] as? Bool, false)
                 XCTAssertTrue(cleared["provisional_frame_id"] is NSNull)
-                perception.send(frame(6, people: [person(6, x: 4, y: 0)]))
-                await drain()
+                await matchedBoundaryFrame(7, perception, clock, yaw: 0, x: 4, y: 0)
                 XCTAssertEqual(try records("follow_recovery.cleared").count, 1)
             } else if ending == "expired" {
                 clock.advance(to: 10, wakeSleepers: false)
@@ -354,17 +354,16 @@ final class FollowMeCoordinatorTests: XCTestCase {
             await drain()
             perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5)]))
             await drain()
-            perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, at: 5)]))
-            await drain()
+            await matchedBoundaryFrame(4, perception, clock)
+            await matchedBoundaryFrame(5, perception, clock)
             XCTAssertEqual(coordinator.state, .signalingReady, "A successful move is still baseline-pending recovery")
             XCTAssertEqual(motion.readySignals, 1)
             if completeBaseline {
-                perception.send(frame(5, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(5, at: 5)]))
-                await drain()
+                await matchedBoundaryFrame(6, perception, clock)
                 XCTAssertEqual(coordinator.state, .waitingForMovement)
             }
             clock.advance(to: 15, wakeSleepers: false)
-            perception.send(frame(6, at: 15, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(6, at: 15)]))
+            perception.send(frame(7, at: 15, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(7, at: 15)]))
             await drain()
             XCTAssertEqual(coordinator.state, completeBaseline ? .waitingForMovement : .failed("Person lost."))
             XCTAssertEqual(motion.readySignals, 1)
@@ -376,6 +375,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let perception = FollowPerceptionFake()
         let motion = AbsoluteRecoveryMotionFake()
         let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
         var config = FollowMeConfiguration()
         config.stationaryPauseSeconds = 0
         let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config)
@@ -387,11 +387,11 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(3, people: [person(3, x: 0.6, y: 0)]))
         await drain()
         XCTAssertEqual(coordinator.state, .aligning)
-        perception.send(frame(4, pose: Pose2D(position: .zero, yaw: -0.050001), people: [person(4, x: 0.6, y: 0)]))
-        await drain()
+        await matchedBoundaryFrame(4, perception, clock, yaw: 0, x: 0.6, y: 0)
+        await matchedBoundaryFrame(5, perception, clock, yaw: -0.050001, x: 0.6, y: 0)
         XCTAssertEqual(coordinator.state, .aligning)
-        perception.send(frame(5, pose: Pose2D(position: .zero, yaw: -0.05), people: [person(5, x: 0.6, y: 0)]))
-        await drain()
+        await matchedBoundaryFrame(6, perception, clock, yaw: -0.050001, x: 0.6, y: 0)
+        await matchedBoundaryFrame(7, perception, clock, yaw: -0.05, x: 0.6, y: 0)
         XCTAssertEqual(coordinator.state, .waitingForClearance)
         XCTAssertEqual(motion.legacy.readySignals, 0)
         _ = await coordinator.stop()
@@ -411,9 +411,9 @@ final class FollowMeCoordinatorTests: XCTestCase {
             motion.suspendReadySignal = ready
             perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5)]))
             await drain()
+            await matchedBoundaryFrame(4, perception, clock)
             if ready {
-                perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, at: 5)]))
-                await drain()
+                await matchedBoundaryFrame(5, perception, clock)
                 XCTAssertEqual(coordinator.state, .signalingReady)
             }
             motion.suspendStop = true
@@ -432,14 +432,14 @@ final class FollowMeCoordinatorTests: XCTestCase {
         for conflict in [false, true] {
             let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
             await acquireWaiting(coordinator, perception, clock)
-            perception.send(frame(4, at: 5))
+            perception.send(frame(4, at: clock.now))
             await drain()
             let alignments = motion.alignments.count
             motion.suspendStop = true
-            perception.send(frame(5, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(5, at: 5)]))
+            perception.send(frame(5, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(5, at: clock.now)]))
             await drain()
-            perception.send(frame(6, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                people: conflict ? [person(6, at: 5), person(6, at: 5, y: 4.1)] : [person(6, at: 5)]))
+            perception.send(frame(6, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                people: conflict ? [person(6, at: clock.now), person(6, at: clock.now, y: 4.1)] : [person(6, at: clock.now)]))
             await drain()
             motion.suspendStop = false
             motion.releaseStop()
@@ -449,8 +449,9 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 XCTAssertEqual(motion.alignments.count, alignments, "Conflicting pending targets cannot authorize alignment after scan stop")
             } else {
                 XCTAssertEqual(coordinator.state, .aligning, "Frame consumed before stop confirmation cannot restore normal control")
-                perception.send(frame(7, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(7, at: 5)]))
-                await drain()
+                await matchedBoundaryFrame(7, perception, clock)
+                XCTAssertEqual(coordinator.state, .aligning, "The alignment's final stop fences its launch frame too")
+                await matchedBoundaryFrame(8, perception, clock)
                 XCTAssertEqual(coordinator.state, .waitingForMovement)
             }
             _ = await coordinator.stop()
@@ -462,6 +463,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
             let perception = FollowPerceptionFake()
             let motion = AbsoluteRecoveryMotionFake()
             let clock = ManualFollowClock()
+            motion.legacy.useSourceClock(clock)
             motion.sample = .init(pose: Pose2D(position: .zero, yaw: .pi / 2),
                 frameID: ARFrameID(generation: 1, sequence: 100), sourceTimestamp: 5,
                 trackingQuality: .normal, source: "synthetic")
@@ -476,26 +478,26 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 _ = await coordinator.start()
                 await drain()
                 clock.advance(to: 5)
-                perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 0.6)]))
+                perception.send(frame(0, at: 5, people: [person(0, at: 5, y: 0.6)]))
                 await drain()
-                perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 0.6)]))
-                await drain()
+                await matchedBoundaryFrame(1, perception, clock, yaw: 0, y: 0.6)
+                await matchedBoundaryFrame(2, perception, clock, y: 0.6)
                 XCTAssertEqual(coordinator.state, .waitingForClearance)
             }
             let oldAnchor = tooClose ? "1:2" : "1:3"
-            perception.send(frame(4, at: 5))
+            perception.send(frame(4, at: clock.now))
             await drain()
             let range = tooClose ? 0.6 : 4.2
-            perception.send(frame(5, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(5, at: 5, y: range)]))
+            perception.send(frame(5, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(5, at: clock.now, y: range)]))
             await drain()
             XCTAssertEqual(coordinator.state, .aligning)
-            perception.send(frame(6, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(6, at: 5, y: range)]))
-            await drain()
+            await matchedBoundaryFrame(6, perception, clock, y: range)
+            await matchedBoundaryFrame(7, perception, clock, y: range)
             XCTAssertEqual(coordinator.state, tooClose ? .waitingForClearance : .waitingForMovement)
             XCTAssertEqual(motion.legacy.readySignals, tooClose ? 0 : 1)
-            perception.send(frame(7, at: 5))
+            perception.send(frame(8, at: clock.now))
             await drain()
-            XCTAssertEqual(anchors, [oldAnchor, "1:6"])
+            XCTAssertEqual(anchors, [oldAnchor, "1:7"])
             _ = await coordinator.stop()
         }
     }
@@ -590,16 +592,23 @@ final class FollowMeCoordinatorTests: XCTestCase {
     func testRealRecoveryWatchdogFailureRemainsTerminalInsteadOfRetryingNextArc() async {
         let perception = FollowPerceptionFake()
         let clock = ManualFollowClock()
+        let source = CoordinatorTurnSource(clock: clock)
         var controllerTime = Date(timeIntervalSince1970: 100)
         var sends = 0
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { controllerTime },
-            sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { _ in
+            sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { duration in
+                for _ in 0..<5 { await Task.yield() }
+                guard !Task.isCancelled else { return }
                 controllerTime = controllerTime.addingTimeInterval(0.5)
+                source.advance(by: duration.secondsValue)
             }, now: { controllerTime }, poseSample: {
-                .init(pose: Pose2D(position: .zero, yaw: 0), frameID: ARFrameID(generation: 1, sequence: 100),
-                    sourceTimestamp: clock.now, trackingQuality: .normal, source: "synthetic")
-            }, sourceNow: { clock.now })
+                source.sample
+            }, sourceNow: { clock.now }, sourceStopSnapshot: { source.sample })
+        source.onCapture = { sample in
+            controller.ingestFollowTurnSource(sample)
+            perception.send(self.frame(sample.frameID!.sequence, at: sample.sourceTimestamp!))
+        }
         var config = FollowMeConfiguration()
         config.stationaryPauseSeconds = 0
         config.departureRangeIncrease = 0
@@ -610,10 +619,11 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await drain()
         perception.send(frame(2))
         for _ in 0..<20 { await drain() }
+        XCTAssertGreaterThan(sends, 0, "Reach measured-progress failure rather than missing-source preflight")
         XCTAssertEqual(coordinator.state, .failed("Search rotation stopped: insufficient measured yaw progress. Stop confirmed. Restart following to try again."))
         let count = sends
         clock.advance(to: 10)
-        perception.send(frame(3, at: 10))
+        perception.send(frame(source.sequence + 1, at: 10))
         await drain()
         XCTAssertEqual(sends, count)
         _ = await coordinator.stop()
@@ -690,6 +700,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
     func testRealControllerRecoveryUsesNegativeWorldHeadingAndMeasuredOvershootThroughOnePass() async {
         let perception = FollowPerceptionFake()
         let clock = ManualFollowClock()
+        let source = CoordinatorTurnSource(clock: clock, position: Vec2(0, 1))
         var yaw = 0.0
         var headings: [Double] = []
         var commands: [Double] = []
@@ -701,11 +712,19 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 commands.append(command.right)
                 // A real controller must correct this negative overshoot using a positive pulse.
                 if commands.count == 1 { yaw = -0.7 }
-                else { yaw += command.right > 0 ? 0.2 : -0.2 }
-            }, stopRover: {}, sleep: { _ in }, poseSample: {
-                .init(pose: Pose2D(position: Vec2(0, 1), yaw: yaw), frameID: ARFrameID(generation: 1, sequence: 100),
-                    sourceTimestamp: clock.now, trackingQuality: .normal, source: "synthetic")
-            }, sourceNow: { clock.now })
+                else { yaw = FollowMotionTaskScope.evidence!.targetYaw! }
+                source.yaw = yaw
+                source.advance(by: 0.001) // Actual sourced crossing while the command response is pending.
+            }, stopRover: {}, sleep: { duration in
+                for _ in 0..<5 { await Task.yield() }
+                guard !Task.isCancelled else { return }
+                source.advance(by: duration.secondsValue, captureLag: 0.020)
+            },
+            poseSample: { source.sample }, sourceNow: { clock.now }, sourceStopSnapshot: { source.sample })
+        source.onCapture = { sample in
+            controller.ingestFollowTurnSource(sample)
+            perception.send(self.frame(sample.frameID!.sequence, at: sample.sourceTimestamp!))
+        }
         var config = FollowMeConfiguration()
         config.stationaryPauseSeconds = 0
         config.departureRangeIncrease = 0
@@ -720,7 +739,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertEqual(Array(commands.prefix(2)), [-0.25, 0.25])
         XCTAssertLessThanOrEqual(abs(normalizeAngle(-135 * .pi / 180 - yaw)), 7 * .pi / 180)
         let count = commands.count
-        perception.send(frame(3))
+        perception.send(frame(source.sequence + 1, at: clock.now))
         await drain()
         XCTAssertEqual(commands.count, count)
         _ = await coordinator.stop()
@@ -860,10 +879,11 @@ final class FollowMeCoordinatorTests: XCTestCase {
             await acquireWaiting(coordinator, perception, clock)
             motion.suspendStop = pendingStop
             motion.suspendAlignment = true
-            perception.send(frame(4, at: 5))
+            let firstLoss = clock.now
+            perception.send(frame(4, at: firstLoss))
             await drain()
             if pendingStop {
-                clock.advance(to: 15)
+                clock.advance(to: firstLoss + 10)
                 await drain()
                 XCTAssertEqual(coordinator.state, .failed("Person lost."), "Stop latency consumes the original budget")
                 motion.suspendStop = false
@@ -871,16 +891,16 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 await drain()
             } else {
                 for step in 1...24 {
-                    let time = 5 + Double(step) * 0.4
+                    let time = firstLoss + Double(step) * 0.4
                     clock.advance(to: time)
                     perception.send(frame(UInt64(step + 4), at: time))
                     await drain()
                 }
-                perception.send(frame(30, at: 14.6, people: [person(30, at: 14.6)]))
+                perception.send(frame(30, at: clock.now, people: [person(30, at: clock.now)]))
                 await drain()
                 XCTAssertEqual(coordinator.state, .aligning)
-                clock.advance(to: 15, wakeSleepers: false)
-                perception.send(frame(31, at: 15, people: [person(31, at: 15)]))
+                clock.advance(to: firstLoss + 10, wakeSleepers: false)
+                perception.send(frame(31, at: clock.now, people: [person(31, at: clock.now)]))
                 await drain()
                 XCTAssertEqual(coordinator.state, .failed("Person lost."), "A frame exactly at expiry cannot rescue alignment")
                 motion.releaseAlignment()
@@ -1267,19 +1287,18 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let perception = FollowPerceptionFake()
         let motion = ContextualFollowMotionFake()
         let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
         var config = FollowMeConfiguration()
         config.stationaryPauseSeconds = 0
         let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock, configuration: config)
         _ = await coordinator.start()
         await drain()
-        perception.send(frame(1, people: [person(1)]))
+        perception.send(frame(0, people: [person(0)]))
         await drain()
-        for sequence in UInt64(2)...3 {
-            perception.send(frame(sequence, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(sequence)]))
-            await drain()
-        }
-        perception.send(frame(4, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, y: 4.3)]))
-        await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0)
+        await matchedBoundaryFrame(2, perception, clock)
+        await matchedBoundaryFrame(3, perception, clock)
+        await matchedBoundaryFrame(4, perception, clock, y: 4.3)
         XCTAssertEqual(motion.requests.map(\.purpose), [.followAlignment, .followReady, .followGoal])
         XCTAssertEqual(motion.contexts.map(\.phase), ["aligning", "aligning", "following"],
                        "Capture the actual pending request phase, not signaling before admission")
@@ -1291,15 +1310,9 @@ final class FollowMeCoordinatorTests: XCTestCase {
     func testPersonApproachingDuringReadySignalCancelsBeforeHoldClearanceIsCrossed() async {
         let (coordinator, perception, motion, clock) = productionSetup()
         motion.suspendReadySignal = true
-        _ = await coordinator.start()
-        await drain()
-        clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.6)]))
-        await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.6)]))
-        await drain()
+        await acquireSignaling(coordinator, perception, clock, range: 1.6)
         let stops = motion.stops
-        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5, y: 1.3)]))
+        perception.send(frame(3, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: clock.now, y: 1.3)]))
         await drain()
         XCTAssertGreaterThan(motion.stops, stops)
         XCTAssertFalse(coordinator.isActive)
@@ -1314,17 +1327,16 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5, y: 1.3)]))
         await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
-        await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0, y: 1.3)
+        await matchedBoundaryFrame(2, perception, clock, y: 1.3)
         XCTAssertEqual(motion.readySignals, 0)
         XCTAssertEqual(String(describing: coordinator.state), "waitingForClearance")
         XCTAssertTrue(coordinator.isActive)
         XCTAssertTrue(motion.goals.isEmpty)
         let alignments = motion.alignments.count
-        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5, y: 1.31)]))
-        await drain()
+        await matchedBoundaryFrame(3, perception, clock, y: 1.31)
         XCTAssertEqual(motion.alignments.count, alignments)
         XCTAssertEqual(motion.readySignals, 0)
         _ = await coordinator.stop()
@@ -1335,21 +1347,21 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5, y: 1.3)]))
         await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
-        await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0, y: 1.3)
+        await matchedBoundaryFrame(2, perception, clock, y: 1.3)
         XCTAssertEqual(coordinator.state, .waitingForClearance)
         motion.suspendAlignment = true
-        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2 - 0.06), people: [person(3, at: 5, y: 1.4)]))
-        await drain()
+        await matchedBoundaryFrame(3, perception, clock, yaw: .pi / 2 - 0.06, y: 1.4)
         XCTAssertEqual(coordinator.state, .aligning)
+        XCTAssertEqual(motion.alignments.count, 1, "Drift detection must clear its new stop before turning")
+        await matchedBoundaryFrame(4, perception, clock, yaw: .pi / 2 - 0.06, y: 1.4)
         XCTAssertEqual(motion.alignments.count, 2)
         motion.releaseAlignment()
         await drain()
         XCTAssertEqual(motion.readySignals, 0)
-        perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, at: 5, y: 1.4)]))
-        await drain()
+        await matchedBoundaryFrame(5, perception, clock, y: 1.4)
         XCTAssertEqual(motion.readySignals, 1)
         _ = await coordinator.stop()
     }
@@ -1359,19 +1371,19 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5, y: 1.3)]))
         await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
-        await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.6)]))
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0, y: 1.3)
+        await matchedBoundaryFrame(2, perception, clock, y: 1.3)
+        perception.send(frame(2, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: clock.now, y: 1.6)]))
         await drain()
         XCTAssertEqual(coordinator.state, .waitingForClearance)
-        perception.send(frame(3, at: 5.1, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: 5.1, y: 1.6)]))
+        perception.send(frame(3, at: clock.now + 0.1, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(3, at: clock.now + 0.1, y: 1.6)]))
         await drain()
         XCTAssertEqual(motion.readySignals, 0)
         XCTAssertTrue(motion.goals.isEmpty)
         XCTAssertEqual(coordinator.perceptionIssue, .staleFrame)
-        clock.advance(to: 7)
+        clock.advance(to: clock.now + 2)
         await drain()
         XCTAssertFalse(coordinator.isActive, "Clearance waiting cannot extend the existing outage deadline")
         _ = await coordinator.stop()
@@ -1382,12 +1394,12 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5, y: 1.3)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5, y: 1.3)]))
         await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5, y: 1.3)]))
-        await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0, y: 1.3)
+        await matchedBoundaryFrame(2, perception, clock, y: 1.3)
         for sequence in UInt64(3)...33 {
-            let time = 5 + Double(sequence - 2) * 0.4
+            let time = clock.now + 0.4
             clock.advance(to: time)
             perception.send(frame(sequence, at: time, pose: Pose2D(position: .zero, yaw: .pi / 2),
                                   people: [person(sequence, at: time, y: 1.3)]))
@@ -1405,22 +1417,14 @@ final class FollowMeCoordinatorTests: XCTestCase {
     func testLossAfterSignalStopBeforeBaselineReacquiresWithoutSecondMoveAndCanDepart() async {
         let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
         motion.suspendRotation = true
-        _ = await coordinator.start()
-        await drain()
-        clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
-        await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
-        await drain()
-        perception.send(frame(3, at: 5))
+        await acquireSignaling(coordinator, perception, clock)
+        perception.send(frame(3, at: clock.now))
         await drain()
         for sequence in UInt64(4)...6 {
-            perception.send(frame(sequence, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(sequence, at: 5)]))
-            await drain()
+            await matchedBoundaryFrame(sequence, perception, clock)
         }
         XCTAssertEqual(coordinator.state, .waitingForMovement)
-        perception.send(frame(7, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(7, at: 5, y: 4.3)]))
-        await drain()
+        await matchedBoundaryFrame(7, perception, clock, y: 4.3)
         XCTAssertEqual(motion.goals.count, 1, "A confirmed signal without its baseline must not leave departure permanently gated")
         XCTAssertEqual(motion.readySignals, 1)
         motion.releaseRotation()
@@ -1431,20 +1435,13 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
         motion.suspendReadySignal = true
         motion.suspendRotation = true
-        _ = await coordinator.start()
-        await drain()
-        clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
-        await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
-        await drain()
-        perception.send(frame(3, at: 5))
+        await acquireSignaling(coordinator, perception, clock)
+        perception.send(frame(3, at: clock.now))
         await drain()
         motion.releaseReadySignal()
-        perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(4, at: 5)]))
-        await drain()
-        perception.send(frame(5, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(5, at: 5)]))
-        await drain()
+        await matchedBoundaryFrame(4, perception, clock)
+        await matchedBoundaryFrame(5, perception, clock)
+        await matchedBoundaryFrame(6, perception, clock)
         XCTAssertEqual(motion.readySignals, 1)
         XCTAssertEqual(coordinator.state, .failed("Ready signal interrupted. Stop and start following again."))
         XCTAssertTrue(motion.goals.isEmpty)
@@ -1456,16 +1453,10 @@ final class FollowMeCoordinatorTests: XCTestCase {
         for scenario in 0..<4 {
             let (coordinator, perception, motion, clock) = productionSetup()
             motion.suspendReadySignal = true
-            _ = await coordinator.start()
-            await drain()
-            clock.advance(to: 5)
-            perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
-            await drain()
-            perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
-            await drain()
+            await acquireSignaling(coordinator, perception, clock)
             if scenario == 0 { motion.readySignalResult = .cancelled }
             if scenario == 1 { motion.readySignalResult = .failed(.obstacle) }
-            if scenario == 2 { clock.advance(to: 5.501); await drain() }
+            if scenario == 2 { clock.advance(to: clock.now + 0.501); await drain() }
             if scenario == 3 { coordinator.inhibitMotion(); _ = await coordinator.stop() }
             motion.releaseReadySignal()
             await drain()
@@ -1484,24 +1475,21 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5)]))
         await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2), people: [person(2, at: 5)]))
-        await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0)
+        await matchedBoundaryFrame(2, perception, clock)
         XCTAssertEqual(motion.readySignals, 1)
         XCTAssertEqual(String(describing: coordinator.state), "signalingReady")
         XCTAssertTrue(motion.goals.isEmpty)
         motion.releaseReadySignal()
         await drain()
         XCTAssertEqual(String(describing: coordinator.state), "signalingReady", "Completion needs a new post-stop frame")
-        perception.send(frame(3, at: 5, pose: Pose2D(position: Vec2(0, 0.1), yaw: .pi / 2), people: [person(3, at: 5)]))
-        await drain()
+        await matchedBoundaryFrame(3, perception, clock, position: Vec2(0, 0.1))
         XCTAssertEqual(coordinator.state, .waitingForMovement)
-        perception.send(frame(4, at: 5, pose: Pose2D(position: Vec2(0, 0.1), yaw: .pi / 2), people: [person(4, at: 5, y: 4.299)]))
-        await drain()
+        await matchedBoundaryFrame(4, perception, clock, position: Vec2(0, 0.1), y: 4.299)
         XCTAssertTrue(motion.goals.isEmpty)
-        perception.send(frame(5, at: 5, pose: Pose2D(position: Vec2(0, 0.1), yaw: .pi / 2), people: [person(5, at: 5, y: 4.3)]))
-        await drain()
+        await matchedBoundaryFrame(5, perception, clock, position: Vec2(0, 0.1), y: 4.3)
         XCTAssertEqual(motion.goals.count, 1)
         XCTAssertEqual(motion.readySignals, 1)
         _ = await coordinator.stop()
@@ -1528,33 +1516,23 @@ final class FollowMeCoordinatorTests: XCTestCase {
         }
         motion.releaseStop()
         await drain()
-        XCTAssertEqual(motion.alignments.count, 1, "Healthy 100 ms arrivals must not starve a 200 ms stop acknowledgement")
+        XCTAssertTrue(motion.alignments.isEmpty, "All frames captured before ACK remain fenced")
+        await matchedBoundaryFrame(4, perception, clock, yaw: .pi / 3, position: Vec2(1, 0.501), x: 1, y: 4.2)
+        XCTAssertEqual(motion.alignments.count, 1, "A deliberate settled post-ACK match resumes alignment")
         if let angle = motion.alignments.first { XCTAssertEqual(angle, .pi / 6, accuracy: 0.0001, "Use newest matched person and its same-snapshot rover pose") }
-        for sequence in UInt64(4)...5 {
-            let time = 5 + Double(sequence - 1) / 10
-            clock.advance(to: time)
-            perception.send(frame(sequence, at: time,
-                                  pose: Pose2D(position: Vec2(1, time - 5), yaw: .pi / 2),
-                                  people: [person(sequence, at: time, x: 1, y: 4.2)]))
-            await drain()
-        }
+        await matchedBoundaryFrame(5, perception, clock, position: Vec2(1, 0.6), x: 1, y: 4.2, at: clock.now + 0.1)
         motion.releaseAlignment()
         await drain()
         XCTAssertEqual(motion.stops, 2)
-        clock.advance(to: 5.5)
-        perception.send(frame(6, at: 5.5, pose: Pose2D(position: Vec2(1, 0.5), yaw: .pi / 2),
-                              people: [person(6, at: 5.5, x: 1, y: 4.2)]))
-        await drain()
-        clock.advance(to: 5.6)
+        await matchedBoundaryFrame(6, perception, clock, position: Vec2(1, 0.7), x: 1, y: 4.2, at: clock.now + 0.1)
+        clock.advance(to: clock.now + 0.1)
         motion.suspendStop = false
         motion.releaseStop()
         await drain()
-        perception.send(frame(7, at: 5.6, pose: Pose2D(position: Vec2(1, 0.6), yaw: .pi / 2),
-                              people: [person(7, at: 5.6, x: 1, y: 4.2)]))
-        await drain()
-        perception.send(frame(8, at: 5.6, pose: Pose2D(position: Vec2(1, 0.7), yaw: .pi / 2),
-                              people: [person(8, at: 5.6, x: 1, y: 4.2)]))
-        await drain()
+        await matchedBoundaryFrame(7, perception, clock, position: Vec2(1, 0.8), x: 1, y: 4.2, at: clock.now)
+        XCTAssertEqual(motion.readySignals, 0, "Equal ACK timestamp cannot hand off")
+        await matchedBoundaryFrame(8, perception, clock, position: Vec2(1, 0.8), x: 1, y: 4.2)
+        await matchedBoundaryFrame(9, perception, clock, position: Vec2(1, 0.9), x: 1, y: 4.2)
         XCTAssertEqual(coordinator.state, .waitingForMovement)
         XCTAssertEqual(motion.alignments.count, 1, "Repeated arrivals across both acknowledgements must allow alignment to complete")
         XCTAssertTrue(motion.goals.isEmpty)
@@ -1586,6 +1564,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         clock.advance(to: 5)
         perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
         await drain()
+        await matchedBoundaryFrame(2, perception, clock, yaw: 0)
         XCTAssertEqual(motion.stops, 2, "Even a cancelled alignment must confirm stationary motors afterward")
         XCTAssertEqual(coordinator.state, .aligning)
         XCTAssertTrue(motion.goals.isEmpty)
@@ -1627,6 +1606,8 @@ final class FollowMeCoordinatorTests: XCTestCase {
         XCTAssertTrue(motion.goals.isEmpty)
         perception.send(frame(2, at: 5, people: [person(2, at: 5)]))
         await drain()
+        XCTAssertTrue(motion.alignments.isEmpty, "Detection capture is before its new stop ACK")
+        await matchedBoundaryFrame(3, perception, clock, yaw: 0)
         XCTAssertEqual(motion.alignments, [.pi / 2])
         XCTAssertTrue(motion.goals.isEmpty)
         _ = await coordinator.stop()
@@ -1673,9 +1654,9 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let (coordinator, perception, motion, clock) = productionSetup()
         await acquireWaiting(coordinator, perception, clock)
         for (sequence, x, y) in [(UInt64(4), 0.5, sqrt(16 - 0.25)), (5, 0.0, 3.5), (6, 0.0, 4.0)] {
-            perception.send(frame(sequence, at: 5,
-                                  people: [person(sequence, at: 5, x: x, y: y, screen: 0.65),
-                                           person(sequence, at: 5, x: 6, y: 6, screen: 0.5)]))
+            perception.send(frame(sequence, at: clock.now,
+                                  people: [person(sequence, at: clock.now, x: x, y: y, screen: 0.65),
+                                           person(sequence, at: clock.now, x: 6, y: 6, screen: 0.5)]))
             await drain()
             XCTAssertEqual(coordinator.state, .waitingForMovement)
             XCTAssertTrue(motion.goals.isEmpty)
@@ -1687,13 +1668,14 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let (coordinator, perception, motion, clock) = productionSetup()
         await acquireWaiting(coordinator, perception, clock)
         let stops = motion.stops
-        perception.send(frame(4, at: 5, depth: false))
+        let outage = clock.now
+        perception.send(frame(4, at: outage, depth: false))
         await drain()
-        clock.advance(to: 6)
-        perception.send(frame(5, at: 6, pose: nil))
+        clock.advance(to: outage + 1)
+        perception.send(frame(5, at: clock.now, pose: nil))
         await drain()
         XCTAssertEqual(motion.stops, stops + 1)
-        clock.advance(to: 7)
+        clock.advance(to: outage + 2)
         await drain()
         XCTAssertEqual(coordinator.state, .failed(FollowPerceptionIssue.poseUnavailable.message))
         XCTAssertTrue(motion.goals.isEmpty)
@@ -1735,28 +1717,24 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5)]))
         await drain()
-        clock.advance(to: 5.2)
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0)
         motion.releaseAlignment()
         await drain()
-        perception.send(frame(2, at: 5.1, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(2, at: 5.1)]))
+        perception.send(frame(2, at: 5.2, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(2, at: 5.2)]))
         await drain()
         XCTAssertEqual(coordinator.state, .aligning, "Delayed in-turn observation cannot establish baseline")
         XCTAssertEqual(motion.alignments.count, 1, "Wait for a post-completion frame")
-        perception.send(frame(3, at: 5.2, people: [person(3, at: 5.2)]))
-        await drain()
+        await matchedBoundaryFrame(3, perception, clock, yaw: 0)
         XCTAssertEqual(coordinator.state, .aligning, "Arrival alone cannot certify heading")
+        await matchedBoundaryFrame(4, perception, clock, yaw: 0)
         XCTAssertEqual(motion.alignments.count, 2)
         motion.releaseAlignment()
         await drain()
-        perception.send(frame(4, at: 5.2, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(4, at: 5.2)]))
-        await drain()
-        perception.send(frame(5, at: 5.2, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(5, at: 5.2)]))
-        await drain()
+        await matchedBoundaryFrame(5, perception, clock)
+        await matchedBoundaryFrame(6, perception, clock)
         XCTAssertEqual(coordinator.state, .waitingForMovement)
         XCTAssertTrue(motion.goals.isEmpty)
         _ = await coordinator.stop()
@@ -1766,6 +1744,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let perception = FollowPerceptionFake()
         let motion = FollowMotionFake()
         let clock = ManualFollowClock()
+        motion.useSourceClock(clock)
         return (FollowMeCoordinator(perception: perception, motion: motion, clock: clock,
                                     eventSink: { _, _ in }), perception, motion, clock)
     }
@@ -1774,6 +1753,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let perception = FollowPerceptionFake()
         let motion = AbsoluteRecoveryMotionFake()
         let clock = ManualFollowClock()
+        motion.legacy.useSourceClock(clock)
         motion.sample = .init(pose: Pose2D(position: .zero, yaw: .pi / 2),
             frameID: ARFrameID(generation: 1, sequence: 100), sourceTimestamp: 5,
             trackingQuality: .normal, source: "synthetic")
@@ -1786,38 +1766,56 @@ final class FollowMeCoordinatorTests: XCTestCase {
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5)]))
         await drain()
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(2, at: 5)]))
-        await drain()
-        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(3, at: 5)]))
-        await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0)
+        await matchedBoundaryFrame(2, perception, clock)
+        await matchedBoundaryFrame(3, perception, clock)
         XCTAssertEqual(coordinator.state, .waitingForMovement)
+    }
+
+    private func acquireSignaling(_ coordinator: FollowMeCoordinator, _ perception: FollowPerceptionFake,
+                                  _ clock: ManualFollowClock, range: Double = 4) async {
+        _ = await coordinator.start()
+        await drain()
+        clock.advance(to: 5)
+        perception.send(frame(0, at: 5, people: [person(0, at: 5, y: range)]))
+        await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0, y: range)
+        await matchedBoundaryFrame(2, perception, clock, y: range)
+        XCTAssertEqual(coordinator.state, .signalingReady)
+    }
+
+    /// One deliberate capture event; never auto-pumps while motion/outage is pending.
+    private func matchedBoundaryFrame(_ sequence: UInt64, _ perception: FollowPerceptionFake,
+                                      _ clock: ManualFollowClock, yaw: Double = .pi / 2,
+                                      position: Vec2 = .zero, x: Double = 0, y: Double = 4,
+                                      at timestamp: TimeInterval? = nil) async {
+        let time = timestamp ?? clock.now + 0.301
+        clock.advance(to: time)
+        perception.send(frame(sequence, at: time, pose: Pose2D(position: position, yaw: yaw),
+            people: [person(sequence, at: time, x: x, y: y)]))
+        await drain()
     }
 
     func testLossBeforeDepartureReacquiresAndRetainsFixedBaseline() async {
         let (coordinator, perception, motion, clock) = sourcedRecoverySetup()
         motion.suspendRotation = true
         await acquireWaiting(coordinator, perception, clock)
-        perception.send(frame(4, at: 5))
+        perception.send(frame(4, at: clock.now))
         await drain()
         XCTAssertEqual(coordinator.state, .reacquiring)
-        perception.send(frame(5, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(5, at: 5, y: 4.2)]))
+        perception.send(frame(5, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(5, at: clock.now, y: 4.2)]))
         await drain()
         XCTAssertEqual(coordinator.state, .aligning)
         XCTAssertTrue(motion.goals.isEmpty, "Reacquisition cannot bypass departure")
-        perception.send(frame(6, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(6, at: 5, y: 4.2)]))
-        await drain()
+        await matchedBoundaryFrame(6, perception, clock, y: 4.2)
+        XCTAssertEqual(coordinator.state, .aligning)
+        await matchedBoundaryFrame(7, perception, clock, y: 4.299)
         XCTAssertEqual(coordinator.state, .waitingForMovement)
-        perception.send(frame(7, at: 5, people: [person(7, at: 5, y: 4.299)]))
-        await drain()
         XCTAssertTrue(motion.goals.isEmpty)
-        perception.send(frame(8, at: 5, people: [person(8, at: 5, y: 4.3)]))
-        await drain()
+        await matchedBoundaryFrame(8, perception, clock, y: 4.3)
         XCTAssertEqual(motion.goals.count, 1, "The original baseline survives reacquisition")
         XCTAssertEqual(motion.readySignals, 1, "Reacquisition cannot repeat the ready move")
         _ = await coordinator.stop()
@@ -1832,13 +1830,15 @@ final class FollowMeCoordinatorTests: XCTestCase {
         clock.advance(to: 5)
         perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
         await drain()
+        await matchedBoundaryFrame(2, perception, clock, yaw: 0)
         XCTAssertEqual(motion.alignments.count, 1)
         _ = await coordinator.stop()
         _ = await coordinator.start()
         await drain()
-        clock.advance(to: 10)
-        perception.send(frame(1, at: 10, people: [person(1, at: 10)]))
+        clock.advance(to: clock.now + 5)
+        perception.send(frame(1, at: clock.now, people: [person(1, at: clock.now)]))
         await drain()
+        await matchedBoundaryFrame(2, perception, clock, yaw: 0)
         XCTAssertEqual(motion.alignments.count, 2, "An old suspended alignment cannot block a new generation")
         motion.releaseAlignment()
         await drain()
@@ -1850,37 +1850,33 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let perception = FollowPerceptionFake()
         let motion = FollowMotionFake()
         let clock = ManualFollowClock()
+        motion.useSourceClock(clock)
         motion.suspendAlignment = true
         let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock)
         _ = await coordinator.start()
         await drain()
         clock.advance(to: 5)
-        perception.send(frame(1, at: 5, people: [person(1, at: 5)]))
+        perception.send(frame(0, at: 5, people: [person(0, at: 5)]))
         await drain()
+        await matchedBoundaryFrame(1, perception, clock, yaw: 0)
         XCTAssertEqual(motion.alignments, [.pi / 2])
-        perception.send(frame(2, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(2, at: 5, y: 4.5)]))
-        await drain()
+        await matchedBoundaryFrame(2, perception, clock, y: 4.5)
         XCTAssertTrue(motion.goals.isEmpty)
         motion.releaseAlignment()
         await drain()
         XCTAssertEqual(coordinator.state, .aligning, "An in-turn frame cannot establish the baseline")
-        perception.send(frame(3, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(3, at: 5, y: 4.5)]))
-        await drain()
-        perception.send(frame(4, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(4, at: 5, y: 4.5)]))
-        await drain()
+        await matchedBoundaryFrame(3, perception, clock, y: 4.5)
+        await matchedBoundaryFrame(4, perception, clock, y: 4.5)
         XCTAssertEqual(String(describing: coordinator.state), "waitingForMovement")
         XCTAssertEqual(motion.stops, 3, "Alignment and ready signal end with confirmed stops")
         for (sequence, distance) in [(UInt64(5), 4.5), (6, 4.3), (7, 4.799)] {
-            perception.send(frame(sequence, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                                  people: [person(sequence, at: 5, y: distance)]))
+            perception.send(frame(sequence, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                                  people: [person(sequence, at: clock.now, y: distance)]))
             await drain()
             XCTAssertTrue(motion.goals.isEmpty, "Stationary, toward, and .299-away observations must hold")
         }
-        perception.send(frame(8, at: 5, pose: Pose2D(position: .zero, yaw: .pi / 2),
-                              people: [person(8, at: 5, y: 4.8)]))
+        perception.send(frame(8, at: clock.now, pose: Pose2D(position: .zero, yaw: .pi / 2),
+                              people: [person(8, at: clock.now, y: 4.8)]))
         await drain()
         XCTAssertEqual(coordinator.state, .following)
         XCTAssertEqual(motion.goals.count, 1)
@@ -1892,6 +1888,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let perception = FollowPerceptionFake()
         let motion = FollowMotionFake()
         let clock = ManualFollowClock()
+        motion.useSourceClock(clock)
         motion.suspendRotation = true
         motion.suspendAlignment = true
         let coordinator = FollowMeCoordinator(perception: perception, motion: motion, clock: clock)
@@ -1904,13 +1901,15 @@ final class FollowMeCoordinatorTests: XCTestCase {
         perception.send(frame(2, at: 5, pose: Pose2D(position: Vec2(1, 1), yaw: -3 * .pi / 4),
                               people: [person(2, at: 5, x: -3, y: 1)]))
         await drain()
+        XCTAssertTrue(motion.alignments.isEmpty)
+        await matchedBoundaryFrame(3, perception, clock, yaw: -3 * .pi / 4, position: Vec2(1, 1), x: -3, y: 1)
         XCTAssertEqual(motion.alignments.count, 1)
         if let angle = motion.alignments.first { XCTAssertEqual(angle, -.pi / 4, accuracy: 0.0001) }
         XCTAssertEqual(String(describing: coordinator.state), "aligning")
         XCTAssertTrue(motion.goals.isEmpty)
         XCTAssertGreaterThanOrEqual(motion.stops, 1)
         XCTAssertTrue(motion.stopOrigins.contains(.detection), "Detection attribution is captured before the stop suspension")
-        perception.send(frame(3, at: 5, depth: false))
+        perception.send(frame(4, at: clock.now, depth: false))
         await drain()
         XCTAssertEqual(coordinator.perceptionIssue, .depthUnavailable, "Alignment cannot block perception")
         motion.releaseRotation()
@@ -2914,17 +2913,20 @@ final class FollowMeCoordinatorTests: XCTestCase {
         let clock = ManualFollowClock()
         let sink = FollowDiagnosticRecordingSink()
         let pulseGate = FollowDiagnosticSuspension()
+        let source = CoordinatorTurnSource(clock: clock)
         let emitter = FollowDiagnosticEmitter(streamID: "reacquisition-deadline", monotonic: { clock.now },
             utc: { Date(timeIntervalSince1970: clock.now) }, sink: sink.append)
         var sends = 0
         let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil },
-            sendCommand: { _ in sends += 1 }, stopRover: {}, sleep: { duration in
-                if duration == .milliseconds(200) { await pulseGate.suspend() }
-            }, diagnosticEmitter: emitter, poseSample: {
-                .init(pose: Pose2D(position: .zero, yaw: 0), frameID: ARFrameID(generation: 1, sequence: 100),
-                    sourceTimestamp: clock.now, trackingQuality: .normal, source: "synthetic")
-            }, sourceNow: { clock.now })
+            sendCommand: { _ in sends += 1; await pulseGate.suspend() }, stopRover: {},
+            sleep: { duration in await clock.sleep(seconds: duration.secondsValue) },
+            now: { Date(timeIntervalSince1970: 100) }, diagnosticEmitter: emitter,
+            poseSample: { source.sample }, sourceNow: { clock.now }, sourceStopSnapshot: { source.sample })
+        source.onCapture = { sample in
+            controller.ingestFollowTurnSource(sample)
+            perception.send(self.frame(sample.frameID!.sequence, at: sample.sourceTimestamp!))
+        }
         var config = FollowMeConfiguration()
         config.stationaryPauseSeconds = 0
         config.departureRangeIncrease = 0
@@ -2936,20 +2938,21 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await drain()
         XCTAssertEqual(coordinator.state, .holdingDistance)
         perception.send(frame(2))
-        await pulseGate.waitUntilEntered()
+        await drain()
+        source.advance(by: 0.301)
+        for _ in 0..<1000 where !pulseGate.entered { await Task.yield() }
+        XCTAssertTrue(pulseGate.entered, "Reach the real pending burst response, not an obsolete 200ms wait")
         XCTAssertEqual(sends, 1)
         for step in 1...19 {
             let time = Double(step) / 2
-            clock.advance(to: time)
-            perception.send(frame(UInt64(step + 2), at: time))
+            source.advance(by: time - clock.now)
             await drain()
         }
-        clock.advance(to: 9.999)
-        perception.send(frame(22, at: 9.999))
+        source.advance(by: 9.999 - clock.now)
         await drain()
         XCTAssertEqual(coordinator.state, .reacquiring)
         clock.advance(to: 10)
-        perception.send(frame(23, at: 10, people: [person(23, at: 10, y: 1.5)]))
+        perception.send(frame(source.sequence + 1, at: 10, people: [person(source.sequence + 1, at: 10, y: 1.5)]))
         await drain()
         XCTAssertFalse(coordinator.isActive, "Deadline enforcement does not wait for the pulse")
         XCTAssertTrue(sink.records.contains { $0.event == "follow_scan.cancel" })
@@ -2958,15 +2961,17 @@ final class FollowMeCoordinatorTests: XCTestCase {
         await drain()
         _ = await coordinator.stop()
         clock.advance(to: 11)
-        perception.send(frame(24, at: 11, people: [person(24, at: 11, y: 1.5)]))
+        perception.send(frame(source.sequence + 2, at: 11, people: [person(source.sequence + 2, at: 11, y: 1.5)]))
         await drain()
         let events = try sink.records.filter { $0.fields["payload"] != nil }.map {
             try JSONSerialization.jsonObject(with: Data($0.fields["payload"]!.utf8)) as! [String: Any]
         }
         XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.operation_begin" }.count, 1)
         XCTAssertEqual(events.first { $0["event"] as? String == "follow_scan.operation_begin" }?["phase"] as? String, "reacquiring")
-        XCTAssertEqual(events.first { $0["event"] as? String == "follow_scan.pulse_wait_end" }?["outcome"] as? String, "interrupted")
-        XCTAssertFalse(events.contains { $0["event"] as? String == "follow_scan.settle_begin" })
+        XCTAssertFalse(events.contains { $0["event"] as? String == "follow_scan.pulse_wait_begin" },
+            "Expired pending response cannot add a motor wait after drain")
+        XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.settle_begin" }.count, 1,
+            "Only the mandatory initial settle occurred; cancellation cannot enter a post-burst settle")
         XCTAssertEqual(sends, 1, "Neither deadline nor stale completion permits another send")
         XCTAssertEqual(controller.safetyState, .idle)
     }
@@ -2978,13 +2983,18 @@ final class FollowMeCoordinatorTests: XCTestCase {
             let sink = FollowDiagnosticRecordingSink()
             let gate = FollowDiagnosticSuspension()
             let alignmentGate = FollowDiagnosticSuspension()
+            let source = CoordinatorTurnSource(clock: clock)
+            var remainingWaitEntered = false
             let emitter = FollowDiagnosticEmitter(streamID: boundary, monotonic: { clock.now },
-                utc: { Date(timeIntervalSince1970: clock.now) }, sink: sink.append)
+                utc: { Date(timeIntervalSince1970: clock.now) }, sink: { event, fields in
+                    sink.append(event, fields: fields)
+                    if event == "follow_scan.pulse_wait_begin" { remainingWaitEntered = true }
+                })
             var sends = 0
             var stops = 0
             var waits: [Double] = []
             let controller = NavigationController(currentPose: { Pose2D(position: .zero, yaw: 0) },
-                forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { nil },
+                forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { Date(timeIntervalSince1970: 100) },
                 sendCommand: { _ in
                     sends += 1
                     if sends == 1, boundary == "send" { await gate.suspend() }
@@ -2996,18 +3006,36 @@ final class FollowMeCoordinatorTests: XCTestCase {
                     let parts = duration.components
                     let seconds = Double(parts.seconds) + Double(parts.attoseconds) / 1e18
                     waits.append(seconds)
-                    if (boundary == "pulse" && seconds == 0.2) || (boundary == "settle" && seconds == 0.3) {
+                    if !gate.entered && ((boundary == "pulse" && remainingWaitEntered && stops == 1 && seconds <= 0.080 + 1e-12)
+                        || (boundary == "settle" && stops == 2 && seconds <= 0.300)) {
                         await gate.suspend()
+                    } else {
+                        await clock.sleep(seconds: seconds)
                     }
-                }, diagnosticEmitter: emitter)
+                }, now: { Date(timeIntervalSince1970: 100) }, diagnosticEmitter: emitter,
+                poseSample: { source.sample }, sourceNow: { clock.now }, sourceStopSnapshot: { source.sample })
+            source.onCapture = { controller.ingestFollowTurnSource($0) }
             let coordinator = FollowMeCoordinator(perception: perception,
                 motion: NavigationFollowMeMotion(navigation: controller), clock: clock, eventSink: sink.append)
             _ = await coordinator.start()
             await drain()
-            clock.advance(to: 5)
+            source.advance(by: 5)
             perception.send(frame(1, at: 5))
-            await gate.waitUntilEntered()
-            perception.send(frame(2, at: 5, people: [person(2, at: 5)]))
+            await drain()
+            source.advance(by: 0.301)
+            for _ in 0..<1000 where sends == 0 { await Task.yield() }
+            XCTAssertEqual(sends, 1, boundary)
+            if boundary == "stop" || boundary == "settle" {
+                // SEND entry is not remaining-wait entry: let the asynchronous ACK read finish
+                // before deliberately expiring the burst to reach its stop/settle boundary.
+                for _ in 0..<1000 where !remainingWaitEntered { await Task.yield() }
+                XCTAssertTrue(remainingWaitEntered, "Reach the original scan's remaining wait: \(boundary)")
+                source.advance(by: 0.081)
+            }
+            for _ in 0..<1000 where !gate.entered { await Task.yield() }
+            XCTAssertTrue(gate.entered, "Reach the actual \(boundary) suspension")
+            source.advance(by: 0.001)
+            perception.send(frame(source.sequence, at: clock.now, people: [person(source.sequence, at: clock.now)]))
             await drain()
             XCTAssertEqual(coordinator.state, .aligning, boundary)
             let captured = try sink.records.filter { $0.event == "follow_scan.cancel" }.map {
@@ -3018,7 +3046,14 @@ final class FollowMeCoordinatorTests: XCTestCase {
             XCTAssertEqual(captured.first?["fenced"] as? Bool, true, boundary)
             XCTAssertEqual(sends, 1, "No alignment send before the suspended scan drains: \(boundary)")
             gate.release()
-            await alignmentGate.waitUntilEntered()
+            await drain()
+            for _ in 0..<2 {
+                source.advance(by: 0.301)
+                perception.send(frame(source.sequence, at: clock.now, people: [person(source.sequence, at: clock.now)]))
+                await drain()
+            }
+            for _ in 0..<1000 where !alignmentGate.entered { await Task.yield() }
+            XCTAssertTrue(alignmentGate.entered, "Two deliberate post-stop source frames permit the new alignment")
             let events = try sink.records.filter { $0.fields["payload"] != nil }.map {
                 try JSONSerialization.jsonObject(with: Data($0.fields["payload"]!.utf8)) as! [String: Any]
             }
@@ -3026,12 +3061,16 @@ final class FollowMeCoordinatorTests: XCTestCase {
                 $0["event"] as? String == "follow_scan.stop_response"
                     && $0["stop_origin"] as? String == "detection"
                     && $0["stop_outcome"] as? String == "confirmed"
-            }, "Controller confirmation must precede continuous alignment: \(boundary)")
-            XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.operation_begin" }.count, 1)
-            XCTAssertEqual(sends, 2, "One scan send, then one continuous alignment send")
-            if boundary == "send" { XCTAssertTrue(waits.isEmpty) }
-            if boundary == "pulse" || boundary == "stop" { XCTAssertEqual(waits, [0.2]) }
-            if boundary == "settle" { XCTAssertEqual(waits, [0.2, 0.3]) }
+            }, "Controller confirmation must precede the new alignment: \(boundary)")
+            XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.operation_begin" && $0["purpose"] as? String == "followScan" }.count, 1)
+            XCTAssertEqual(events.filter { $0["event"] as? String == "follow_scan.operation_begin" && $0["purpose"] as? String == "followAlignment" }.count, 1)
+            XCTAssertEqual(sends, 2, "One scan send, then one alignment burst")
+            let motorWaits = events.filter { $0["event"] as? String == "follow_scan.pulse_wait_begin" }
+                .compactMap { $0["requested_wait_s"] as? Double }
+            XCTAssertTrue(motorWaits.allSatisfy { $0 > 0 && $0 <= 0.080 + 1e-12 })
+            if boundary == "send" { XCTAssertTrue(motorWaits.isEmpty, "Pending send cancellation adds no motor wait") }
+            else { XCTAssertEqual(motorWaits.count, 1, "Only the original scan's remaining budget wait entered") }
+            XCTAssertFalse(waits.contains { abs($0 - 0.200) < 1e-12 }, "No obsolete 200ms pulse wait")
             coordinator.inhibitMotion()
             let terminalStop = Task { await coordinator.stop() }
             await drain()
@@ -3046,6 +3085,7 @@ final class FollowMeCoordinatorTests: XCTestCase {
     func testDetectionFencesSuspendedAckBeforeQueuedAlignmentTaskCanRun() async {
         let perception = FollowPerceptionFake()
         let clock = ManualFollowClock()
+        let source = CoordinatorTurnSource(clock: clock)
         let ackGate = FollowDiagnosticSuspension()
         let sink = FollowDiagnosticRecordingSink()
         var scanSends = 0
@@ -3058,8 +3098,11 @@ final class FollowMeCoordinatorTests: XCTestCase {
             forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: {
                 if !ackGate.entered { await ackGate.suspend() }
                 return nil
-            }, sendCommand: { _ in }, stopRover: {}, sleep: { _ in await Task.yield() },
-            diagnosticEmitter: emitter)
+            }, sendCommand: { _ in }, stopRover: {},
+            sleep: { duration in await clock.sleep(seconds: duration.secondsValue) },
+            now: { Date(timeIntervalSince1970: 100) }, diagnosticEmitter: emitter,
+            poseSample: { source.sample }, sourceNow: { clock.now }, sourceStopSnapshot: { source.sample })
+        source.onCapture = { controller.ingestFollowTurnSource($0) }
         let coordinator = FollowMeCoordinator(perception: perception,
             motion: NavigationFollowMeMotion(navigation: controller), clock: clock, eventSink: { event, fields in
                 sink.append(event, fields: fields)
@@ -3069,19 +3112,56 @@ final class FollowMeCoordinatorTests: XCTestCase {
             })
         _ = await coordinator.start()
         await drain()
-        clock.advance(to: 5)
+        source.advance(by: 5)
         perception.send(frame(1, at: 5))
-        await ackGate.waitUntilEntered()
-        perception.send(frame(2, at: 5, people: [person(2, at: 5, x: 4, y: 0)]))
+        await drain()
+        source.advance(by: 0.301)
+        for _ in 0..<1000 where !ackGate.entered { await Task.yield() }
+        XCTAssertTrue(ackGate.entered, "The queued actual ACK getter is the intended suspension")
+        perception.send(frame(4, at: clock.now, people: [person(4, at: clock.now, x: 4, y: 0)]))
         await drain()
         XCTAssertEqual(scanSends, 0, "An eligible detection cannot authorize a queued scan acknowledgement to send")
+        ackGate.release()
         _ = await coordinator.stop()
     }
 }
 
+/// A bounded, explicit camera capture at each simulated timer/response boundary.
+/// Providers only read the stored sample; no capture is generated by a read.
 @MainActor
-private final class AbsoluteRecoveryMotionFake: FollowMeAbsoluteHeadingMotion {
+private final class CoordinatorTurnSource {
+    let clock: ManualFollowClock
+    let position: Vec2
+    var yaw = 0.0
+    private(set) var sequence: UInt64 = 1
+    private(set) var sample: NavigationPoseSample
+    var onCapture: ((NavigationPoseSample) -> Void)?
+
+    init(clock: ManualFollowClock, position: Vec2 = .zero) {
+        self.clock = clock
+        self.position = position
+        sample = .init(pose: .init(position: position, yaw: 0), frameID: .init(generation: 1, sequence: 1),
+            sourceTimestamp: clock.now, trackingQuality: .normal, source: "synthetic_ar")
+    }
+
+    func advance(by seconds: Double, captureLag: Double = 0) {
+        guard sequence < 160 else { XCTFail("Finite fixture capture schedule exhausted"); return }
+        clock.advance(to: clock.now + max(0.001, seconds))
+        sequence += 1
+        sample = .init(pose: .init(position: position, yaw: yaw), frameID: .init(generation: 1, sequence: sequence),
+            sourceTimestamp: clock.now - captureLag, trackingQuality: .normal, source: "synthetic_ar")
+        onCapture?(sample)
+    }
+}
+
+private extension Duration {
+    var secondsValue: Double { Double(components.seconds) + Double(components.attoseconds) / 1e18 }
+}
+
+@MainActor
+private final class AbsoluteRecoveryMotionFake: FollowMeAbsoluteHeadingMotion, FollowMeSourceClockMotion {
     let legacy = FollowMotionFake()
+    var sourceUptime: TimeInterval? { legacy.sourceUptime }
     var sample = NavigationPoseSample(pose: Pose2D(position: .zero, yaw: 0),
         frameID: ARFrameID(generation: 1, sequence: 100), sourceTimestamp: 0, trackingQuality: .normal, source: "synthetic")
     var headings: [Double] = []

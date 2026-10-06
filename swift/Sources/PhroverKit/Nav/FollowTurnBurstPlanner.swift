@@ -1,0 +1,314 @@
+import Foundation
+
+/// Pure, operation-local host-request planning. Angles are radians; host/source
+/// durations are seconds. Neither observed rates nor sampled travel certify
+/// physical speed, total coast, or motor-on duration. No motor or stop authority.
+public enum FollowTurnBurstPlanner {
+    public enum Purpose: Sendable { case alignment, scan }
+    public struct Profile: Sendable, Equatable {
+        public let maximumHostBurstBudget: Double = 0.080
+        public let initialReferenceRate: Double = 2 * .pi / 3
+        public let settleWait: Double = 0.300
+        public let fixedWheelMagnitude: Double = 0.25
+        public let tolerance: Double
+        public init(purpose: Purpose) { tolerance = purpose == .alignment ? 0.05 : 7 * .pi / 180 }
+    }
+    public struct Calibration: Sendable, Equatable {
+        public let operationID: UInt64
+        public let generation: UInt64
+        public let targetYaw: Double
+        public let clockDomain: String
+        public let responseRate: Double
+        /// Nil allowances are unknown and omitted arithmetically, never measured zero.
+        public let maximumSendDuration: Double?
+        public let maximumStopDuration: Double?
+        /// Partial sampled travel after acknowledgement, not total physical coast.
+        public let observedPostAckTravel: Double?
+        public let overshootCeiling: Double?
+        public let completedResponses: Int
+        public let terminalResolutionFailure: Bool
+        public let lastStopAcknowledgementUptime: Double?
+        public let lastSourceSequence: UInt64?
+        public let lastSourceTimestamp: Double?
+        public let lastSourceSample: Sample?
+        public init(operationID: UInt64, generation: UInt64, targetYaw: Double, clockDomain: String) {
+            self.operationID = operationID
+            self.generation = generation
+            self.targetYaw = targetYaw
+            self.clockDomain = clockDomain
+            responseRate = 2 * .pi / 3
+            maximumSendDuration = nil
+            maximumStopDuration = nil
+            observedPostAckTravel = nil
+            overshootCeiling = nil
+            completedResponses = 0
+            terminalResolutionFailure = false
+            lastStopAcknowledgementUptime = nil
+            lastSourceSequence = nil
+            lastSourceTimestamp = nil
+            lastSourceSample = nil
+        }
+        fileprivate init(previous: Self, rate: Double, send: Double, stop: Double,
+                         travel: Double?, ceiling: Double? = nil, terminal: Bool = false, response: Response) {
+            operationID = previous.operationID
+            generation = previous.generation
+            targetYaw = previous.targetYaw
+            clockDomain = previous.clockDomain
+            responseRate = rate
+            maximumSendDuration = send
+            maximumStopDuration = stop
+            observedPostAckTravel = travel
+            overshootCeiling = ceiling
+            completedResponses = previous.completedResponses + 1
+            terminalResolutionFailure = previous.terminalResolutionFailure || terminal
+            lastStopAcknowledgementUptime = response.stopAcknowledgementUptime
+            lastSourceSequence = response.samples.last?.sequence ?? previous.lastSourceSequence
+            lastSourceTimestamp = response.samples.last?.sourceTimestamp ?? previous.lastSourceTimestamp
+            lastSourceSample = response.samples.last ?? previous.lastSourceSample
+        }
+    }
+    public struct Input: Sendable {
+        public let actualYaw: Double
+        public let profile: Profile
+        public let calibration: Calibration
+        public let sendEntryUptime: Double
+        /// Integration attests current stopped/fresh source and operation authority.
+        public let authorized: Bool
+        /// Integration records sender entry even if no valid response can be reduced.
+        /// Unknown response permits one initial probe, never a calibration retry.
+        public let provisionalProbeIssued: Bool
+        public init(actualYaw: Double, profile: Profile, calibration: Calibration,
+                    sendEntryUptime: Double, authorized: Bool = true, provisionalProbeIssued: Bool = false) {
+            self.actualYaw = actualYaw
+            self.profile = profile
+            self.calibration = calibration
+            self.sendEntryUptime = sendEntryUptime
+            self.authorized = authorized
+            self.provisionalProbeIssued = provisionalProbeIssued
+        }
+    }
+    public enum Decision: Sendable, Equatable {
+        case arrived
+        case burst(direction: Int, budget: Double)
+        case resolutionFailure(NavigationFailure)
+        case unavailable
+    }
+    /// Collection uptime and source time must share the explicitly named clock domain.
+    /// Missing provenance represents unknown/legacy evidence, never manufactured freshness.
+    public struct Sample: Sendable, Equatable {
+        public let yaw: Double
+        public let sequence: UInt64?
+        public let generation: UInt64?
+        public let sourceTimestamp: Double?
+        public let collectedUptime: Double
+        public let clockDomain: String?
+        /// True only for normal tracking/health at collection, not at a later read.
+        public let healthy: Bool
+        public let sourceIdentity: String?
+        public let trackingState: String?
+        public init(yaw: Double, sequence: UInt64?, generation: UInt64?, sourceTimestamp: Double?,
+                    collectedUptime: Double, clockDomain: String?, healthy: Bool) {
+            self.init(yaw: yaw, sequence: sequence, generation: generation, sourceTimestamp: sourceTimestamp,
+                collectedUptime: collectedUptime, clockDomain: clockDomain, healthy: healthy,
+                sourceIdentity: nil, trackingState: nil)
+        }
+        public init(yaw: Double, sequence: UInt64?, generation: UInt64?, sourceTimestamp: Double?,
+                    collectedUptime: Double, clockDomain: String?, healthy: Bool,
+                    sourceIdentity: String?, trackingState: String?) {
+            self.yaw = yaw
+            self.sequence = sequence
+            self.generation = generation
+            self.sourceTimestamp = sourceTimestamp
+            self.collectedUptime = collectedUptime
+            self.clockDomain = clockDomain
+            self.healthy = healthy
+            self.sourceIdentity = sourceIdentity
+            self.trackingState = trackingState
+        }
+        /// Diagnostic labels do not change the planner's exact-boundary equality.
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.yaw == rhs.yaw && lhs.sequence == rhs.sequence && lhs.generation == rhs.generation &&
+                lhs.sourceTimestamp == rhs.sourceTimestamp && lhs.collectedUptime == rhs.collectedUptime &&
+                lhs.clockDomain == rhs.clockDomain && lhs.healthy == rhs.healthy
+        }
+    }
+    public enum Completion: Sendable { case completed, cancelled, failed, replaced, ambiguous }
+    public struct Response: Sendable {
+        public let operationID: UInt64
+        public let generation: UInt64
+        public let targetYaw: Double
+        public let clockDomain: String
+        public let completion: Completion
+        public let requestedBudget: Double
+        public let sendEntryUptime: Double
+        public let sendResponseUptime: Double
+        public let stopObligationUptime: Double
+        public let stopAcknowledgementUptime: Double
+        /// Ordered source evidence; endpoints may be missing. Missing is unknown,
+        /// while supplied invalid/unhealthy evidence rejects the entire reduction.
+        public let samples: [Sample]
+        /// Caller attests intervals are unambiguous; shortest deltas cannot prove missed full turns.
+        public let traversalUnambiguous: Bool
+        public init(operationID: UInt64, generation: UInt64, targetYaw: Double, clockDomain: String,
+                    completion: Completion = .completed, requestedBudget: Double,
+                    sendEntryUptime: Double, sendResponseUptime: Double, stopObligationUptime: Double,
+                    stopAcknowledgementUptime: Double, samples: [Sample], traversalUnambiguous: Bool = true) {
+            self.operationID = operationID
+            self.generation = generation
+            self.targetYaw = targetYaw
+            self.clockDomain = clockDomain
+            self.completion = completion
+            self.requestedBudget = requestedBudget
+            self.sendEntryUptime = sendEntryUptime
+            self.sendResponseUptime = sendResponseUptime
+            self.stopObligationUptime = stopObligationUptime
+            self.stopAcknowledgementUptime = stopAcknowledgementUptime
+            self.samples = samples
+            self.traversalUnambiguous = traversalUnambiguous
+        }
+    }
+    public struct Reduction: Sendable {
+        public let calibration: Calibration
+        /// Rejection preserves all prior calibration. It is not motion authority:
+        /// integration must remain stopped and resolve invalid/cancelled evidence.
+        public let rejection: String?
+        public let signedResponse: Double?
+        public let sampledAbsoluteTravel: Double?
+        fileprivate init(calibration: Calibration, rejection: String?, signedResponse: Double? = nil,
+                         sampledAbsoluteTravel: Double? = nil) {
+            self.calibration = calibration
+            self.rejection = rejection
+            self.signedResponse = signedResponse
+            self.sampledAbsoluteTravel = sampledAbsoluteTravel
+        }
+    }
+    public static func recording(_ response: Response, in calibration: Calibration,
+                                 profile: Profile) -> Reduction {
+        func reject(_ reason: String) -> Reduction { .init(calibration: calibration, rejection: reason) }
+        guard response.operationID == calibration.operationID, response.generation == calibration.generation,
+              response.targetYaw.isFinite, response.targetYaw == calibration.targetYaw,
+              !calibration.clockDomain.isEmpty, response.clockDomain == calibration.clockDomain else {
+            return reject("attribution_changed")
+        }
+        guard response.completion == .completed, response.traversalUnambiguous else { return reject("incomplete_or_ambiguous") }
+        let times = [response.sendEntryUptime, response.sendResponseUptime,
+                     response.stopObligationUptime, response.stopAcknowledgementUptime]
+        guard times.allSatisfy({ $0.isFinite && $0 >= 0 }),
+              response.sendResponseUptime >= response.sendEntryUptime,
+              response.stopObligationUptime >= response.sendEntryUptime,
+              response.stopAcknowledgementUptime >= max(response.sendResponseUptime, response.stopObligationUptime),
+              response.requestedBudget.isFinite, response.requestedBudget > 0,
+              response.requestedBudget <= profile.maximumHostBurstBudget else { return reject("invalid_host_timing") }
+        if let previousAck = calibration.lastStopAcknowledgementUptime,
+           response.sendEntryUptime <= previousAck { return reject("replayed_response") }
+        var previous: Sample?
+        for sample in response.samples {
+            guard sample.healthy, sample.yaw.isFinite, (calibration.targetYaw - sample.yaw).isFinite,
+                  let sequence = sample.sequence, sample.generation == calibration.generation,
+                  sample.clockDomain == calibration.clockDomain, let timestamp = sample.sourceTimestamp,
+                  timestamp.isFinite, timestamp >= 0, sample.collectedUptime.isFinite,
+                  sample.collectedUptime - timestamp >= 0, sample.collectedUptime - timestamp <= 0.500 else {
+                return reject("invalid_source_at_collection")
+            }
+            if let previous {
+                guard sequence > previous.sequence!, timestamp > previous.sourceTimestamp!,
+                      sample.collectedUptime >= previous.collectedUptime else { return reject("nonadvancing_source") }
+                if abs(wrap(sample.yaw - previous.yaw)) == .pi { return reject("ambiguous_half_turn") }
+            }
+            previous = sample
+        }
+        let hasSettledEndpoint = response.samples.last.map {
+            $0.collectedUptime >= response.stopAcknowledgementUptime + profile.settleWait
+                && $0.sourceTimestamp! > response.stopAcknowledgementUptime
+        } ?? false
+        let hasResponseBracket = response.samples.count >= 2 && hasSettledEndpoint
+            && response.samples.first!.collectedUptime <= response.sendEntryUptime
+        if let first = response.samples.first {
+            // Adjacent brackets can share their exact immutable settled endpoint.
+            // This is reuse as a boundary, never a claim of a new source frame.
+            if first != calibration.lastSourceSample {
+                if let sequence = calibration.lastSourceSequence, first.sequence! <= sequence { return reject("replayed_source") }
+                if let timestamp = calibration.lastSourceTimestamp, first.sourceTimestamp! <= timestamp { return reject("replayed_source") }
+            }
+        }
+        var rate = calibration.responseRate
+        var net = 0.0
+        var sampledTravel = 0.0
+        var postAckTravel = 0.0
+        var postAckIntervals = 0
+        for (before, after) in zip(response.samples, response.samples.dropFirst()) {
+            let delta = wrap(after.yaw - before.yaw)
+            let interval = after.sourceTimestamp! - before.sourceTimestamp!
+            let observedRate = abs(delta) / interval
+            guard delta.isFinite, observedRate.isFinite else { return reject("nonfinite_response_rate") }
+            net += delta
+            sampledTravel += abs(delta)
+            if hasResponseBracket { rate = max(rate, observedRate) }
+            if hasSettledEndpoint, before.sourceTimestamp! > response.stopAcknowledgementUptime {
+                postAckTravel += abs(delta)
+                postAckIntervals += 1
+            }
+        }
+        if hasResponseBracket {
+            let duration = response.samples.last!.sourceTimestamp! - response.samples.first!.sourceTimestamp!
+            let sourceRate = abs(net) / duration
+            let budgetRate = abs(net) / response.requestedBudget
+            guard net.isFinite, sampledTravel.isFinite, sourceRate.isFinite, budgetRate.isFinite, postAckTravel.isFinite else {
+                return reject("nonfinite_response_rate")
+            }
+            rate = max(rate, sourceRate, budgetRate)
+        }
+        let travel = postAckIntervals > 0
+            ? max(calibration.observedPostAckTravel ?? 0, postAckTravel) : calibration.observedPostAckTravel
+        var ceiling = calibration.overshootCeiling
+        var terminal = false
+        if hasResponseBracket {
+            let preError = wrap(calibration.targetYaw - response.samples.first!.yaw)
+            let postError = wrap(calibration.targetYaw - response.samples.last!.yaw)
+            let directedResponse = net * (preError < 0 ? -1 : 1)
+            if abs(preError) > profile.tolerance, directedResponse >= abs(preError), abs(postError) > profile.tolerance {
+                let previousExcess = abs(preError) - profile.tolerance
+                let distance = abs(net)
+                let shrink = response.requestedBudget * min(1, previousExcess / distance)
+                if distance > previousExcess, shrink.isFinite, shrink > 0, shrink < response.requestedBudget {
+                    ceiling = min(ceiling ?? .infinity, shrink)
+                } else { terminal = true }
+            }
+        }
+        return .init(calibration: .init(previous: calibration, rate: rate,
+            send: max(calibration.maximumSendDuration ?? 0, response.sendResponseUptime - response.sendEntryUptime),
+            stop: max(calibration.maximumStopDuration ?? 0, response.stopAcknowledgementUptime - response.stopObligationUptime),
+            travel: travel, ceiling: ceiling, terminal: terminal, response: response), rejection: nil,
+            signedResponse: hasResponseBracket ? net : nil,
+            sampledAbsoluteTravel: hasResponseBracket ? sampledTravel : nil)
+    }
+    public static func plan(_ input: Input) -> Decision {
+        guard input.authorized, input.actualYaw.isFinite, input.calibration.targetYaw.isFinite,
+              input.sendEntryUptime.isFinite, input.sendEntryUptime >= 0,
+              (input.calibration.targetYaw - input.actualYaw).isFinite else { return .unavailable }
+        let error = wrap(input.calibration.targetYaw - input.actualYaw)
+        if abs(error) <= input.profile.tolerance { return .arrived }
+        let calibration = input.calibration
+        if calibration.terminalResolutionFailure || (calibration.completedResponses == 0 && input.provisionalProbeIssued) {
+            return .resolutionFailure(.rotationResolutionInsufficient)
+        }
+        let excess = abs(error) - input.profile.tolerance
+        // E/R - A - C/R deliberately double-counts some equivalent response latency.
+        // Initial-stop duration alone is not a completed nonzero response allowance.
+        let allowance = (calibration.maximumSendDuration ?? 0) + (calibration.maximumStopDuration ?? 0)
+        let candidate = excess / calibration.responseRate - allowance
+            - (calibration.observedPostAckTravel ?? 0) / calibration.responseRate
+        let budget = min(input.profile.maximumHostBurstBudget, candidate, calibration.overshootCeiling ?? .infinity)
+        let deadline = input.sendEntryUptime + budget
+        guard budget.isFinite, budget > 0, deadline.isFinite, deadline > input.sendEntryUptime else {
+            return .resolutionFailure(.rotationResolutionInsufficient)
+        }
+        return .burst(direction: error < 0 ? -1 : 1, budget: budget)
+    }
+    private static func wrap(_ angle: Double) -> Double {
+        var value = angle.truncatingRemainder(dividingBy: 2 * .pi)
+        if value >= .pi { value -= 2 * .pi }
+        if value < -.pi { value += 2 * .pi }
+        return value
+    }
+}

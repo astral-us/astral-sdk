@@ -18,6 +18,9 @@ struct FollowRecoveryAuthorization: Sendable {
 struct FollowRecoveryHeadingRequest: Sendable {
     let stageHeading: Double
     let authorization: FollowRecoveryAuthorization
+    /// Correlation only; the coordinator still owns cursor advancement.
+    var stageIndex: Int? = nil
+    var segmentIndex: Int? = nil
 }
 
 struct FollowRecoverySegmentEvidence: Sendable {

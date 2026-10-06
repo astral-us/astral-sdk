@@ -84,7 +84,12 @@ public protocol FollowMeMotion {
 
 /// Optional internal companion. Original public conformers acquire no requirements.
 @MainActor
-protocol FollowMeContextualMotion: FollowMeMotion {
+protocol FollowMeSourceClockMotion: FollowMeMotion {
+    var sourceUptime: TimeInterval? { get }
+}
+
+@MainActor
+protocol FollowMeContextualMotion: FollowMeSourceClockMotion {
     func inhibitScanContinuation(origin: FollowMotionStopOrigin)
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult
     func motionFailures() -> AsyncStream<FollowMotionFailureDelivery>
@@ -129,6 +134,7 @@ extension FollowMeMotion {
 }
 
 extension FollowMeContextualMotion {
+    var sourceUptime: TimeInterval? { nil }
     func inhibitScanContinuation(origin: FollowMotionStopOrigin) {}
 
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {

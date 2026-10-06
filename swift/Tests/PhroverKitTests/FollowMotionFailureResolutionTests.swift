@@ -2,6 +2,26 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testResolutionTelemetrySurvivesGenericWrapperAndStickyFailedStopWithoutLosingControllerPhase() {
+        let context = delivery(.stream, purpose: .followAlignment).context
+        let facts: [String: FollowDiagnosticValue] = ["controller_phase": .string("stopped_planning"),
+            "candidate_budget_s": .number(-0.019), "retained_response_rate_rad_s": .number(2.0943951023931953),
+            "post_ack_travel_confidence": .string("unknown")]
+        var record = FollowMotionFailureResolution(.init(context: context, reason: .rotationResolutionInsufficient,
+            stopOutcome: .pending, source: .stream, turnDiagnosticFields: facts))
+        XCTAssertEqual(record.turnDiagnosticFields, facts)
+        XCTAssertTrue(record.message.contains("Confirming motor stop…"))
+        record.consume(.init(context: context, reason: .commandFailed, stopOutcome: .confirmed, source: .result))
+        XCTAssertEqual(record.turnDiagnosticFields, facts)
+        XCTAssertEqual(record.diagnosticReason, "rotation_resolution_insufficient")
+        XCTAssertTrue(record.message.contains("Stop confirmed."))
+        record.consume(.init(context: context, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+        record.consume(.init(context: context, reason: .cancelled, stopOutcome: .confirmed, source: .result))
+        XCTAssertEqual(record.turnDiagnosticFields["controller_phase"], .string("stopped_planning"))
+        XCTAssertEqual(record.priority, 3)
+        XCTAssertEqual(record.message, "Motor stop could not be confirmed. Motion is blocked.")
+    }
+
     private let pending = "Search rotation stopped: insufficient measured yaw progress. Confirming motor stop…"
     private let confirmed = "Search rotation stopped: insufficient measured yaw progress. Stop confirmed. Restart following to try again."
     private let blocked = "Motor stop could not be confirmed. Motion is blocked."
@@ -67,5 +87,43 @@ final class FollowMotionFailureResolutionTests: XCTestCase {
         XCTAssertEqual(record.stopOutcome, .unknown)
         XCTAssertNil(record.key)
         XCTAssertEqual(record.diagnosticReason, "stalled")
+    }
+
+    func testResolutionFailureRetainsCapturedPurposeReasonAndStopPriorityInBothOrders() {
+        for purpose: FollowMotionPurpose? in [.followScan, .followAlignment, nil] {
+            let prefix = purpose == .followScan ? "Search rotation" : (purpose == .followAlignment ? "Person alignment" : "Turn")
+            for order: [FollowMotionDeliverySource] in [[.stream, .result], [.result, .stream]] {
+                var record = FollowMotionFailureResolution(delivery(order[0], reason: .rotationResolutionInsufficient,
+                    stop: .unknown, purpose: purpose))
+                XCTAssertEqual(record.diagnosticReason, "rotation_resolution_insufficient")
+                XCTAssertEqual(record.priority, 2)
+                XCTAssertEqual(record.message, "\(prefix) stopped: observed response is too coarse for the remaining angle. Confirming motor stop…")
+                record.consume(delivery(order[1], reason: .commandFailed, purpose: .followReady))
+                record.consume(delivery(.result, reason: .cancelled))
+                record.consume(delivery(.confirmation, reason: .rotationResolutionInsufficient, stop: .confirmed, stale: true))
+                XCTAssertEqual(record.stopOutcome, .pending)
+                XCTAssertEqual(record.context.purpose, purpose)
+                record.consume(delivery(.confirmation, reason: .rotationResolutionInsufficient, stop: .confirmed))
+                XCTAssertEqual(record.primaryReason, .rotationResolutionInsufficient)
+                XCTAssertEqual(record.message, "\(prefix) stopped: observed response is too coarse for the remaining angle. Stop confirmed. Restart following to try again.")
+                record.consume(delivery(.confirmation, reason: .commandFailed, stop: .failed))
+                record.consume(delivery(.result, reason: .rotationResolutionInsufficient, stop: .confirmed))
+                XCTAssertEqual(record.message, blocked)
+                XCTAssertEqual(record.priority, 3)
+            }
+        }
+    }
+
+    func testSpecificDeliverySuppliesCapturedPurposeAfterUnknownGenericWrapper() {
+        var record = FollowMotionFailureResolution(delivery(.result, reason: .commandFailed,
+            stop: .unknown, purpose: nil))
+        record.consume(delivery(.stream, reason: .rotationResolutionInsufficient, purpose: .followAlignment))
+        XCTAssertEqual(record.context.purpose, .followAlignment)
+        XCTAssertEqual(record.primaryReason, .rotationResolutionInsufficient)
+        XCTAssertEqual(record.message, "Person alignment stopped: observed response is too coarse for the remaining angle. Confirming motor stop…")
+        record.consume(delivery(.confirmation, reason: .commandFailed, stop: .failed, purpose: nil))
+        record.consume(delivery(.result, reason: .cancelled, stop: .confirmed, purpose: nil))
+        XCTAssertEqual(record.context.purpose, .followAlignment)
+        XCTAssertEqual(record.message, blocked)
     }
 }

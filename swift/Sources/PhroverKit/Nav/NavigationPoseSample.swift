@@ -30,7 +30,9 @@ struct NavigationPoseSample: Sendable {
 
     static let unavailable = Self(pose: nil, frameID: nil, sourceTimestamp: nil, trackingQuality: nil)
 
-    func rejection(at uptime: TimeInterval, expectedGeneration: UInt64? = nil) -> String? {
+    func rejection(at uptime: TimeInterval, expectedGeneration: UInt64? = nil,
+                   requireEnriched: Bool = false) -> String? {
+        if requireEnriched, source == "legacy_unknown" { return "missing_follow_provenance" }
         guard let pose else { return "missing_pose" }
         guard pose.position.x.isFinite, pose.position.y.isFinite, pose.yaw.isFinite else { return "nonfinite_pose" }
         if source != "legacy_unknown" {

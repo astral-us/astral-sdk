@@ -40,7 +40,8 @@ struct FollowAdmissionSnapshot {
     let evaluatedAt: TimeInterval
 
     init(batch: FollowFrameBatch, previous: FollowPersonObservation?, pending: Bool,
-         tracker: FollowTargetTracker, now: TimeInterval, configuration: FollowMeConfiguration) {
+          tracker: FollowTargetTracker, now: TimeInterval, configuration: FollowMeConfiguration,
+          acceptedAssociation: (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation)? = nil) {
         self.batch = batch
         self.pending = pending
         self.evaluatedAt = now
@@ -52,8 +53,8 @@ struct FollowAdmissionSnapshot {
         } else if let previous {
             if batch.frameID.generation != previous.frameID.generation {
                 rejection = "frame_generation_mismatch"
-            } else if pending {
-                let evaluated = tracker.continueTrackEvaluated(batch.people, previous: previous,
+            } else if pending || acceptedAssociation != nil {
+                let evaluated = acceptedAssociation ?? tracker.continueTrackEvaluated(batch.people, previous: previous,
                     predictedPosition: previous.position, now: now, frameID: batch.frameID)
                 association = evaluated
                 switch evaluated.decision {

@@ -81,6 +81,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var trackingQuality: ARTrackingQuality = .unavailable
     public private(set) var sessionGeneration: UInt64 = 0
     public private(set) var latestSnapshot: ARFrameSnapshot?
+    private(set) var sourceHighWater: FollowTurnSourceHighWater?
 
     /// Latest RGB frame, for `Detector` to run inference on.
     public private(set) var latestPixelBuffer: CVPixelBuffer?
@@ -175,6 +176,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     private func prepareForReset() {
         sessionGeneration &+= 1
         frameSequence = 0
+        sourceHighWater = nil
         meshAnchors = []
         clearCurrentFrame()
         publishLifecycle(.reset(generation: sessionGeneration))
@@ -195,6 +197,10 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             trackingQuality: trackingQuality, depthConfidenceMap: depthConfidenceMap, depthSource: depthSource
         )
         latestSnapshot = snapshot
+        // ARFrame.timestamp is seconds since device boot, the system-uptime domain.
+        // Preserve actual ingress maxima even while snapshot consumers/detection are suspended.
+        sourceHighWater = .init(frameID: snapshot.id, sourceTimestamp: timestamp.isFinite
+            ? max(sourceHighWater?.sourceTimestamp ?? timestamp, timestamp) : sourceHighWater?.sourceTimestamp)
         latestPixelBuffer = snapshot.image
         latestCamera = compatibilityCamera
         latestDepthMap = snapshot.depthMap

@@ -98,6 +98,49 @@ then depend on the products you need:
 ])
 ```
 
+### Adaptive follow-turn planning compatibility
+
+`PhroverKit` now exposes the pure `FollowTurnBurstPlanner` and immutable profile,
+source/response evidence, calibration, and decision values. Its initial reference
+is provisional `2π/3 rad/s`; positive host budgets have no 20 ms floor and cap at
+80 ms **from sender entry**, including queue/transport time. The planner uses
+inclusive 0.05 rad alignment / 7° scan tolerance. Unknown latency and post-ack
+travel remain optional, not measured zero. Calibration is local to one operation,
+target, generation, and explicitly shared source/collection clock domain. Rejected
+evidence never updates its maxima; the caller must remain stopped and resolve it.
+The exact settled sample can be shared between adjacent response brackets without
+being counted as a new frame; every subsequent sample must genuinely advance.
+The caller records an issued provisional probe even when response evidence is lost,
+and remains responsible for authoritative stop confirmation and fresh source gates.
+Observed AR rate and partial sampled post-ack travel are not certified physical
+bounds. Both captured follow-turn purposes now use the controller-owned executor;
+generic rotation, readiness, and goal driving retain their own policies.
+
+Follow-turn telemetry is additive to the existing schema/version and `follow_scan.*`
+stream (including captured alignment purpose). Bounded lifecycle records report the
+selected host budget, sender entry/deadline, exposed transport attempts, ACK overrun,
+requested/actual additional wait, stop obligation/drain/confirmation, strict source
+fences, and operation-local response model. Source identities, capture timestamps,
+tracking quality, rejected brackets, and unknown/partial measurements remain explicit.
+The 200 ms follow pulse is historical inactive metadata; the active maximum is 80 ms.
+Watchdog checkpoints retain their Date-based clock label, separately from AR/system
+uptime timing and transport UTC correlation. Healthy ingress retains bounded facts
+without emitting full per-frame burst records or reading an additional pose provider.
+These records do not certify physical motor duration, peak yaw rate, total coast,
+or small-angle accuracy. Independent review and final SDK/app gates remain pending
+in the [implementation plan](docs/superpowers/plans/2026-10-05-follow-me-adaptive-turn-bursts.md).
+
+`NavigationFailure.rotationResolutionInsufficient` (diagnostic reason
+`rotation_resolution_insufficient`) and the corresponding
+`SilentSearchMotionFailure.rotationResolutionInsufficient` are additive cases on
+public non-frozen enums. Downstream exhaustive source switches must handle them.
+Existing public method signatures, protocol requirements, and enum cases are
+preserved. The new failure means the conservative response model leaves no safe
+positive representable request for the remaining angle; it is not arrival, person
+loss, stall, or command-link failure. Follow text retains captured purpose, reports
+confirmation as pending until authoritative stop evidence arrives, and gives a
+failed stop highest-priority blocked-motion wording.
+
 ### Quickstart
 
 See [`examples/PhroverOperator`](./examples/PhroverOperator) for a complete, runnable

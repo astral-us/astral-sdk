@@ -2,6 +2,7 @@ import Foundation
 
 /// A value-only record. The coordinator owns retention and motor-stop authority.
 struct FollowMotionFailureResolution {
+    private(set) var turnDiagnosticFields: [String: FollowDiagnosticValue] = [:]
     struct Key: Hashable {
         let generation: UInt64
         let operationID: UInt64
@@ -41,7 +42,13 @@ struct FollowMotionFailureResolution {
         let previousStop = stopOutcome
         let seen = !sources.isEmpty
         if primaryReason == .commandFailed || primaryReason == .cancelled {
-            if delivery.reason != .cancelled { primaryReason = delivery.reason }
+            if delivery.reason != .cancelled {
+                primaryReason = delivery.reason
+                if delivery.reason != .commandFailed { context = delivery.context }
+            }
+        }
+        if delivery.reason == primaryReason, !delivery.turnDiagnosticFields.isEmpty {
+            turnDiagnosticFields.merge(delivery.turnDiagnosticFields) { _, value in value }
         }
         // Pending/cancellation/unknown cannot revoke an acknowledgement. Failed is sticky.
         if stopOutcome != .failed {
@@ -65,12 +72,15 @@ struct FollowMotionFailureResolution {
         case .commsLost: return "comms_lost"
         case .tipping: return "tipping"
         case .stalled: return "stalled"
+        case .rotationResolutionInsufficient: return "rotation_resolution_insufficient"
         case .commandFailed: return "transport_failed"
         case .trackingLost: return "tracking_lost"
         case .cancelled: return "cancelled"
         }
     }
-    var priority: Int { stopOutcome == .failed ? 3 : (diagnosticReason == "no_yaw_progress" ? 2 : 1) }
+    var priority: Int {
+        stopOutcome == .failed ? 3 : (diagnosticReason == "no_yaw_progress" || primaryReason == .rotationResolutionInsufficient ? 2 : 1)
+    }
     var message: String {
         if stopOutcome == .failed { return "Motor stop could not be confirmed. Motion is blocked." }
         if diagnosticReason == "no_yaw_progress" {
@@ -85,6 +95,10 @@ struct FollowMotionFailureResolution {
         case .commsLost: return "Rover communication lost. Motion stopped."
         case .tipping: return "Rover tipping detected. Motion stopped."
         case .stalled: return "Navigation stopped: insufficient measured progress."
+        case .rotationResolutionInsufficient:
+            let turn = context.purpose == .followScan ? "Search rotation" : (context.purpose == .followAlignment ? "Person alignment" : "Turn")
+            let stop = stopOutcome == .confirmed ? "Stop confirmed. Restart following to try again." : "Confirming motor stop…"
+            return "\(turn) stopped: observed response is too coarse for the remaining angle. \(stop)"
         case .noPath: return "No navigation path available."
         case .pathRejected: return "Navigation path rejected."
         case .commandFailed: return "Navigation command failed."

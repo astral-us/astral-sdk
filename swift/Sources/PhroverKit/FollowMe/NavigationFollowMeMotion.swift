@@ -19,7 +19,11 @@ public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeA
         await navigation.performFollowMotion(.alignment(angle), context: nil).result
     }
 
-    public func stopAndConfirm() async throws { try await navigation.stopAndConfirm() }
+    var sourceUptime: TimeInterval? { navigation.followSourceUptime }
+
+    public func stopAndConfirm() async throws {
+        try await FollowTurnSourceScope.$required.withValue(true) { try await navigation.stopAndConfirm() }
+    }
 
     public func signalReady() async -> NavigationResult {
         await navigation.performFollowMotion(.ready, context: nil).result

@@ -22,6 +22,7 @@ final class FollowScanDiagnosticTrace {
     private var timings: [String: FollowDiagnosticValue] = [:]
     private var settleEnd: Double?
     private var insidePulse = false
+    private var failedStage: String?
 
     func enter(_ name: String) { stage = name; stageStart = emitter.hostTime() }
 
@@ -34,9 +35,13 @@ final class FollowScanDiagnosticTrace {
     }
 
     func failure(_ reason: NavigationFailure, evidence: FollowMotionOperationEvidence, latch: Bool) {
+        let resolution = evidence.failure(source: .stream).map { FollowMotionFailureResolution($0) }
         emit("failure", evidence: evidence, latch: latch, outcome: "failed",
-            reason: reason == .stalled ? "no_yaw_progress" : String(describing: reason), fields: [
-                "failed_stage": .string(stage), "typed_reason": .string(String(describing: reason))])
+            reason: reason == .stalled ? "no_yaw_progress" : (reason == .rotationResolutionInsufficient ? "rotation_resolution_insufficient" : String(describing: reason)), fields: [
+                "failed_stage": .string(reason == .stalled ? "watchdog" : (failedStage ?? stage)),
+                "typed_reason": .string(String(describing: reason)),
+                "formatter_message": resolution.map { .string($0.message) } ?? .null,
+                "priority": resolution.map { .number(Double($0.priority)) } ?? .null])
     }
 
     init(emitter: FollowDiagnosticEmitter) {
@@ -52,6 +57,10 @@ final class FollowScanDiagnosticTrace {
         let profile = context.profile
         let operationFields: [String: FollowDiagnosticValue] = [
             "request_token": context.request.map { .number(Double($0.requestToken)) } ?? .null,
+            "episode_id": evidence.recoveryEpisodeID.map { .string($0.uuidString) } ?? .null,
+            "stage_index": evidence.recoveryStageIndex.map { .number(Double($0)) } ?? .null,
+            "segment_index": evidence.recoverySegmentIndex.map { .number(Double($0)) } ?? .null,
+            "stage_segment_availability": .string(evidence.recoveryStageIndex == nil ? "not_supplied" : "captured_coordinator_cursor"),
             "requested_increment_rad": context.requestedRotation.map { .number($0) } ?? .null,
             "requested_scan_used_rad": context.request?.scanUsed.map { .number($0) } ?? .null,
             "requested_scan_remaining_rad": context.request?.scanRemaining.map { .number($0) } ?? .null,
@@ -73,6 +82,8 @@ final class FollowScanDiagnosticTrace {
             "watchdog_progress_rad": watchdog?.progress.map { .number($0) } ?? .null,
             "watchdog_elapsed_s": watchdog?.elapsed.map { .number($0) } ?? .null,
             "watchdog_elapsed_clock": .string("controller_watchdog_date"),
+            "watchdog_checkpoint_wall_ms": watchdog?.lastProgressAt.map { .number($0.timeIntervalSince1970 * 1000) } ?? .null,
+            "watchdog_checkpoint_clock": .string("controller_watchdog_date"),
             "watchdog_required_progress_rad": .number(watchdog?.requiredProgress ?? 0.05),
             "watchdog_interval_s": .number(watchdog?.interval ?? 2.5),
         ]
@@ -90,6 +101,7 @@ final class FollowScanDiagnosticTrace {
         payload.merge(operationFields) { _, value in value }
         payload.merge(watchdogFields) { _, value in value }
         payload.merge(stageFields) { _, value in value }
+        payload.merge(evidence.burstTrace?.fields ?? [:]) { _, value in value }
         if evidence.recoveryEpisodeID != nil {
             payload.merge(FollowReacquisitionDiagnostics.controllerPayload(evidence)) { _, value in value }
         }
@@ -186,6 +198,7 @@ final class FollowScanDiagnosticTrace {
     }
 
     func endSend(evidence: FollowMotionOperationEvidence, latch: Bool, outcome: String) {
+        if outcome == "failed", failedStage == nil { failedStage = "send" }
         retainTiming("send", end: emitter.hostTime())
         emit("send_ack", evidence: evidence, latch: latch, outcome: outcome,
             fields: timingFields().merging(receiptFields(evidence.commandReceipt)) { _, value in value })

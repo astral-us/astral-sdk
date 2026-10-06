@@ -6,6 +6,22 @@ import XCTest
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testIngressHighWaterRetainsPendingTimestampEvenWhenNewestSnapshotRegresses() {
+        let manager = ARSessionManager()
+        manager.resetForTesting()
+        let events = manager.snapshots() // Leave the consumer suspended; pending frames still count.
+        for time in [100.0, 100.2, 100.1] {
+            manager.ingestForTesting(image: makeImage(), timestamp: time, cameraTransform: matrix_identity_float4x4,
+                intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
+                depthMap: nil, trackingQuality: .normal)
+        }
+        XCTAssertEqual(manager.latestSnapshot?.timestamp, 100.1)
+        XCTAssertEqual(manager.sourceHighWater?.frameID, .init(generation: 1, sequence: 3))
+        XCTAssertEqual(manager.sourceHighWater?.sourceTimestamp, 100.2)
+        manager.resetForTesting()
+        XCTAssertNil(manager.sourceHighWater)
+        withExtendedLifetime(events) {}
+    }
     func testSnapshotIngestionRetainsSelectedDepthConfidencePairAndClearsItOnNextFrame() async throws {
         let manager = ARSessionManager()
         var iterator = manager.snapshots().makeAsyncIterator()
@@ -38,24 +54,103 @@ final class ARSessionManagerTests: XCTestCase {
             intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
             depthMap: nil, trackingQuality: .normal)
         let gate = FollowDiagnosticSuspension()
+        let ackEntered = expectation(description: "Follow controller enters ACK getter")
+        let completed = expectation(description: "Follow controller returns after AR reset")
+        var observedResult: NavigationResult?
+        var uptime = 100.5
+        var ackSuspended = false
         var commands = 0
+        weak var sourceReceiver: NavigationController?
         let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 },
-            plan: { _, goal in [goal] }, lastAckAt: { await gate.suspend(); return Date() },
-            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { _ in },
-            poseSample: { manager.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }, sourceNow: { 100.5 })
-        let scan = Task { await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3) }
-        await gate.waitUntilEntered() // Exactly 500 ms old snapshot passed preflight in the uptime domain.
+            plan: { _, goal in [goal] }, lastAckAt: {
+                if uptime >= 100.801, !ackSuspended {
+                    ackSuspended = true
+                    ackEntered.fulfill()
+                    await gate.suspend()
+                }
+                return Date(timeIntervalSince1970: uptime)
+            },
+            sendCommand: { _ in commands += 1 }, stopRover: {}, sleep: { duration in
+                // Model a camera capture after ACK + 300 ms, never inside stopRover.
+                if uptime == 100.5 {
+                    uptime = 100.801
+                    manager.ingestForTesting(image: self.makeImage(), timestamp: uptime,
+                        cameraTransform: self.transform(x: 1, z: 2), intrinsics: matrix_identity_float3x3,
+                        imageResolution: CGSize(width: 8, height: 6), depthMap: nil, trackingQuality: .normal)
+                    sourceReceiver?.ingestFollowTurnSource(.init(snapshot: manager.latestSnapshot!))
+                    await Task.yield()
+                } else {
+                    try? await Task.sleep(for: duration)
+                }
+            }, now: { Date(timeIntervalSince1970: uptime) },
+            poseSample: { manager.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }, sourceNow: { uptime },
+            sourceEvents: {
+                let snapshots = manager.snapshots()
+                return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+                    let task = Task { @MainActor in
+                        for await snapshot in snapshots { continuation.yield(.init(snapshot: snapshot)) }
+                        continuation.finish()
+                    }
+                    continuation.onTermination = { @Sendable _ in task.cancel() }
+                }
+            }, sourceStopSnapshot: { manager.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) },
+            sourceHighWater: { manager.sourceHighWater },
+            sourceHealth: { .init(generation: manager.sessionGeneration, trackingQuality: manager.trackingQuality) })
+        sourceReceiver = controller
+        let scan = Task {
+            observedResult = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
+            completed.fulfill()
+        }
+        await fulfillment(of: [ackEntered], timeout: 1)
+        XCTAssertEqual(manager.latestSnapshot?.id, ARFrameID(generation: 1, sequence: 2))
+        XCTAssertEqual(manager.latestSnapshot?.timestamp, uptime)
+        XCTAssertEqual(commands, 0, "Reset is exercised while stopped, before any nonzero send")
         manager.resetForTesting()
         XCTAssertNil(manager.latestSnapshot)
-        manager.ingestForTesting(image: makeImage(), timestamp: 100.5, cameraTransform: transform(x: 1, z: 2),
+        manager.ingestForTesting(image: makeImage(), timestamp: uptime, cameraTransform: transform(x: 1, z: 2),
             intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 8, height: 6),
             depthMap: nil, trackingQuality: .normal)
         gate.release()
-        let result = await scan.value
-        XCTAssertEqual(result, .failed(.trackingLost), "A fresh reset snapshot cannot join the old AR operation")
+        await fulfillment(of: [completed], timeout: 1)
+        scan.cancel()
+        XCTAssertEqual(observedResult, .failed(.trackingLost), "A fresh reset snapshot cannot join the old AR operation")
         XCTAssertEqual(commands, 0)
         XCTAssertEqual(manager.latestSnapshot?.id, ARFrameID(generation: 2, sequence: 1))
-        XCTAssertEqual(manager.latestSnapshot?.timestamp, 100.5)
+        XCTAssertEqual(manager.latestSnapshot?.timestamp, uptime)
+    }
+
+    func testWithheldPostStopARSourceCancellationReturnsToCaller() async {
+        let manager = ARSessionManager()
+        manager.resetForTesting()
+        manager.ingestForTesting(image: makeImage(), timestamp: ProcessInfo.processInfo.systemUptime,
+            cameraTransform: transform(x: 1, z: 2), intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil, trackingQuality: .normal)
+        let events = AsyncStream<NavigationPoseSample>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        defer { events.continuation.finish() }
+        let waiting = expectation(description: "Controller waits with post-stop camera events withheld")
+        let completed = expectation(description: "Cancellation drains the stopped source wait")
+        var enteredWait = false
+        var commands = 0
+        var result: NavigationResult?
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { 2 },
+            plan: { _, goal in [goal] }, lastAckAt: { Date() }, sendCommand: { _ in commands += 1 },
+            stopRover: {}, sleep: { duration in
+                if !enteredWait { enteredWait = true; waiting.fulfill() }
+                try? await Task.sleep(for: duration)
+            }, poseSample: { manager.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) },
+            sourceEvents: { events.stream },
+            sourceStopSnapshot: { manager.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) },
+            sourceHighWater: { manager.sourceHighWater },
+            sourceHealth: { .init(generation: manager.sessionGeneration, trackingQuality: manager.trackingQuality) })
+        let scan = Task {
+            result = await NavigationFollowMeMotion(navigation: controller).rotateForScan(by: 0.3)
+            completed.fulfill()
+        }
+        await fulfillment(of: [waiting], timeout: 1)
+        scan.cancel()
+        await fulfillment(of: [completed], timeout: 1)
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertEqual(commands, 0)
     }
 
     func testResetAdvancesGenerationAndFramesAdvanceSequenceOnce() throws {

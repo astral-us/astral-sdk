@@ -93,7 +93,7 @@ final class FollowPipelineDiagnosticsTests: XCTestCase {
     func testLegacyReadyAdapterNeverClaimsControllerFirstWheelOrSourceTelemetry() async throws {
         let perception = FollowPerceptionFake()
         let clock = ManualFollowClock()
-        let motion = FollowMotionFake()
+        let motion = FollowMotionFake(clock: clock)
         var config = FollowMeConfiguration()
         config.stationaryPauseSeconds = 0
         var authorized: [String: Any]?
@@ -104,10 +104,11 @@ final class FollowPipelineDiagnosticsTests: XCTestCase {
         }
         _ = await coordinator.start()
         for sequence: UInt64 in 1...3 {
+            clock.advance(to: Double(sequence - 1) * 0.31)
             let id = ARFrameID(generation: 1, sequence: sequence)
             let pose = Pose2D(position: .zero, yaw: 0)
-            perception.send(.frame(.init(frameID: id, timestamp: 0, pose: pose, depthAvailable: true,
-                people: [.init(frameID: id, timestamp: 0, confidence: 0.9,
+            perception.send(.frame(.init(frameID: id, timestamp: clock.now, pose: pose, depthAvailable: true,
+                people: [.init(frameID: id, timestamp: clock.now, confidence: 0.9,
                     boundingBox: CGRect(x: 0.4, y: 0.2, width: 0.2, height: 0.6), position: Vec2(1.6, 0), pose: pose)],
                 trackingQuality: .normal)))
             for _ in 0..<100 { await Task.yield() }

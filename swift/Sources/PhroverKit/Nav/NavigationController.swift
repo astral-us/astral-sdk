@@ -30,11 +30,33 @@ public final class NavigationController {
     private let currentPose: () -> Pose2D?
     private let currentPoseSample: (() -> NavigationPoseSample?)?
     private let sourceNow: () -> TimeInterval
+    private let sourceEvents: (() -> AsyncStream<NavigationPoseSample>)?
+    private let sourceStopSnapshot: (() -> NavigationPoseSample?)?
+    private let sourceHighWater: (() -> FollowTurnSourceHighWater?)?
+    private let sourceHealth: (() -> FollowTurnSourceHealth)?
+    private var followTurnSourceGate = FollowTurnSourceGate()
+    private var followTurnSourceTask: Task<Void, Never>?
+    private var followTurnSourceSubscriptionID: UUID?
+    private var followTurnSourceWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private final class FollowTurnAckRead {
+        let owner: UInt
+        var completed = false
+        var value: Date?
+        init(owner: UInt) { self.owner = owner }
+    }
+    private var followTurnAckRead: FollowTurnAckRead?
+    private var followTurnSourceObservers: [UUID: (NavigationPoseSample) -> Void] = [:]
+    private(set) var followTurnStopFence: FollowTurnStopFence?
+    private var pendingFollowTurnBurst: FollowTurnBurstFence?
+    private var pendingFollowTurnBurstDrain: FollowTurnBurstDrain?
+    var followTurnBurstPendingStatus: FollowTurnBurstPendingStatus? { pendingFollowTurnBurst?.status }
     private let currentForwardClearance: () -> Double
     private let makePlan: (Vec2, Vec2) -> [Vec2]?
     private let readySignalCostmap: ((Vec2) -> Costmap)?
     private let currentLastAck: () async -> Date?
     private let sendCommand: (WheelCommand) async throws -> Void
+    private let sendFollowBurstCommand: (WheelCommand) async -> RoverCommandDiagnosticResult
+    private let transportUptime: @Sendable () -> TimeInterval
     private let stopRover: () async throws -> Void
     private let sleep: (Duration) async -> Void
     private let now: () -> Date
@@ -48,7 +70,12 @@ public final class NavigationController {
     private var loop: Task<NavigationResult, Never>?
     private var stopConfirmation: Task<Void, Error>?
     private var stopUnconfirmed = false
-    private var operationGeneration: UInt = 0
+    private var operationGeneration: UInt = 0 {
+        didSet {
+            pendingFollowTurnBurst?.inhibit()
+            wakeFollowTurnSourceWaiters()
+        }
+    }
     private var replanCounter = 0
     private var activePolicy: (any PathAdmissibilityPolicy)?
     private var safetyStateContinuations: [UUID: AsyncStream<NavigationSafetyState>.Continuation] = [:]
@@ -76,11 +103,13 @@ public final class NavigationController {
     func performFollowMotion(_ request: FollowMotionRequest, context: FollowMotionRequestContext?) async -> FollowMotionResult {
         nextFollowOperationID &+= 1 // Controller-owned identity reserved before the first suspension.
         let captured = FollowMotionOperationContext(request: context, controllerOperationID: nextFollowOperationID,
-            purpose: request.purpose, profile: request.purpose == .followScan ? RoverConfig.followScanRotationProfile : nil,
+            purpose: request.purpose, profile: (request.purpose == .followScan || request.purpose == .followAlignment)
+                ? .turnBurst(purpose: request.purpose) : nil,
             requestedRotation: FollowRecoveryScope.heading == nil ? request.requestedRotation : nil)
         let evidence = FollowMotionOperationEvidence(context: captured)
-        if request.purpose == .followScan, let diagnosticEmitter {
+        if (request.purpose == .followScan || request.purpose == .followAlignment), let diagnosticEmitter {
             evidence.scanTrace = FollowScanDiagnosticTrace(emitter: diagnosticEmitter)
+            evidence.burstTrace = FollowTurnBurstDiagnosticTrace()
         }
         if stopUnconfirmed { evidence.recordStop(.failed) }
         if let previous = activeFollowEvidence {
@@ -186,6 +215,28 @@ public final class NavigationController {
         currentPose = { ar.pose }
         currentPoseSample = { ar.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }
         sourceNow = { ProcessInfo.processInfo.systemUptime }
+        sourceStopSnapshot = { ar.latestSnapshot.map(NavigationPoseSample.init(snapshot:)) }
+        sourceHighWater = { ar.sourceHighWater }
+        sourceHealth = { .init(generation: ar.sessionGeneration, trackingQuality: ar.trackingQuality) }
+        sourceEvents = {
+            let snapshots = ar.snapshots() // Subscribe synchronously before a stop can be admitted.
+            let lifecycle = ar.lifecycleEvents()
+            return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+                let task = Task { @MainActor in
+                    for await snapshot in snapshots { continuation.yield(.init(snapshot: snapshot)) }
+                    continuation.finish()
+                }
+                let healthTask = Task { @MainActor in
+                    for await event in lifecycle {
+                        switch event {
+                        case .reset, .interrupted, .failed: continuation.yield(.unavailable)
+                        case .interruptionEnded: break // Only an actual new healthy source restores provenance.
+                        }
+                    }
+                }
+                continuation.onTermination = { @Sendable _ in task.cancel(); healthTask.cancel() }
+            }
+        }
         currentForwardClearance = { ar.forwardClearance }
         makePlan = { start, goal in
             let costmap = CostmapBuilder.build(from: ar.meshAnchors, center: start)
@@ -195,6 +246,8 @@ public final class NavigationController {
         currentLastAck = { await control.lastAckAt }
         sendCommand = Self.diagnosticSender(legacy: { try await control.sendNavigation($0) },
             receipt: { await control.sendNavigationWithReceipt($0) })
+        sendFollowBurstCommand = { await control.sendNavigationWithReceipt($0) }
+        transportUptime = { ProcessInfo.processInfo.systemUptime }
         stopRover = Self.diagnosticStopper(legacy: { try await control.stop() },
             receipt: { await control.stopWithReceipt() })
         sleep = { try? await Task.sleep(for: $0) }
@@ -215,15 +268,29 @@ public final class NavigationController {
          stopRoverReceipt: (() async -> RoverCommandDiagnosticResult)? = nil,
          diagnosticEmitter: FollowDiagnosticEmitter? = nil,
          poseSample: (() -> NavigationPoseSample?)? = nil,
-         sourceNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         sourceNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         sourceEvents: (() -> AsyncStream<NavigationPoseSample>)? = nil,
+         sourceStopSnapshot: (() -> NavigationPoseSample?)? = nil,
+         sourceHighWater: (() -> FollowTurnSourceHighWater?)? = nil,
+         sourceHealth: (() -> FollowTurnSourceHealth)? = nil,
+         transportUptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.currentPose = currentPose
         self.currentPoseSample = poseSample
         self.sourceNow = sourceNow
+        self.sourceEvents = sourceEvents
+        self.sourceStopSnapshot = sourceStopSnapshot
+        self.sourceHighWater = sourceHighWater
+        self.sourceHealth = sourceHealth
         self.currentForwardClearance = forwardClearance
         self.makePlan = plan
         self.readySignalCostmap = readySignalCostmap
         self.currentLastAck = lastAckAt
         self.sendCommand = Self.diagnosticSender(legacy: sendCommand, receipt: sendCommandReceipt)
+        self.sendFollowBurstCommand = sendCommandReceipt ?? { command in
+            do { try await sendCommand(command); return .init(receipt: .unknown, failure: nil) }
+            catch { return .init(receipt: .unknown, failure: error) }
+        }
+        self.transportUptime = transportUptime
         self.stopRover = Self.diagnosticStopper(legacy: stopRover, receipt: stopRoverReceipt)
         self.sleep = sleep
         self.now = now
@@ -527,98 +594,210 @@ public final class NavigationController {
         if FollowMotionTaskScope.evidence == nil {
             return await performFollowMotion(.scan(angle), context: nil).result
         }
-        let profile = FollowMotionTaskScope.evidence?.initialContext.profile ?? RoverConfig.followScanRotationProfile
-        guard !stopUnconfirmed else { return .failed(.commandFailed) }
-        operationGeneration &+= 1
-        let reservation = operationGeneration
-        FollowMotionTaskScope.evidence?.ownedGeneration = reservation
-        do { try await confirmStop(origin: "independent") } catch { return .failed(.commandFailed) }
-        guard operationGeneration == reservation, !Task.isCancelled,
-              FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
-        operationGeneration &+= 1
-        FollowMotionTaskScope.evidence?.ownedGeneration = operationGeneration
-        let startSourceTime = sourceNow()
-        let startSample = readFollowPose()
-        if let recovery = FollowRecoveryScope.heading {
-            FollowMotionTaskScope.evidence?.recovery = .init(postStopSource: startSample, resolutionSource: nil,
-                stageHeading: recovery.stageHeading, segmentHeading: nil, requestedDelta: nil,
-                arrivalSource: nil, segmentArrived: false, stageArrived: nil, postStopReadUptime: startSourceTime)
-        }
-        guard followPoseRejection(startSample, at: startSourceTime) == nil, let startYaw = startSample.pose?.yaw else {
-            if currentPoseSample != nil, let evidence = FollowMotionTaskScope.evidence {
-                evidence.scanTrace?.unavailablePost(sample: .init(sample: startSample, uptime: startSourceTime,
-                    expectedGeneration: FollowRecoveryScope.authorization?.expectedGeneration), evidence: evidence, latch: stopUnconfirmed)
-            }
-            let result = NavigationResult.failed(currentPoseSample == nil ? .noPose : .trackingLost)
-            finish(result)
-            return result
-        }
-        state = .driving
-        publishSafetyState(.moving)
-        let initialTarget = FollowRecoveryScope.heading?.stageHeading ?? normalizeAngle(startYaw + angle)
-        let task = Task { await performRotate(to: initialTarget, mode: .followScan,
-            followProfile: profile, sourceGeneration: startSample.frameID?.generation) }
-        loop = task
-        let result = await task.value
-        guard operationGeneration == reservation + 1 else { return .cancelled }
-        guard !stopUnconfirmed else { return .failed(.commandFailed) }
-        do { try await confirmStop(origin: "final") } catch { return .failed(.commandFailed) }
-        guard operationGeneration == reservation + 1, !Task.isCancelled,
-              FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
-        if let previous = FollowMotionTaskScope.evidence?.recovery {
-            let arrival = readFollowPose()
-            let arrivalReadUptime = sourceNow()
-            let valid = followPoseRejection(arrival, at: arrivalReadUptime) == nil
-            let segmentArrived = valid && arrival.pose.map {
-                abs(FollowReacquisitionPlanner.wrap((previous.segmentHeading ?? .nan) - $0.yaw)) <= profile.angularTolerance
-            } == true
-            let stageArrived = valid ? arrival.pose.map {
-                abs(FollowReacquisitionPlanner.wrap(previous.stageHeading - $0.yaw)) <= profile.angularTolerance
-            } : nil
-            FollowMotionTaskScope.evidence?.recovery = .init(postStopSource: previous.postStopSource,
-                resolutionSource: previous.resolutionSource, stageHeading: previous.stageHeading,
-                segmentHeading: previous.segmentHeading, requestedDelta: previous.requestedDelta,
-                arrivalSource: arrival, segmentArrived: result == .arrived && segmentArrived,
-                stageArrived: result == .arrived ? stageArrived : nil,
-                postStopReadUptime: previous.postStopReadUptime, resolutionReadUptime: previous.resolutionReadUptime,
-                arrivalReadUptime: arrivalReadUptime)
-            if result == .arrived, !valid {
-                let unavailable = NavigationResult.failed(.trackingLost)
-                finish(unavailable)
-                return unavailable
-            }
-        }
-        return result
+        return await startFollowTurn(by: angle, purpose: .followScan)
     }
 
-    /// Continuous follow alignment with the same serialized, throwing stop latch
-    /// as follow scanning. A successful external pre-stop cannot authorize motion
-    /// after a newer internal stop fails.
+    /// Follow-only adaptive alignment. Generic rotation remains continuous.
     public func rotateForFollowAlignment(by angle: Double) async -> NavigationResult {
+        if FollowMotionTaskScope.evidence == nil {
+            return await performFollowMotion(.alignment(angle), context: nil).result
+        }
+        return await startFollowTurn(by: angle, purpose: .followAlignment)
+    }
+
+    private func startFollowTurn(by angle: Double, purpose: FollowMotionPurpose) async -> NavigationResult {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
         operationGeneration &+= 1
-        let reservation = operationGeneration
-        FollowMotionTaskScope.evidence?.ownedGeneration = reservation
-        do { try await confirmStop() } catch { return .failed(.commandFailed) }
-        guard operationGeneration == reservation, !Task.isCancelled,
-              FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
-        operationGeneration &+= 1
-        FollowMotionTaskScope.evidence?.ownedGeneration = operationGeneration
-        let startSample = FollowRecoveryScope.authorization == nil ? NavigationPoseSample.legacy(currentPose()) : readFollowPose()
-        guard FollowRecoveryScope.authorization == nil || followPoseRejection(startSample, at: sourceNow()) == nil,
-              let startYaw = startSample.pose?.yaw else {
-            let result = NavigationResult.failed(.noPose)
-            finish(result)
-            return result
+        let owner = operationGeneration
+        let evidence = FollowMotionTaskScope.evidence
+        evidence?.ownedGeneration = owner
+        startFollowTurnSourceEvents()
+        let subscription = followTurnSourceSubscriptionID
+        defer {
+            if followTurnSourceSubscriptionID == subscription {
+                followTurnSourceTask?.cancel()
+                followTurnSourceTask = nil
+                followTurnSourceSubscriptionID = nil
+            }
         }
+        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        // Preserve the actual stopped capture even when source admission rejects
+        // it. This is evidence only; resolution remains absent until admission.
+        if let recovery = FollowRecoveryScope.heading {
+            evidence?.recovery = .init(postStopSource: followTurnSourceGate.latest ?? .unavailable,
+                resolutionSource: nil, stageHeading: recovery.stageHeading,
+                segmentHeading: nil, requestedDelta: nil, arrivalSource: nil,
+                segmentArrived: false, stageArrived: nil, postStopReadUptime: sourceNow())
+        }
+        guard operationGeneration == owner, !Task.isCancelled, evidence?.fenced != true,
+              recoveryAuthorized, let initialFence = followTurnStopFence else { return .cancelled }
+        let selection = await awaitFollowTurnSource(after: initialFence, progress: .init())
+        guard operationGeneration == owner, !Task.isCancelled, evidence?.fenced != true,
+              recoveryAuthorized else { return .cancelled }
+        let initial: NavigationPoseSample
+        switch selection {
+        case .sample(let sample): initial = sample
+        case .failed(let reason): let result = NavigationResult.failed(reason); finish(result); return result
+        case .cancelled: return .cancelled
+        }
+        guard angle.isFinite, let yaw = initial.pose?.yaw, (yaw + angle).isFinite else {
+            return .failed(.trackingLost)
+        }
+        let target: Double
+        if purpose == .followScan, let recovery = FollowRecoveryScope.heading {
+            let delta: Double
+            switch FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: recovery.stageHeading, actualYaw: yaw) {
+            case .turn(let resolvedDelta, let resolvedTarget): delta = resolvedDelta; target = resolvedTarget
+            case .stageArrived: delta = 0; target = FollowReacquisitionPlanner.wrap(yaw)
+            case .unavailable, .exhausted: return .cancelled
+            }
+            evidence?.recovery = .init(postStopSource: initial, resolutionSource: initial,
+                stageHeading: recovery.stageHeading, segmentHeading: target, requestedDelta: delta,
+                arrivalSource: nil, segmentArrived: false, stageArrived: nil,
+                postStopReadUptime: sourceNow(), resolutionReadUptime: sourceNow())
+        } else {
+            target = FollowReacquisitionPlanner.wrap(yaw + angle)
+        }
+        evidence?.targetYaw = target
+        let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan)
         state = .driving
         publishSafetyState(.moving)
-        let task = Task { await performRotate(to: normalizeAngle(startYaw + angle), mode: .continuous) }
+        let task = Task { @MainActor in
+            let runtime = FollowTurnRuntimeState(targetYaw: target, initial: initial,
+                tolerance: profile.tolerance, date: self.now())
+            defer {
+                if let evidence, runtime.failure != .trackingLost {
+                    let snapshot = runtime.progress.watchdog.diagnosticSnapshot(
+                        distanceToGoal: runtime.progress.distanceToGoal, now: self.now())
+                    evidence.scanTrace?.observed(snapshot, previous: snapshot,
+                        sample: .init(sample: initial, uptime: self.sourceNow(), expectedGeneration: runtime.generation))
+                }
+            }
+            if let evidence {
+                let snapshot = runtime.progress.watchdog.diagnosticSnapshot(
+                    distanceToGoal: runtime.progress.distanceToGoal, now: self.now())
+                evidence.scanTrace?.observed(snapshot, previous: snapshot,
+                    sample: .init(sample: initial, uptime: self.sourceNow(), expectedGeneration: runtime.generation))
+            }
+            let progressObserver = UUID()
+            self.followTurnSourceObservers[progressObserver] = { sample in
+                guard self.operationGeneration == owner, evidence?.fenced != true else { return }
+                let previous = runtime.progress.watchdog.diagnosticSnapshot(
+                    distanceToGoal: runtime.progress.distanceToGoal, now: self.now())
+                runtime.observe(sample, uptime: self.sourceNow(), date: self.now())
+                if let evidence {
+                    if runtime.failure == .trackingLost {
+                        if sample.rejection(at: self.sourceNow(), expectedGeneration: runtime.generation,
+                            requireEnriched: true) != nil {
+                            evidence.scanTrace?.unavailablePost(sample: .init(sample: sample, uptime: self.sourceNow(),
+                                expectedGeneration: runtime.generation), evidence: evidence, latch: self.stopUnconfirmed)
+                        }
+                        return
+                    }
+                    evidence.scanTrace?.observed(runtime.progress.watchdog.diagnosticSnapshot(
+                        distanceToGoal: runtime.progress.distanceToGoal, now: self.now()), previous: previous,
+                        sample: .init(sample: sample, uptime: self.sourceNow(), expectedGeneration: runtime.generation))
+                }
+            }
+            defer { self.followTurnSourceObservers.removeValue(forKey: progressObserver) }
+            var bracket: FollowTurnResponseBracket?
+            let bracketObserver = UUID()
+            defer { self.followTurnSourceObservers.removeValue(forKey: bracketObserver) }
+            return await FollowTurnOperationExecutor.execute(targetYaw: target, generation: initial.frameID!.generation,
+                operationID: evidence?.context.controllerOperationID ?? UInt64(owner), profile: profile, runtime: runtime,
+                uptime: self.sourceNow, now: self.now,
+                authorized: { self.operationGeneration == owner && evidence?.fenced != true && self.recoveryAuthorized && !self.stopUnconfirmed },
+                admit: { progress in
+                    let refreshed = await self.refreshFollowTurnRuntime(runtime, owner: owner, evidence: evidence,
+                        requireFreshAck: progress.hasSentCommand)
+                    guard self.operationGeneration == owner, !Task.isCancelled, evidence?.fenced != true,
+                           self.recoveryAuthorized else { return .cancelled }
+                    if self.stopUnconfirmed { return .failed(.commandFailed) }
+                    if let failure = runtime.failure { return .failed(failure) }
+                    guard refreshed else { return .cancelled }
+                    guard let sample = self.followTurnSourceGate.latest else { return .failed(.trackingLost) }
+                    return .sample(sample)
+                },
+                burst: { command, budget, _, boundary in
+                    guard self.operationGeneration == owner, evidence?.fenced != true, !Task.isCancelled,
+                          self.recoveryAuthorized, !self.stopUnconfirmed else { throw CancellationError() }
+                     guard let start = self.followTurnSourceGate.latest else { throw CancellationError() }
+                     if let evidence {
+                         let snapshot = runtime.progress.watchdog.diagnosticSnapshot(
+                             distanceToGoal: runtime.progress.distanceToGoal, now: self.now())
+                         evidence.scanTrace?.observed(snapshot, previous: snapshot,
+                             sample: .init(sample: start, uptime: self.sourceNow(), expectedGeneration: runtime.generation))
+                         evidence.scanTrace?.pulse(.init(sample: start, uptime: self.sourceNow(),
+                             expectedGeneration: runtime.generation), command: command, evidence: evidence,
+                             latch: self.stopUnconfirmed)
+                     }
+                    bracket = .init(start: start, at: self.sourceNow(), generation: initial.frameID!.generation,
+                        boundary: boundary)
+                    self.followTurnSourceObservers[bracketObserver] = { sample in
+                        let health = self.sourceHealth?()
+                        bracket?.collect(sample, at: self.sourceNow(), healthy: health == nil ||
+                            (health?.trackingQuality == .normal && health?.generation == initial.frameID!.generation))
+                    }
+                    let receipt = try await self.executeFollowTurnBurst(command, requestedBudget: budget, purpose: purpose,
+                        runtime: runtime)
+                    if let latest = self.followTurnSourceGate.latest {
+                        bracket?.collect(latest, at: self.sourceNow(), healthy: true)
+                    }
+                    return receipt
+                },
+                stoppedSource: { fence, progress in
+                    await self.awaitFollowTurnSource(after: fence, progress: progress, runtime: runtime)
+                },
+                diagnostic: { calibration, sample, decision, uptime in
+                    evidence?.burstTrace?.planning(calibration, sample: sample, profile: profile, decision: decision, uptime: uptime)
+                    if let evidence { evidence.scanTrace?.emit("burst_plan", evidence: evidence, latch: self.stopUnconfirmed) }
+                },
+                reduced: { response, reduction in
+                    evidence?.burstTrace?.reduction(response, reduction)
+                    if let evidence { evidence.scanTrace?.emit("burst_response", evidence: evidence, latch: self.stopUnconfirmed,
+                        outcome: reduction.rejection == nil ? "accepted" : "rejected", reason: reduction.rejection) }
+                },
+                response: { receipt, budget, settled in
+                    self.followTurnSourceObservers.removeValue(forKey: bracketObserver)
+                    guard var captured = bracket, let fence = receipt.confirmedStopFence,
+                          self.followTurnStopFence?.identity == fence.identity,
+                          fence.operationGeneration == owner, fence.sourceGeneration == initial.frameID!.generation,
+                          let obligation = receipt.stopObligationUptime else { return nil }
+                    captured.collect(settled, at: self.sourceNow(), healthy: true, settled: true)
+                    return .init(operationID: evidence?.context.controllerOperationID ?? UInt64(owner),
+                        generation: initial.frameID!.generation, targetYaw: target, clockDomain: "ar_system_uptime",
+                        requestedBudget: budget, sendEntryUptime: receipt.send.sendEntryUptime,
+                        sendResponseUptime: receipt.send.responseUptime, stopObligationUptime: obligation,
+                        stopAcknowledgementUptime: fence.acknowledgementUptime, samples: captured.samples,
+                        traversalUnambiguous: captured.unambiguous)
+                })
+        }
         loop = task
         let result = await task.value
-        guard operationGeneration == reservation + 1 else { return .cancelled }
-        guard !stopUnconfirmed else { return .failed(.commandFailed) }
-        do { try await confirmStop() } catch { return .failed(.commandFailed) }
+        guard operationGeneration == owner else { return .cancelled }
+        loop = nil
+        if stopUnconfirmed { return .failed(.commandFailed) }
+        guard !Task.isCancelled, evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
+        if let previous = evidence?.recovery, let arrival = followTurnSourceGate.latest {
+            let readUptime = sourceNow()
+            let valid = arrival.rejection(at: readUptime, expectedGeneration: initial.frameID!.generation,
+                requireEnriched: true) == nil
+            let segmentArrived = valid && arrival.pose.map {
+                abs(FollowReacquisitionPlanner.wrap(target - $0.yaw)) <= profile.tolerance
+            } == true
+            let stageArrived = valid ? arrival.pose.map {
+                abs(FollowReacquisitionPlanner.wrap(previous.stageHeading - $0.yaw)) <= profile.tolerance
+            } : nil
+            evidence?.recovery = .init(postStopSource: previous.postStopSource,
+                resolutionSource: previous.resolutionSource, stageHeading: previous.stageHeading,
+                segmentHeading: target, requestedDelta: previous.requestedDelta, arrivalSource: arrival,
+                segmentArrived: result == .arrived && segmentArrived,
+                stageArrived: result == .arrived ? stageArrived : nil,
+                postStopReadUptime: previous.postStopReadUptime, resolutionReadUptime: previous.resolutionReadUptime,
+                arrivalReadUptime: readUptime)
+            if result == .arrived, !valid { return .failed(.trackingLost) }
+        }
+        finish(result)
         return result
     }
 
@@ -626,7 +805,8 @@ public final class NavigationController {
     /// Detection uses this synchronous fence before scheduling serialized confirmation.
     /// Retain the loop so confirmation still drains all suspended transport work.
     func inhibitFollowScanContinuation(origin: FollowMotionStopOrigin) {
-        guard let evidence = activeFollowEvidence, evidence.context.purpose == .followScan else { return }
+        guard let evidence = activeFollowEvidence,
+              evidence.context.purpose == .followScan || evidence.context.purpose == .followAlignment else { return }
         evidence.fenced = true
         evidence.scanTrace?.cancel(origin: origin.rawValue, evidence: evidence, latch: stopUnconfirmed)
         operationGeneration &+= 1
@@ -642,17 +822,23 @@ public final class NavigationController {
         try await confirmStop(retryingFailedStop: true, evidence: evidence, origin: origin)
     }
 
+    var followSourceUptime: TimeInterval { sourceNow() }
+
     private func confirmStop(retryingFailedStop: Bool = false, evidence: FollowMotionOperationEvidence? = nil,
                              origin: String = "independent") async throws {
         let captured = evidence ?? FollowMotionTaskScope.evidence
+        let captureSource = captured?.context.purpose == .followScan || captured?.context.purpose == .followAlignment ||
+            FollowTurnSourceScope.required || followTurnSourceTask != nil
         let trace = captured?.scanTrace
         let token = captured.flatMap { trace?.beginStop(origin: origin, evidence: $0, latch: stopUnconfirmed) }
         captured?.recordStop(.pending)
         let generation = operationGeneration
         let previousStop = stopConfirmation
         let previousLoop = loop
+        let pendingBurst = pendingFollowTurnBurstDrain
         previousLoop?.cancel()
         let receiptCapture = FollowMotionStopReceiptCapture()
+        let callerCapture = FollowMotionTaskScope.stopReceiptCapture
         let confirmation = Task { @MainActor in
             // Serialize stops so an older stop cannot race a newer motion command.
             if retryingFailedStop {
@@ -661,8 +847,22 @@ public final class NavigationController {
                 try await previousStop?.value
             }
             _ = await previousLoop?.value
+            await pendingBurst?.wait()
             try await FollowMotionTaskScope.$evidence.withValue(captured) {
                 try await FollowMotionTaskScope.$stopReceiptCapture.withValue(receiptCapture) { try await stopRover() }
+            }
+            // Capture in the returning stop task, before its waiter or another actor hop.
+            if captureSource {
+                let acknowledgementUptime = sourceNow()
+                if let snapshot = sourceStopSnapshot?() { followTurnSourceGate.ingest(snapshot) }
+                if let highWater = sourceHighWater?() { followTurnSourceGate.include(highWater) }
+                let fence = followTurnSourceGate.fence(at: acknowledgementUptime,
+                    operationGeneration: generation, context: captured?.context ?? .unknown)
+                receiptCapture.sourceFence = fence
+                callerCapture?.recordSourceFence(fence)
+                callerCapture?.receipt = receiptCapture.receipt
+                captured?.turnStopFence = fence
+                if operationGeneration == generation { followTurnStopFence = fence }
             }
         }
         stopConfirmation = confirmation
@@ -703,23 +903,43 @@ public final class NavigationController {
 
     private func rotationStop(origin: String) async throws {
         let evidence = FollowMotionTaskScope.evidence
+        let owner = operationGeneration
+        let captureSource = evidence?.context.purpose == .followScan || evidence?.context.purpose == .followAlignment ||
+            FollowTurnSourceScope.required || followTurnSourceTask != nil
         let token = evidence.flatMap { $0.scanTrace?.beginStop(origin: origin, evidence: $0, latch: stopUnconfirmed) }
         let receiptCapture = FollowMotionStopReceiptCapture()
         do {
             try await FollowMotionTaskScope.$stopReceiptCapture.withValue(receiptCapture) { try await stopRover() }
+            if captureSource {
+                let acknowledgementUptime = sourceNow()
+                if let snapshot = sourceStopSnapshot?() { followTurnSourceGate.ingest(snapshot) }
+                if let highWater = sourceHighWater?() { followTurnSourceGate.include(highWater) }
+                let fence = followTurnSourceGate.fence(at: acknowledgementUptime,
+                    operationGeneration: owner, context: evidence?.context ?? .unknown)
+                receiptCapture.sourceFence = fence
+                evidence?.turnStopFence = fence
+                if operationGeneration == owner { followTurnStopFence = fence }
+            }
+            if operationGeneration == owner, !Task.isCancelled, evidence?.fenced != true {
+                evidence?.recordStop(.confirmed)
+            }
             if let evidence, let token {
                 evidence.scanTrace?.endStop(token, origin: origin, evidence: evidence, receipt: receiptCapture.receipt,
                     latch: stopUnconfirmed, outcome: "acknowledged")
             }
         } catch {
-            if origin == "pulse", !Task.isCancelled {
+            // Burst confirmation drains independently of the cancelled loop.
+            // Losing its captured owner still interrupts the old response; only
+            // the replacing serialized confirmation can decide the new latch.
+            let interrupted = Task.isCancelled || (operationGeneration != owner && evidence?.fenced == true)
+            if origin == "pulse", !interrupted {
                 // Same pulse-stop latch rule; capture before emitting the response.
                 stopUnconfirmed = true
                 evidence?.recordStop(.failed)
             }
             if let evidence, let token {
                 evidence.scanTrace?.endStop(token, origin: origin, evidence: evidence, receipt: receiptCapture.receipt, latch: stopUnconfirmed,
-                    outcome: Task.isCancelled ? "cancelled" : "failed")
+                    outcome: interrupted ? "cancelled" : "failed")
             }
             throw error
         }
@@ -738,8 +958,10 @@ public final class NavigationController {
         activePolicy = nil
         path = []
         let previousStop = stopConfirmation
+        let pendingBurst = pendingFollowTurnBurstDrain
         stopConfirmation = Task { @MainActor in
             _ = try? await previousStop?.value
+            await pendingBurst?.wait()
             try await FollowMotionTaskScope.$evidence.withValue(captured) {
                 try await rotationStop(origin: "independent")
             }
@@ -754,8 +976,11 @@ public final class NavigationController {
     public func cancelAndWait() async {
         let generation = operationGeneration
         let task = loop
+        let pendingBurst = pendingFollowTurnBurstDrain
+        pendingFollowTurnBurst?.inhibit()
         task?.cancel()
         _ = await task?.value
+        await pendingBurst?.wait()
         guard operationGeneration == generation else { return }
         try? await stopRover()
         guard operationGeneration == generation else { return }
@@ -767,6 +992,641 @@ public final class NavigationController {
     }
 
     // MARK: - Loop
+
+    /// Revalidate a completed actual ACK read against current Date/source facts.
+    /// Rotation retains its existing nil-IMU / no-forward-obstacle policy.
+    private func validateFollowTurnRuntime(_ runtime: FollowTurnRuntimeState, owner: UInt,
+                                          evidence: FollowMotionOperationEvidence?, requireFreshAck: Bool? = nil) -> Bool {
+        guard !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true,
+              !stopUnconfirmed, recoveryAuthorized else { return false }
+        runtime.expire(at: now())
+        guard runtime.failure == nil else { return false }
+        guard let sample = followTurnSourceGate.latest,
+              sample.rejection(at: sourceNow(), expectedGeneration: runtime.generation, requireEnriched: true) == nil,
+              let fence = followTurnStopFence, fence.operationGeneration == owner,
+              fence.sourceGeneration == runtime.generation,
+              sample.sourceTimestamp! > fence.acknowledgementUptime,
+              sample.sourceTimestamp! > (fence.highestSourceTimestamp ?? -.infinity),
+              sample.frameID!.sequence > (fence.highestSequence ?? 0) else {
+            runtime.fail(.trackingLost); return false
+        }
+        if let health = sourceHealth?(), health.trackingQuality != .normal || health.generation != runtime.generation {
+            runtime.fail(.trackingLost); return false
+        }
+        switch guardLayer.evaluate(forwardClearance: currentForwardClearance(), lastAckAt: runtime.lastAck,
+            now: now(), feedback: nil, requireFreshAck: requireFreshAck ?? runtime.progress.hasSentCommand,
+            checkForwardObstacle: false) {
+        case .go: return true
+        case .stopCommsLost: runtime.fail(.commsLost)
+        case .stopTipping: runtime.fail(.tipping)
+        case .stopObstacle: runtime.fail(.obstacle)
+        }
+        return false
+    }
+
+    /// At most one outstanding read per owner. The read has no motor/runtime
+    /// authority, and is never joined on interruption. Late completion only fills
+    /// its own immutable-owner slot; it cannot clear or wake a newer owner's slot.
+    private func interruptibleFollowTurnAck(owner: UInt, deadline: Double = .infinity,
+                                           progress: () -> FollowTurnWaitingProgress,
+                                           interrupted: () -> Bool) async -> (completed: Bool, value: Date?) {
+        let read: FollowTurnAckRead
+        if let existing = followTurnAckRead, existing.owner == owner {
+            read = existing
+        } else {
+            read = FollowTurnAckRead(owner: owner)
+            followTurnAckRead = read
+            let getter = currentLastAck
+            Task { @MainActor [weak self] in
+                read.value = await getter()
+                read.completed = true
+                guard let self, self.followTurnAckRead === read, self.operationGeneration == owner else { return }
+                self.wakeFollowTurnSourceWaiters()
+            }
+        }
+        while true {
+            guard !Task.isCancelled, operationGeneration == owner, !interrupted(), sourceNow() < deadline else {
+                return (false, nil)
+            }
+            if read.completed {
+                if followTurnAckRead === read { followTurnAckRead = nil }
+                return (true, read.value)
+            }
+            var wake = deadline
+            if let sample = followTurnSourceGate.latest, let timestamp = sample.sourceTimestamp {
+                wake = min(wake, (timestamp + 0.500).nextUp)
+            }
+            if let remaining = progress().remaining(at: now()) { wake = min(wake, sourceNow() + remaining) }
+            if let authorization = FollowRecoveryScope.authorization {
+                wake = min(wake, sourceNow() + max(0, authorization.deadline - authorization.now()))
+            }
+            await waitForFollowTurnSource(until: wake, while: { !read.completed })
+        }
+    }
+
+    private func refreshFollowTurnRuntime(_ runtime: FollowTurnRuntimeState, owner: UInt,
+                                         evidence: FollowMotionOperationEvidence?, requireFreshAck: Bool? = nil,
+                                         deadline: Double = .infinity, stopTriggered: () -> Bool = { false }) async -> Bool {
+        // Freeze/check the existing progress epoch before the suspension; an ACK
+        // return or a cached source read must never start a replacement epoch.
+        runtime.expire(at: now())
+        guard runtime.failure == nil, !Task.isCancelled, operationGeneration == owner,
+              evidence?.fenced != true, !stopUnconfirmed, recoveryAuthorized else { return false }
+        let ack = await interruptibleFollowTurnAck(owner: owner, deadline: deadline, progress: { runtime.progress }) {
+            runtime.expire(at: self.now())
+            return stopTriggered() || !self.validateFollowTurnRuntime(runtime, owner: owner, evidence: evidence,
+                requireFreshAck: false)
+        }
+        guard ack.completed else { return false }
+        guard !Task.isCancelled, operationGeneration == owner, evidence?.fenced != true,
+              !stopUnconfirmed, recoveryAuthorized else { return false }
+        runtime.lastAck = ack.value
+        return validateFollowTurnRuntime(runtime, owner: owner, evidence: evidence, requireFreshAck: requireFreshAck)
+    }
+
+    /// A shared one-burst execution boundary. Stop runs independently of caller
+    /// cancellation; a replaced owner delegates cleanup to the replacing stop.
+    func executeFollowTurnBurst(_ command: WheelCommand, requestedBudget: Double,
+                                purpose: FollowMotionPurpose,
+                                runtime: FollowTurnRuntimeState? = nil) async throws -> FollowTurnBurstExecutionReceipt {
+        let owner = operationGeneration
+        let evidence = FollowMotionTaskScope.evidence
+        var ownedSubscription: UUID?
+        var observation: FollowTurnBurstObservation?
+        var sourceTriggeredStop: Double?
+        var stopAdmissionUptime: Double?
+        if let target = evidence?.targetYaw {
+            if followTurnSourceTask == nil {
+                startFollowTurnSourceEvents()
+                ownedSubscription = followTurnSourceSubscriptionID
+            }
+            if let start = followTurnSourceGate.latest {
+                observation = .init(targetYaw: target,
+                    tolerance: FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
+                    start: start, uptime: sourceNow())
+            }
+        }
+        defer {
+            if let ownedSubscription, followTurnSourceSubscriptionID == ownedSubscription {
+                followTurnSourceTask?.cancel()
+                followTurnSourceTask = nil
+                followTurnSourceSubscriptionID = nil
+            }
+        }
+        let observerID = UUID()
+        if observation != nil {
+            followTurnSourceObservers[observerID] = { sample in
+                if observation?.observe(sample, at: self.sourceNow()) == true, sourceTriggeredStop == nil {
+                    sourceTriggeredStop = self.sourceNow()
+                    if let evidence { evidence.burstTrace?.obligation(at: self.sourceNow(),
+                        reason: observation?.triggerReason ?? "source", pending: self.pendingFollowTurnBurst != nil,
+                        evidence: evidence, latch: self.stopUnconfirmed) }
+                }
+            }
+        }
+        defer { followTurnSourceObservers.removeValue(forKey: observerID) }
+        var execution = try await FollowTurnBurstExecutor.execute(command: command, budget: requestedBudget,
+            send: { await self.sendFollowTurnBurst($0, requestedBudget: $1, purpose: purpose, runtime: runtime) },
+            waitRemaining: { receipt in
+                var enteredWait = false
+                var waitStart: Double?
+                var requestedWait = 0.0
+                defer {
+                    let waitEnd = self.sourceNow()
+                    evidence?.burstTrace?.additionalWait(requested: requestedWait, start: waitStart ?? waitEnd, end: waitEnd)
+                    if let evidence { evidence.burstTrace?.waitEnded(reason: observation?.triggerReason ??
+                        (runtime?.failure.map { String(describing: $0) } ??
+                            (Task.isCancelled || evidence.fenced || self.operationGeneration != owner ? "fence" :
+                                (self.sourceNow() >= receipt.deadline ? "budget_expiry" : "health_or_authority"))),
+                        evidence: evidence, latch: self.stopUnconfirmed) }
+                    if enteredWait, let evidence {
+                        evidence.scanTrace?.endWait("pulse_wait", evidence: evidence, latch: self.stopUnconfirmed,
+                            interrupted: Task.isCancelled || evidence.fenced || self.operationGeneration != owner)
+                    }
+                }
+                while self.sourceNow() < receipt.deadline {
+                    runtime?.expire(at: self.now())
+                    if runtime?.failure != nil { return }
+                    if sourceTriggeredStop != nil { return }
+                    if let runtime, !(await self.refreshFollowTurnRuntime(runtime, owner: owner, evidence: evidence,
+                        deadline: receipt.deadline, stopTriggered: { sourceTriggeredStop != nil })) { return }
+                    guard !Task.isCancelled, self.operationGeneration == owner, !self.stopUnconfirmed,
+                          evidence?.fenced != true, self.recoveryAuthorized else { return }
+                    var deadline = receipt.deadline
+                    if let remaining = runtime?.progress.remaining(at: self.now()) {
+                        deadline = min(deadline, self.sourceNow() + remaining)
+                    }
+                    if var current = observation {
+                        guard let sample = self.followTurnSourceGate.latest,
+                              sample.rejection(at: self.sourceNow(), expectedGeneration: current.generation,
+                                  requireEnriched: true) == nil else { return }
+                        if let health = self.sourceHealth?(), health.trackingQuality != .normal || health.generation != current.generation {
+                            return
+                        }
+                        if current.observe(sample, at: self.sourceNow()) { return }
+                        observation = current
+                        deadline = min(deadline, (sample.sourceTimestamp! + 0.500).nextUp)
+                    }
+                    if let authorization = FollowRecoveryScope.authorization {
+                        deadline = min(deadline, self.sourceNow() + max(0, authorization.deadline - authorization.now()))
+                    }
+                    if !enteredWait, let evidence {
+                        waitStart = self.sourceNow()
+                        requestedWait = max(0, deadline - self.sourceNow())
+                        evidence.scanTrace?.beginWait("pulse_wait", duration: max(0, deadline - self.sourceNow()),
+                            evidence: evidence, latch: self.stopUnconfirmed)
+                        enteredWait = true
+                    }
+                    await self.waitForFollowTurnSource(until: deadline)
+                }
+            },
+            stop: {
+                guard self.operationGeneration == owner else { throw CancellationError() }
+                runtime?.expire(at: self.now())
+                if let runtime, let reason = runtime.failure, let evidence,
+                   !Task.isCancelled, !evidence.fenced, !evidence.emittedFailure {
+                    // Preserve the actual terminal cause while stop is still
+                    // pending. A later failed stop overrides motion permission,
+                    // but must not erase this captured primary failure.
+                    let snapshot = runtime.progress.watchdog.diagnosticSnapshot(
+                        distanceToGoal: runtime.progress.distanceToGoal, now: self.now())
+                    if let sample = self.followTurnSourceGate.latest {
+                        evidence.scanTrace?.observed(snapshot, previous: snapshot,
+                            sample: .init(sample: sample, uptime: self.sourceNow(), expectedGeneration: runtime.generation))
+                    }
+                    self.finish(.failed(reason))
+                }
+                stopAdmissionUptime = self.sourceNow()
+                if let evidence {
+                    evidence.burstTrace?.obligation(at: self.sourceNow(),
+                        reason: runtime?.failure.map { String(describing: $0) } ?? (evidence.fenced ? "fence" : "budget_expiry"),
+                        pending: false, evidence: evidence, latch: self.stopUnconfirmed)
+                    evidence.burstTrace?.stopAdmission(at: self.sourceNow())
+                }
+                let confirmation = Task { @MainActor in
+                    guard self.operationGeneration == owner else { throw CancellationError() }
+                    try await FollowTurnSourceScope.$required.withValue(true) {
+                        try await self.rotationStop(origin: "pulse")
+                    }
+                    guard self.operationGeneration == owner else { throw CancellationError() }
+                    return self.followTurnStopFence
+                }
+                return try await confirmation.value
+            })
+        execution.stopObligationUptime = min(execution.send.stopObligationUptime ?? .infinity,
+            sourceTriggeredStop ?? .infinity, execution.send.deadline, stopAdmissionUptime ?? .infinity)
+        if let evidence, let fence = execution.confirmedStopFence, let obligation = execution.stopObligationUptime {
+            evidence.burstTrace?.stopConfirmed(fence, obligation: obligation, evidence: evidence, latch: stopUnconfirmed)
+        }
+        return execution
+    }
+
+    /// Internal sender seam; Task 4 supplies planner/source authority and serialized stop ownership.
+    func sendFollowTurnBurst(_ command: WheelCommand, requestedBudget: Double,
+                             purpose: FollowMotionPurpose,
+                             runtime: FollowTurnRuntimeState? = nil) async -> FollowTurnBurstSendReceipt {
+        let owner = operationGeneration
+        let evidence = FollowMotionTaskScope.evidence
+        let requireFreshAckForSend = runtime?.progress.hasSentCommand ?? false
+        if let runtime, !validateFollowTurnRuntime(runtime, owner: owner, evidence: evidence) {
+            let entry = sourceNow()
+            return .init(sendEntryUptime: entry, deadline: entry + requestedBudget, responseUptime: entry,
+                result: .init(receipt: .unknown, failure: FollowTurnBurstTransportDenial.fenced), stopObligation: true)
+        }
+        let entry = sourceNow()
+        let deadline = entry + requestedBudget
+        guard pendingFollowTurnBurst == nil else {
+            return .init(sendEntryUptime: entry, deadline: deadline, responseUptime: entry,
+                result: .init(receipt: .init(httpStatus: nil, acknowledged: false, acknowledgementUTC: nil,
+                    attempts: 0, outcome: "fenced"), failure: FollowTurnBurstTransportDenial.fenced),
+                stopObligation: false)
+        }
+        guard entry.isFinite, requestedBudget.isFinite, requestedBudget > 0, requestedBudget <= 0.080,
+              deadline.isFinite, deadline > entry else {
+            return .init(sendEntryUptime: entry, deadline: deadline, responseUptime: entry,
+                result: .init(receipt: .init(httpStatus: nil, acknowledged: false, acknowledgementUTC: nil,
+                    attempts: 0, outcome: "invalid_budget"), failure: FollowTurnBurstTransportDenial.invalidBudget),
+                stopObligation: false)
+        }
+        let fence = FollowTurnBurstFence(deadline: deadline)
+        evidence?.burstTrace?.senderEntry(entry, deadline: deadline, budget: requestedBudget)
+        let drain = FollowTurnBurstDrain()
+        let transportCapture = FollowTurnTransportCapture()
+        pendingFollowTurnBurst = fence
+        pendingFollowTurnBurstDrain = drain
+        // The shared follow executor supplies the frozen target through captured
+        // operation evidence. Generic senders never subscribe to follow source.
+        var observation: FollowTurnBurstObservation?
+        var ownedSubscription: UUID?
+        var sourceStopped = false
+        if (purpose == .followAlignment || purpose == .followScan), let target = evidence?.targetYaw {
+            if followTurnSourceTask == nil {
+                startFollowTurnSourceEvents()
+                ownedSubscription = followTurnSourceSubscriptionID
+            }
+            if let start = followTurnSourceGate.latest {
+                observation = .init(targetYaw: target,
+                    tolerance: FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
+                    start: start, uptime: entry)
+            }
+        }
+        defer {
+            if let ownedSubscription, followTurnSourceSubscriptionID == ownedSubscription {
+                followTurnSourceTask?.cancel()
+                followTurnSourceTask = nil
+                followTurnSourceSubscriptionID = nil
+            }
+        }
+        let observerID = UUID()
+        if observation != nil {
+            followTurnSourceObservers[observerID] = { sample in
+                runtime?.observe(sample, uptime: self.sourceNow(), date: self.now())
+                if runtime?.failure != nil { fence.inhibit(at: self.sourceNow()); return }
+                guard self.operationGeneration == owner, evidence?.fenced != true,
+                       !self.stopUnconfirmed, self.recoveryAuthorized else { fence.inhibit(at: self.sourceNow()); return }
+                guard sample.rejection(at: self.sourceNow(), expectedGeneration: observation?.generation,
+                           requireEnriched: true) == nil else { fence.inhibit(at: self.sourceNow()); return }
+                if observation?.observe(sample, at: self.sourceNow()) == true {
+                    sourceStopped = true
+                    fence.inhibit(at: self.sourceNow())
+                    if let evidence { evidence.burstTrace?.obligation(at: self.sourceNow(),
+                        reason: observation?.triggerReason ?? "source", pending: true, evidence: evidence, latch: self.stopUnconfirmed) }
+                }
+            }
+        }
+        defer { followTurnSourceObservers.removeValue(forKey: observerID) }
+        let authorization = FollowTurnBurstAuthorization(operationID: evidence?.context.controllerOperationID ?? UInt64(owner),
+            sendEntryUptime: entry, requestedBudget: requestedBudget, uptime: transportUptime,
+            isAuthorized: { fence.authorized },
+            authorizeAttempt: { [weak self] in
+                await MainActor.run {
+                    guard let self else { return false }
+                    runtime?.expire(at: self.now())
+                    if runtime?.failure != nil { fence.inhibit(at: self.sourceNow()); return false }
+                    if let runtime, !self.validateFollowTurnRuntime(runtime, owner: owner, evidence: evidence,
+                        requireFreshAck: requireFreshAckForSend) {
+                        fence.inhibit(at: self.sourceNow()); return false
+                    }
+                    return self.operationGeneration == owner && !self.stopUnconfirmed &&
+                        evidence?.fenced != true && self.recoveryAuthorized
+                }
+            }, didEnterAttempt: { transportCapture.record($0) })
+        let selected = purpose == .followAlignment || purpose == .followScan ? authorization : nil
+        let monitor = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            runtime?.expire(at: now())
+            if runtime?.failure != nil { fence.inhibit(at: sourceNow()); return }
+            if sourceNow() >= deadline {
+                fence.inhibit(at: deadline)
+                if let evidence { evidence.burstTrace?.obligation(at: deadline, observedAt: sourceNow(), reason: "budget_expiry", pending: true,
+                    evidence: evidence, latch: stopUnconfirmed) }
+                if runtime == nil { return }
+            }
+            if var observation {
+                while !Task.isCancelled, fence.authorized || runtime != nil {
+                    runtime?.expire(at: now())
+                    if runtime?.failure != nil { fence.inhibit(at: sourceNow()); return }
+                    if sourceStopped { return }
+                    if let runtime, !(await refreshFollowTurnRuntime(runtime, owner: owner, evidence: evidence,
+                        requireFreshAck: requireFreshAckForSend)) {
+                        fence.inhibit(at: sourceNow()); return
+                    }
+                    if sourceStopped { return }
+                    guard operationGeneration == owner, !stopUnconfirmed,
+                           evidence?.fenced != true, recoveryAuthorized else { fence.inhibit(at: sourceNow()); return }
+                    if sourceNow() >= deadline {
+                        fence.inhibit(at: deadline)
+                        if let evidence { evidence.burstTrace?.obligation(at: deadline, observedAt: sourceNow(), reason: "budget_expiry", pending: true,
+                            evidence: evidence, latch: stopUnconfirmed) }
+                        if runtime == nil { return }
+                    }
+                    guard let latest = followTurnSourceGate.latest,
+                          latest.rejection(at: sourceNow(), expectedGeneration: observation.generation,
+                               requireEnriched: true) == nil else { fence.inhibit(at: sourceNow()); return }
+                    if let health = sourceHealth?(), health.trackingQuality != .normal || health.generation != observation.generation {
+                        fence.inhibit(at: sourceNow()); return
+                    }
+                    if let sample = followTurnSourceGate.latest, observation.observe(sample, at: sourceNow()) {
+                        fence.inhibit(at: sourceNow())
+                        // Crossing already fences every retry. Do not introduce a
+                        // new monitor sleep after that stop obligation; the shared
+                        // epoch is still observed at ingress and checked on drain.
+                        return
+                    }
+                    var wake = sourceNow() < deadline ? deadline : .infinity
+                    wake = min(wake, (latest.sourceTimestamp! + 0.500).nextUp)
+                    if let remaining = runtime?.progress.remaining(at: now()) { wake = min(wake, sourceNow() + remaining) }
+                    if let authorization = FollowRecoveryScope.authorization {
+                        wake = min(wake, sourceNow() + max(0, authorization.deadline - authorization.now()))
+                    }
+                    await waitForFollowTurnSource(until: wake)
+                }
+            } else {
+                await sleep(.seconds(max(0, deadline - sourceNow())))
+                guard !Task.isCancelled, sourceNow() >= deadline else { return }
+                fence.inhibit(at: deadline) // Only this immutable operation token; never motors or a newer owner.
+            }
+        }
+        // Deadline/source-clock wake ownership is independent of the actual
+        // ACK getter: that actor suspension must not pause budget inhibition.
+        let deadlineMonitor: Task<Void, Never>? = runtime.map { runtime in
+            Task { @MainActor in
+                while !Task.isCancelled {
+                    guard operationGeneration == owner, !stopUnconfirmed, evidence?.fenced != true,
+                          recoveryAuthorized else { fence.inhibit(at: sourceNow()); return }
+                    runtime.expire(at: now())
+                    if runtime.failure != nil { fence.inhibit(at: sourceNow()); return }
+                    if sourceStopped { return }
+                    if sourceNow() >= deadline {
+                        fence.inhibit(at: deadline)
+                        if let evidence { evidence.burstTrace?.obligation(at: deadline, observedAt: sourceNow(), reason: "budget_expiry", pending: true,
+                            evidence: evidence, latch: stopUnconfirmed) }
+                    }
+                    guard let sample = followTurnSourceGate.latest,
+                          sample.rejection(at: sourceNow(), expectedGeneration: runtime.generation, requireEnriched: true) == nil else {
+                        runtime.fail(.trackingLost); fence.inhibit(at: sourceNow()); return
+                    }
+                    if let health = sourceHealth?(), health.trackingQuality != .normal || health.generation != runtime.generation {
+                        runtime.fail(.trackingLost); fence.inhibit(at: sourceNow()); return
+                    }
+                    var wake = sourceNow() < deadline ? deadline : .infinity
+                    wake = min(wake, (sample.sourceTimestamp! + 0.500).nextUp)
+                    if let remaining = runtime.progress.remaining(at: now()) { wake = min(wake, sourceNow() + remaining) }
+                    if let authorization = FollowRecoveryScope.authorization {
+                        wake = min(wake, sourceNow() + max(0, authorization.deadline - authorization.now()))
+                    }
+                    await waitForFollowTurnSource(until: wake)
+                }
+            }
+        }
+        var response = entry
+        let result = await withTaskCancellationHandler {
+            await FollowTurnBurstTransportScope.$authorization.withValue(selected) {
+                runtime?.progress.hasSentCommand = true
+                evidence?.recordStop(.pending)
+                if let evidence { evidence.scanTrace?.beginSend(command, evidence: evidence, latch: stopUnconfirmed) }
+                let result = await sendFollowBurstCommand(command)
+                // Capture/cancel synchronously at the actual sender return, not
+                // after the task-local wrapper's next actor resumption.
+                response = sourceNow()
+                if let evidence, fence.status.stopObligation || response >= deadline {
+                    evidence.burstTrace?.obligation(at: fence.stopObligationUptime ?? min(response, deadline),
+                        observedAt: response,
+                        reason: sourceStopped ? (observation?.triggerReason ?? "source") :
+                            (response >= deadline ? "budget_expiry" : "fence_or_health"),
+                        pending: false, evidence: evidence, latch: stopUnconfirmed)
+                }
+                evidence?.burstTrace?.senderResponse(entry: entry, deadline: deadline, response: response,
+                    attempts: transportCapture.attempts, obligated: fence.status.stopObligation, result: result)
+                monitor.cancel()
+                deadlineMonitor?.cancel()
+                drain.finish()
+                if let evidence {
+                    evidence.recordCommandReceipt(result.receipt)
+                    evidence.scanTrace?.endSend(evidence: evidence, latch: stopUnconfirmed,
+                        outcome: result.failure == nil ? "acknowledged" : "failed")
+                }
+                return result
+            }
+        } onCancel: { fence.inhibit() }
+        if response >= deadline { fence.inhibit(at: deadline) }
+        if pendingFollowTurnBurst === fence {
+            pendingFollowTurnBurst = nil
+            pendingFollowTurnBurstDrain = nil
+        }
+        return .init(transportAttempts: transportCapture.attempts, sendEntryUptime: entry, deadline: deadline,
+            responseUptime: response, result: result, stopObligation: fence.status.stopObligation,
+            stopObligationUptime: fence.stopObligationUptime)
+    }
+
+    /// Task 2 boundary seam. It remains disconnected from the motor burst executor until Task 4.
+    func prepareFollowTurnSource(progress: FollowTurnWaitingProgress = .init()) async -> FollowTurnSourceResult {
+        operationGeneration &+= 1
+        let owner = operationGeneration
+        startFollowTurnSourceEvents()
+        let subscriptionID = followTurnSourceSubscriptionID
+        defer {
+            if followTurnSourceSubscriptionID == subscriptionID {
+                followTurnSourceTask?.cancel()
+                followTurnSourceTask = nil
+                followTurnSourceSubscriptionID = nil
+            }
+        }
+        do { try await FollowTurnSourceScope.$required.withValue(true) { try await confirmStop() } }
+        catch { return .failed(.commandFailed) }
+        guard let fence = followTurnStopFence, operationGeneration == owner else { return .cancelled }
+        return await awaitFollowTurnSource(after: fence, progress: progress)
+    }
+
+    private func startFollowTurnSourceEvents() {
+        followTurnSourceTask?.cancel()
+        followTurnSourceTask = nil
+        followTurnSourceSubscriptionID = nil
+        guard let sourceEvents else { return }
+        followTurnSourceSubscriptionID = UUID()
+        if let sample = currentPoseSample?() { followTurnSourceGate.ingest(sample) }
+        let events = sourceEvents()
+        followTurnSourceTask = Task { @MainActor [weak self] in
+            for await sample in events {
+                guard !Task.isCancelled, let self else { break }
+                self.ingestFollowTurnSource(sample)
+            }
+        }
+    }
+
+    /// Synchronous source ingress; immutable events are processed before the
+    /// cached latest sample can be replaced by another capture.
+    func ingestFollowTurnSource(_ sample: NavigationPoseSample) {
+        followTurnSourceGate.ingest(sample)
+        for observer in followTurnSourceObservers.values { observer(sample) }
+        wakeFollowTurnSourceWaiters()
+    }
+
+    private func wakeFollowTurnSourceWaiters() {
+        let waiters = followTurnSourceWaiters.values
+        followTurnSourceWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func waitForFollowTurnSource(until deadline: TimeInterval, while needsWait: @escaping () -> Bool = { true }) async {
+        let id = UUID()
+        let token = FollowTurnSourceWaitToken()
+        await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return }
+            let timer = Task { @MainActor in
+                guard !Task.isCancelled, token.isActive else { return }
+                guard needsWait() else {
+                    followTurnSourceWaiters.removeValue(forKey: id)?.resume()
+                    return
+                }
+                let remaining = deadline - sourceNow()
+                if remaining > 0 { await sleep(.seconds(remaining)) }
+                followTurnSourceWaiters.removeValue(forKey: id)?.resume()
+            }
+            await withCheckedContinuation { followTurnSourceWaiters[id] = $0 }
+            token.cancel()
+            timer.cancel()
+        } onCancel: {
+            token.cancel()
+            Task { @MainActor [weak self] in self?.followTurnSourceWaiters.removeValue(forKey: id)?.resume() }
+        }
+    }
+
+    func awaitFollowTurnSource(after fence: FollowTurnStopFence,
+                               progress: FollowTurnWaitingProgress,
+                               runtime: FollowTurnRuntimeState? = nil) async -> FollowTurnSourceResult {
+        let evidence = FollowMotionTaskScope.evidence
+        var enteredSettle = false
+        var evaluated: NavigationPoseSample?
+        defer {
+            if let evidence, evaluated == nil {
+                evidence.burstTrace?.sourceGate(fence: fence, sample: followTurnSourceGate.latest, uptime: sourceNow(),
+                    reason: followTurnSourceGate.diagnosticRejection(after: fence, at: sourceNow()) ?? "authority_or_runtime_failure",
+                    evidence: evidence, latch: stopUnconfirmed)
+            }
+            if enteredSettle, let evidence {
+                if let evaluated, let runtime {
+                    evidence.scanTrace?.settled()
+                    evidence.scanTrace?.evaluation(.init(sample: evaluated, uptime: sourceNow(),
+                        expectedGeneration: fence.sourceGeneration),
+                        snapshot: runtime.progress.watchdog.diagnosticSnapshot(
+                            distanceToGoal: runtime.progress.distanceToGoal, now: now()),
+                        evidence: evidence, latch: stopUnconfirmed)
+                } else {
+                    evidence.scanTrace?.endWait("settle", evidence: evidence, latch: stopUnconfirmed,
+                        interrupted: Task.isCancelled || evidence.fenced || operationGeneration != fence.operationGeneration)
+                }
+            }
+        }
+        if let expected = FollowRecoveryScope.authorization?.expectedGeneration, expected != fence.sourceGeneration {
+            return .failed(.trackingLost)
+        }
+        while true {
+            guard !Task.isCancelled, operationGeneration == fence.operationGeneration,
+                  followTurnStopFence?.identity == fence.identity,
+                  FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
+            guard !stopUnconfirmed else { return .failed(.commandFailed) }
+            let uptime = sourceNow()
+            runtime?.expire(at: now())
+            if let failure = runtime?.failure { return .failed(failure) }
+            if runtime == nil, progress.expired(at: now()) { return .failed(.stalled) }
+            if let health = sourceHealth?(), health.trackingQuality != .normal || health.generation != fence.sourceGeneration {
+                return .failed(.trackingLost)
+            }
+            guard let sample = followTurnSourceGate.latest,
+                  sample.rejection(at: uptime, expectedGeneration: fence.sourceGeneration, requireEnriched: true) == nil else {
+                if let evidence {
+                    evidence.scanTrace?.unavailablePost(sample: followTurnSourceGate.latest.map {
+                        .init(sample: $0, uptime: uptime, expectedGeneration: fence.sourceGeneration)
+                    }, evidence: evidence, latch: stopUnconfirmed)
+                }
+                return .failed(.trackingLost)
+            }
+            let read = await interruptibleFollowTurnAck(owner: fence.operationGeneration, progress: { runtime?.progress ?? progress }) {
+                runtime?.expire(at: self.now())
+                if let health = self.sourceHealth?(), health.trackingQuality != .normal || health.generation != fence.sourceGeneration {
+                    return true
+                }
+                return self.followTurnStopFence?.identity != fence.identity || evidence?.fenced == true ||
+                    !self.recoveryAuthorized || self.stopUnconfirmed || runtime?.failure != nil ||
+                    (runtime == nil && progress.expired(at: self.now())) ||
+                    self.followTurnSourceGate.latest?.rejection(at: self.sourceNow(),
+                        expectedGeneration: fence.sourceGeneration, requireEnriched: true) != nil
+            }
+            if !read.completed { continue }
+            let ack = read.value
+            guard !Task.isCancelled, operationGeneration == fence.operationGeneration,
+                  followTurnStopFence?.identity == fence.identity,
+                  FollowMotionTaskScope.evidence?.fenced != true, recoveryAuthorized else { return .cancelled }
+            runtime?.expire(at: now())
+            if let failure = runtime?.failure { return .failed(failure) }
+            if runtime == nil, progress.expired(at: now()) { return .failed(.stalled) }
+            guard !stopUnconfirmed else { return .failed(.commandFailed) }
+            if let health = sourceHealth?(), health.trackingQuality != .normal || health.generation != fence.sourceGeneration {
+                return .failed(.trackingLost)
+            }
+            guard let newest = followTurnSourceGate.latest,
+                  newest.rejection(at: sourceNow(), expectedGeneration: fence.sourceGeneration, requireEnriched: true) == nil else {
+                if let evidence {
+                    evidence.scanTrace?.unavailablePost(sample: followTurnSourceGate.latest.map {
+                        .init(sample: $0, uptime: sourceNow(), expectedGeneration: fence.sourceGeneration)
+                    }, evidence: evidence, latch: stopUnconfirmed)
+                }
+                return .failed(.trackingLost)
+            }
+            let decision = guardLayer.evaluate(forwardClearance: currentForwardClearance(), lastAckAt: ack,
+                now: now(), feedback: nil, requireFreshAck: progress.hasSentCommand, checkForwardObstacle: false)
+            switch decision {
+            case .go: break
+            case .stopCommsLost: return .failed(.commsLost)
+            case .stopTipping: return .failed(.tipping)
+            case .stopObstacle: return .failed(.obstacle)
+            }
+            if let selected = followTurnSourceGate.consume(after: fence, at: sourceNow()) {
+                evaluated = selected
+                if let evidence { evidence.burstTrace?.sourceGate(fence: fence, sample: selected, uptime: sourceNow(),
+                    reason: nil, evidence: evidence, latch: stopUnconfirmed) }
+                return .sample(selected)
+            }
+            var deadline = (newest.sourceTimestamp! + 0.500).nextUp
+            if sourceNow() < fence.acknowledgementUptime + 0.300 { deadline = min(deadline, fence.acknowledgementUptime + 0.300) }
+            if let remaining = (runtime?.progress ?? progress).remaining(at: now()) {
+                deadline = min(deadline, sourceNow() + remaining)
+            }
+            if let authorization = FollowRecoveryScope.authorization {
+                deadline = min(deadline, sourceNow() + max(0, authorization.deadline - authorization.now()))
+            }
+            if !enteredSettle, sourceNow() < fence.acknowledgementUptime + 0.300, let evidence {
+                evidence.scanTrace?.beginWait("settle", duration: fence.acknowledgementUptime + 0.300 - sourceNow(),
+                    evidence: evidence, latch: stopUnconfirmed)
+                enteredSettle = true
+            }
+            if let evidence { evidence.burstTrace?.sourceGate(fence: fence, sample: newest, uptime: sourceNow(),
+                reason: followTurnSourceGate.diagnosticRejection(after: fence, at: sourceNow()),
+                evidence: evidence, latch: stopUnconfirmed) }
+            await waitForFollowTurnSource(until: deadline)
+        }
+    }
 
     func readFollowPose() -> NavigationPoseSample {
         if let currentPoseSample { return currentPoseSample() ?? .unavailable }
@@ -1243,6 +2103,7 @@ public final class NavigationController {
         case .commsLost: "Rover command link lost."
         case .tipping: "Rover may be tipping."
         case .stalled: "Navigation stalled."
+        case .rotationResolutionInsufficient: "Rotation stopped: observed response is too coarse for the remaining angle."
         case .commandFailed: "Rover command failed."
         case .trackingLost: "ARKit tracking lost."
         case .cancelled: "Navigation cancelled."

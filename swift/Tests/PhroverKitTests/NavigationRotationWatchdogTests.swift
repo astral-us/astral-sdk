@@ -5,14 +5,17 @@ import RoverNav
 @MainActor
 final class NavigationRotationWatchdogTests: XCTestCase {
     func testCancelledPulseStopIsSafeOnlyAfterIndependentConfirmedStop() async throws {
-        let pulseStop = SuspendedNavigationSend(error: URLError(.cancelled))
+        let pulseStop = SuspendedPulseStop()
+        let source = FollowRotationSourceFixture()
         var stops = 0
         let controller = NavigationController(
             currentPose: { Pose2D(position: .zero, yaw: 0) },
             forwardClearance: { 2 }, plan: { _, goal in [goal] },
             lastAckAt: { Date() }, sendCommand: { _ in },
             stopRover: { stops += 1; if stops == 2 { try await pulseStop.send() } },
-            sleep: { _ in })
+            sleep: { await source.advance($0) }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         var failures: [NavigationSafetyState] = []
         let observer = Task {
             for await state in controller.safetyStates() {
@@ -21,7 +24,11 @@ final class NavigationRotationWatchdogTests: XCTestCase {
         }
         let scan = Task { await controller.rotateForFollowScan(by: .pi / 6) }
         await pulseStop.waitUntilRequested()
-        try await controller.stopAndConfirm()
+        let independentStop = Task { try await controller.stopAndConfirm() }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(stops, 2, "An independent stop must drain the actual pending pulse stop")
+        pulseStop.fail()
+        try await independentStop.value
         let result = await scan.value
         for _ in 0..<20 { await Task.yield() }
         observer.cancel()
@@ -32,13 +39,15 @@ final class NavigationRotationWatchdogTests: XCTestCase {
     }
 
     func testFollowScanUsesFixedReliableWheelMagnitude() async {
-        var yaw = 0.0
+        let source = FollowRotationSourceFixture()
         var commands: [WheelCommand] = []
         let controller = NavigationController(
-            currentPose: { Pose2D(position: .zero, yaw: yaw) },
+            currentPose: { source.snapshot.pose },
             forwardClearance: { 2 }, plan: { _, goal in [goal] },
-            lastAckAt: { Date() }, sendCommand: { commands.append($0) },
-            stopRover: {}, sleep: { _ in yaw += 0.1 })
+            lastAckAt: { Date() }, sendCommand: { commands.append($0); source.yaw = .pi / 6 },
+            stopRover: {}, sleep: { await source.advance($0) }, poseSample: { source.snapshot },
+            sourceNow: { source.uptime }, sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
+        source.controller = controller
         let result = await controller.rotateForFollowScan(by: .pi / 6)
         XCTAssertEqual(result, .arrived)
         XCTAssertFalse(commands.isEmpty)
@@ -84,6 +93,7 @@ final class NavigationRotationWatchdogTests: XCTestCase {
         for scan in [false, true] {
             for error: Error in [CancellationError(), URLError(.cancelled)] {
                 let send = SuspendedNavigationSend(error: error)
+                let source = FollowRotationSourceFixture()
                 var stops = 0
                 let controller = NavigationController(
                     currentPose: { Pose2D(position: .zero, yaw: 0) },
@@ -92,8 +102,10 @@ final class NavigationRotationWatchdogTests: XCTestCase {
                     lastAckAt: { nil },
                     sendCommand: { _ in try await send.send() },
                     stopRover: { stops += 1 },
-                    sleep: { _ in }
+                    sleep: { await source.advance($0) }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                    sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot }
                 )
+                source.controller = controller
                 let states = controller.safetyStates()
                 let received = Task { () -> [NavigationSafetyState] in
                     var result: [NavigationSafetyState] = []
@@ -144,6 +156,7 @@ final class NavigationRotationWatchdogTests: XCTestCase {
 
     func testUnrequestedURLRotationSendCancellationRemainsCommandFailure() async {
         for scan in [false, true] {
+            let source = FollowRotationSourceFixture()
             let controller = NavigationController(
                 currentPose: { Pose2D(position: .zero, yaw: 0) },
                 forwardClearance: { 2 },
@@ -151,8 +164,10 @@ final class NavigationRotationWatchdogTests: XCTestCase {
                 lastAckAt: { nil },
                 sendCommand: { _ in throw URLError(.cancelled) },
                 stopRover: {},
-                sleep: { _ in }
+                sleep: { await source.advance($0) }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+                sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot }
             )
+            source.controller = controller
             let states = controller.safetyStates()
             let failure = Task { () -> NavigationSafetyState? in
                 for await state in states {
@@ -172,7 +187,8 @@ final class NavigationRotationWatchdogTests: XCTestCase {
     }
 
     func testCancelledScanPulseStopRemainsFailureWhenFinalStopIsUnconfirmed() async {
-        let pulseStop = SuspendedNavigationSend(error: URLError(.cancelled))
+        let pulseStop = SuspendedPulseStop()
+        let source = FollowRotationSourceFixture()
         var stops = 0
         var commands = 0
         let controller = NavigationController(
@@ -186,13 +202,19 @@ final class NavigationRotationWatchdogTests: XCTestCase {
                 if stops == 2 { try await pulseStop.send() }
                 if stops > 2 { throw RotationStopError.failed }
             },
-            sleep: { _ in }
+            sleep: { await source.advance($0) }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot }
         )
+        source.controller = controller
         let scan = Task { await controller.rotateForFollowScan(by: .pi / 6) }
         await pulseStop.waitUntilRequested()
 
+        let independentStop = Task { try await controller.stopAndConfirm() }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(stops, 2, "Replacement stop cannot overtake the pending stop response")
+        pulseStop.fail()
         do {
-            try await controller.stopAndConfirm()
+            try await independentStop.value
             XCTFail("A cancelled pulse stop does not confirm that the motors stopped")
         } catch {
             XCTAssertEqual(error as? RotationStopError, .failed)
@@ -207,6 +229,7 @@ final class NavigationRotationWatchdogTests: XCTestCase {
     }
 
     func testFollowScanStopsSendingPulsesWhenPulseStopFails() async {
+        let source = FollowRotationSourceFixture()
         var stopCount = 0
         var commands = 0
         let controller = NavigationController(
@@ -219,8 +242,10 @@ final class NavigationRotationWatchdogTests: XCTestCase {
                 stopCount += 1
                 if stopCount == 2 { throw RotationStopError.failed }
             },
-            sleep: { _ in }
+            sleep: { await source.advance($0) }, poseSample: { source.snapshot }, sourceNow: { source.uptime },
+            sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot }
         )
+        source.controller = controller
         let result = await controller.rotateForFollowScan(by: .pi / 6)
         XCTAssertEqual(result, .failed(.commandFailed))
         XCTAssertEqual(commands, 1)
@@ -298,6 +323,46 @@ private final class SuspendedRotationStop {
 }
 
 private enum RotationStopError: Error { case failed }
+
+@MainActor
+private final class SuspendedPulseStop {
+    private var requested = false
+    private var requestWaiter: CheckedContinuation<Void, Never>?
+    private var response: CheckedContinuation<Void, Error>?
+    func send() async throws {
+        requested = true
+        requestWaiter?.resume(); requestWaiter = nil
+        try await withCheckedThrowingContinuation { response = $0 }
+    }
+    func waitUntilRequested() async {
+        if requested { return }
+        await withCheckedContinuation { requestWaiter = $0 }
+    }
+    func fail() { response?.resume(throwing: URLError(.cancelled)); response = nil }
+}
+
+/// Explicit simulated camera captures at timer boundaries. Provider reads only
+/// return stored evidence; they never manufacture sequence/time advancement.
+@MainActor
+private final class FollowRotationSourceFixture {
+    weak var controller: NavigationController?
+    var uptime = 10.0
+    var yaw = 0.0
+    let events = AsyncStream<NavigationPoseSample>.makeStream()
+    var snapshot = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+        frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 9.99, trackingQuality: .normal)
+
+    func advance(_ duration: Duration) async {
+        await Task.yield()
+        guard !Task.isCancelled else { return }
+        let elapsed = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+        uptime += elapsed
+        snapshot = .init(pose: .init(position: .zero, yaw: yaw),
+            frameID: .init(generation: 1, sequence: snapshot.frameID!.sequence + 1),
+            sourceTimestamp: uptime, trackingQuality: .normal)
+        controller?.ingestFollowTurnSource(snapshot)
+    }
+}
 
 @MainActor
 private final class RotationHarness {

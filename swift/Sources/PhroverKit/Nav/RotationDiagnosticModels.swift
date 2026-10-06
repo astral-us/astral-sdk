@@ -54,6 +54,7 @@ struct FollowMotionOperationContext: Sendable, Equatable {
 }
 
 struct FollowMotionFailureDelivery: Sendable {
+    let turnDiagnosticFields: [String: FollowDiagnosticValue]
     let context: FollowMotionOperationContext
     let reason: NavigationFailure
     let stopOutcome: FollowMotionStopOutcome
@@ -63,7 +64,9 @@ struct FollowMotionFailureDelivery: Sendable {
     let stopReceipt: RoverCommandDiagnosticReceipt?
     init(context: FollowMotionOperationContext, reason: NavigationFailure, stopOutcome: FollowMotionStopOutcome,
          source: FollowMotionDeliverySource, stale: Bool = false,
-         commandReceipt: RoverCommandDiagnosticReceipt? = nil, stopReceipt: RoverCommandDiagnosticReceipt? = nil) {
+          commandReceipt: RoverCommandDiagnosticReceipt? = nil, stopReceipt: RoverCommandDiagnosticReceipt? = nil,
+          turnDiagnosticFields: [String: FollowDiagnosticValue] = [:]) {
+        self.turnDiagnosticFields = turnDiagnosticFields
         self.context = context
         self.reason = reason
         self.stopOutcome = stopOutcome
@@ -75,6 +78,7 @@ struct FollowMotionFailureDelivery: Sendable {
 }
 
 struct FollowMotionResult: Sendable {
+    let turnStopFence: FollowTurnStopFence?
     var outcome: FollowMotionOutcome {
         if let deferred, failure == nil, stopOutcome != .failed { return .notStarted(deferred) }
         return .navigation(result)
@@ -91,7 +95,8 @@ struct FollowMotionResult: Sendable {
     init(result: NavigationResult, context: FollowMotionOperationContext, failure: FollowMotionFailureDelivery?,
          stopOutcome: FollowMotionStopOutcome = .unknown, commandReceipt: RoverCommandDiagnosticReceipt? = nil,
          stopReceipt: RoverCommandDiagnosticReceipt? = nil, deferred: FollowReadyDeferral? = nil,
-         recovery: FollowRecoverySegmentEvidence? = nil) {
+         recovery: FollowRecoverySegmentEvidence? = nil, turnStopFence: FollowTurnStopFence? = nil) {
+        self.turnStopFence = turnStopFence
         self.recovery = recovery
         self.deferred = deferred
         self.result = result
@@ -110,15 +115,19 @@ final class FollowMotionOperationEvidence {
     let recoveryEpisodeID: UUID?
     let recoveryDeadline: Double?
     let recoveryStageHeading: Double?
+    let recoveryStageIndex: Int?
+    let recoverySegmentIndex: Int?
     let recoveryExpectedGeneration: UInt64?
     var recoveryAuthorizationTime: Double?
     var recoveryAuthorizationOutcome: String?
     var recovery: FollowRecoverySegmentEvidence?
+    var turnStopFence: FollowTurnStopFence?
     let initialContext: FollowMotionOperationContext
     var targetYaw: Double?
     var fenced = false
     var emittedFailure = false
     var scanTrace: FollowScanDiagnosticTrace?
+    var burstTrace: FollowTurnBurstDiagnosticTrace?
     var ownedGeneration: UInt?
     var callerCancellationStop: Task<Bool?, Never>?
     private(set) var primaryFailure: NavigationFailure?
@@ -131,6 +140,8 @@ final class FollowMotionOperationEvidence {
         recoveryEpisodeID = FollowRecoveryScope.authorization?.episodeID
         recoveryDeadline = FollowRecoveryScope.authorization?.deadline
         recoveryStageHeading = FollowRecoveryScope.heading?.stageHeading
+        recoveryStageIndex = FollowRecoveryScope.heading?.stageIndex
+        recoverySegmentIndex = FollowRecoveryScope.heading?.segmentIndex
         recoveryExpectedGeneration = FollowRecoveryScope.authorization?.expectedGeneration
     }
     var context: FollowMotionOperationContext {
@@ -150,13 +161,19 @@ final class FollowMotionOperationEvidence {
     func failure(source: FollowMotionDeliverySource) -> FollowMotionFailureDelivery? {
         guard let primaryFailure else { return nil }
         return .init(context: context, reason: primaryFailure, stopOutcome: stopOutcome,
-            source: source, stale: fenced, commandReceipt: commandReceipt, stopReceipt: stopReceipt)
+            source: source, stale: fenced, commandReceipt: commandReceipt, stopReceipt: stopReceipt,
+            turnDiagnosticFields: burstTrace.map { trace in trace.fields.merging([
+                "episode_id": recoveryEpisodeID.map { .string($0.uuidString) } ?? .null,
+                "stage_index": recoveryStageIndex.map { .number(Double($0)) } ?? .null,
+                "segment_index": recoverySegmentIndex.map { .number(Double($0)) } ?? .null,
+                "stage_segment_availability": .string(recoveryStageIndex == nil ? "not_supplied" : "captured_coordinator_cursor")
+            ]) { _, value in value } } ?? [:])
     }
     func result(_ result: NavigationResult) -> FollowMotionResult {
         .init(result: result, context: context, failure: failure(source: .result),
             stopOutcome: stopOutcome, commandReceipt: commandReceipt, stopReceipt: stopReceipt,
             deferred: primaryFailure == nil && stopOutcome != .failed ? FollowReadyAdmissionScope.current?.deferred : nil,
-            recovery: recovery)
+            recovery: recovery, turnStopFence: turnStopFence)
     }
 }
 
@@ -164,6 +181,13 @@ final class FollowMotionOperationEvidence {
 @MainActor
 final class FollowMotionStopReceiptCapture {
     var receipt: RoverCommandDiagnosticReceipt?
+    var sourceFence: FollowTurnStopFence?
+    var onSourceFence: (@MainActor (FollowTurnStopFence) -> Void)?
+
+    func recordSourceFence(_ fence: FollowTurnStopFence) {
+        sourceFence = fence
+        onSourceFence?(fence)
+    }
 }
 
 enum FollowMotionTaskScope {
@@ -173,6 +197,15 @@ enum FollowMotionTaskScope {
 }
 
 struct FollowScanRotationProfile: Sendable, Equatable {
+    /// Legacy trace schema projection of the active immutable burst profile.
+    /// `pulseWait` is the maximum requested host budget, never an ACK-relative wait.
+    static func turnBurst(purpose: FollowMotionPurpose) -> Self {
+        let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan)
+        return .init(pulseWait: profile.maximumHostBurstBudget, settleWait: profile.settleWait,
+            wheelCap: profile.fixedWheelMagnitude, yawGain: RoverConfig.followScanRotationProfile.yawGain,
+            angularTolerance: profile.tolerance)
+    }
+
     let pulseWait: TimeInterval
     let settleWait: TimeInterval
     let wheelCap: Double
