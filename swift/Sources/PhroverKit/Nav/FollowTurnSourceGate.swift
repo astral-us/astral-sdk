@@ -43,6 +43,7 @@ final class FollowTurnRuntimeState {
     var progress = FollowTurnWaitingProgress()
     var lastAck: Date?
     private(set) var failure: NavigationFailure?
+    private(set) var sourceRejection: String?
     private var previous: NavigationPoseSample
 
     init(targetYaw: Double, initial: NavigationPoseSample, tolerance: Double, date: Date) {
@@ -61,10 +62,16 @@ final class FollowTurnRuntimeState {
 
     func fail(_ reason: NavigationFailure) { if failure == nil { failure = reason } }
 
+    func failTracking(_ rejection: String?) {
+        guard failure == nil else { return }
+        sourceRejection = rejection
+        failure = .trackingLost
+    }
+
     func observe(_ sample: NavigationPoseSample, uptime: Double, date: Date) {
         guard failure == nil else { return }
-        guard sample.rejection(at: uptime, expectedGeneration: generation, requireEnriched: true) == nil else {
-            failure = .trackingLost
+        if let rejection = sample.rejection(at: uptime, expectedGeneration: generation, requireEnriched: true) {
+            failTracking(rejection)
             return
         }
         guard sample.frameID!.sequence > previous.frameID!.sequence,

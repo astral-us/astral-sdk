@@ -644,6 +644,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     now: { time }, canContinue: { allowed }))
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 4, purpose: .followScan, phase: "reacquiring")
             let result = await NavigationFollowMeMotion(navigation: controller).performRecoveryHeading(request, context: context)
+            XCTAssertEqual(result.result, .cancelled, "Expired or denied recovery at \(boundary)")
             outcomes.append(sends)
             outcomes.append(result.result == .cancelled ? 1 : 0)
         }

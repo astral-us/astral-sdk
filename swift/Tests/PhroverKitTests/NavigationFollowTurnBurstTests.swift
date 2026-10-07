@@ -372,7 +372,9 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
                 // This capture is healthy/age-valid, but equal to the stop ACK.
                 snapshot = self.sample(3, 10.0)
                 controller.ingestFollowTurnSource(snapshot)
-                attempted = await FollowTurnBurstTransportScope.authorization!.authorizeAttempt!()
+                let authority = FollowTurnBurstTransportScope.authorization!
+                XCTAssertNil(authority.authorizeAttempt, "Production attempts must not hop back to MainActor")
+                attempted = authority.isAuthorized()
                 XCTAssertFalse(attempted, "Attempt authority must retain the strict stop capture fence")
                 throw FollowTurnBurstTransportDenial.fenced
             }, stopRover: { stops += 1 }, sleep: { try? await Task.sleep(for: $0) },

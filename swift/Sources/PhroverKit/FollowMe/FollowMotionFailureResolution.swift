@@ -39,6 +39,7 @@ struct FollowMotionFailureResolution {
             guard delivery.context.request?.requestToken == context.request?.requestToken else { return }
         }
         let previousReason = primaryReason
+        let previousCause = context.failureCause
         let previousStop = stopOutcome
         let seen = !sources.isEmpty
         if primaryReason == .commandFailed || primaryReason == .cancelled {
@@ -50,6 +51,10 @@ struct FollowMotionFailureResolution {
         if delivery.reason == primaryReason, !delivery.turnDiagnosticFields.isEmpty {
             turnDiagnosticFields.merge(delivery.turnDiagnosticFields) { _, value in value }
         }
+        if delivery.reason == primaryReason, context.failureCause == nil,
+           delivery.context.failureCause != nil {
+            context = delivery.context
+        }
         // Pending/cancellation/unknown cannot revoke an acknowledgement. Failed is sticky.
         if stopOutcome != .failed {
             switch delivery.stopOutcome {
@@ -60,6 +65,7 @@ struct FollowMotionFailureResolution {
             }
         }
         deduplicated = seen && previousReason == primaryReason && previousStop == stopOutcome
+            && previousCause == context.failureCause
         sources.insert(delivery.source.rawValue)
     }
     var diagnosticReason: String {
@@ -72,9 +78,9 @@ struct FollowMotionFailureResolution {
         case .commsLost: return "comms_lost"
         case .tipping: return "tipping"
         case .stalled: return "stalled"
-        case .rotationResolutionInsufficient: return "rotation_resolution_insufficient"
+        case .rotationResolutionInsufficient: return context.failureCause?.rawValue ?? "rotation_resolution_insufficient"
         case .commandFailed: return "transport_failed"
-        case .trackingLost: return "tracking_lost"
+        case .trackingLost: return context.failureCause == .poseSourceStale ? "pose_source_stale" : "tracking_lost"
         case .cancelled: return "cancelled"
         }
     }
@@ -90,7 +96,10 @@ struct FollowMotionFailureResolution {
         }
         switch primaryReason {
         case .noPose: return "Rover pose unavailable. Wait for AR tracking to recover."
-        case .trackingLost: return "AR tracking lost. Wait for tracking to recover."
+        case .trackingLost:
+            return context.failureCause == .poseSourceStale
+                ? "Camera pose is stale. Motion stopped; wait for fresh camera frames."
+                : "AR tracking lost. Wait for tracking to recover."
         case .obstacle: return "Obstacle detected. Motion stopped."
         case .commsLost: return "Rover communication lost. Motion stopped."
         case .tipping: return "Rover tipping detected. Motion stopped."
@@ -98,6 +107,12 @@ struct FollowMotionFailureResolution {
         case .rotationResolutionInsufficient:
             let turn = context.purpose == .followScan ? "Search rotation" : (context.purpose == .followAlignment ? "Person alignment" : "Turn")
             let stop = stopOutcome == .confirmed ? "Stop confirmed. Restart following to try again." : "Confirming motor stop…"
+            if context.failureCause == .burstPreSendExpired {
+                return "Turn not started: command scheduling exceeded burst budget. \(stop)"
+            }
+            if context.failureCause == .calibrationEvidenceIncomplete {
+                return "\(turn) stopped: calibration pose evidence is incomplete or unreliable. \(stop)"
+            }
             return "\(turn) stopped: observed response is too coarse for the remaining angle. \(stop)"
         case .noPath: return "No navigation path available."
         case .pathRejected: return "Navigation path rejected."

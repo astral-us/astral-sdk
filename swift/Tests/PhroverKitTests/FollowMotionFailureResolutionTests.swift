@@ -2,6 +2,56 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testEvidenceAndStaleSourceCausesSurviveBothOrdersAndFailedStop() {
+        for (cause, reason) in [(FollowTurnFailureCause.calibrationEvidenceIncomplete, NavigationFailure.rotationResolutionInsufficient),
+                                (.poseSourceStale, .trackingLost)] {
+            let base = delivery(.stream).context
+            let context = FollowMotionOperationContext(request: base.request, controllerOperationID: base.controllerOperationID,
+                purpose: base.purpose, profile: base.profile, failureCause: cause)
+            let specific = FollowMotionFailureDelivery(context: context, reason: reason, stopOutcome: .pending, source: .stream)
+            let wrapper = delivery(.result, reason: .commandFailed)
+            for order in [[specific, wrapper], [wrapper, specific]] {
+                var resolution = FollowMotionFailureResolution(order[0])
+                resolution.consume(order[1])
+                XCTAssertEqual(resolution.primaryReason, reason)
+                XCTAssertEqual(resolution.diagnosticReason, cause.rawValue)
+                XCTAssertFalse(resolution.message.contains("too coarse"))
+                resolution.consume(delivery(.confirmation, reason: .commandFailed, stop: .failed))
+                resolution.consume(delivery(.result, reason: .cancelled, stop: .confirmed, stale: true))
+                XCTAssertEqual(resolution.context.failureCause, cause)
+                XCTAssertEqual(resolution.message, "Motor stop could not be confirmed. Motion is blocked.")
+                XCTAssertEqual(resolution.priority, 3)
+            }
+        }
+    }
+
+    func testSchedulingCauseSurvivesBothDeliveryOrdersUnknownWrappersAndStickyStopFailure() {
+        let unknown = delivery(.result, reason: .commandFailed)
+        let base = unknown.context
+        let context = FollowMotionOperationContext(request: base.request, controllerOperationID: base.controllerOperationID,
+            purpose: base.purpose, profile: base.profile, failureCause: .burstPreSendExpired)
+        let specific = FollowMotionFailureDelivery(context: context, reason: .rotationResolutionInsufficient,
+            stopOutcome: .pending, source: .stream, turnDiagnosticFields: ["sender_outcome": .string("expired")])
+        for order in [[unknown, specific], [specific, unknown]] {
+            var record = FollowMotionFailureResolution(order[0])
+            record.consume(order[1])
+            XCTAssertEqual(record.key, .init(generation: 7, operationID: 91))
+            XCTAssertEqual(record.diagnosticReason, "burst_pre_send_expired")
+            XCTAssertEqual(record.turnDiagnosticFields["sender_outcome"], .string("expired"))
+            XCTAssertTrue(record.message.hasSuffix("Confirming motor stop…"))
+            record.consume(delivery(.confirmation, reason: .commandFailed, stop: .confirmed, stale: true))
+            XCTAssertEqual(record.stopOutcome, .pending)
+            record.consume(delivery(.confirmation, reason: .commandFailed, stop: .confirmed))
+            XCTAssertTrue(record.message.hasSuffix("Stop confirmed. Restart following to try again."))
+            record.consume(delivery(.confirmation, reason: .commandFailed, stop: .failed))
+            record.consume(delivery(.result, reason: .cancelled, stop: .confirmed))
+            XCTAssertEqual(record.context.failureCause, .burstPreSendExpired)
+            XCTAssertEqual(record.primaryReason, .rotationResolutionInsufficient)
+            XCTAssertEqual(record.message, "Motor stop could not be confirmed. Motion is blocked.")
+            XCTAssertEqual(record.priority, 3)
+        }
+    }
+
     func testResolutionTelemetrySurvivesGenericWrapperAndStickyFailedStopWithoutLosingControllerPhase() {
         let context = delivery(.stream, purpose: .followAlignment).context
         let facts: [String: FollowDiagnosticValue] = ["controller_phase": .string("stopped_planning"),

@@ -6,6 +6,13 @@ enum FollowMotionStopOutcome: String, Sendable { case unknown, pending, confirme
 enum FollowMotionDeliverySource: String, Sendable { case stream, result, confirmation }
 enum FollowMotionStopOrigin: String, Sendable { case pulse, independent, final, detection, cleanup }
 
+/// Internal subtype of the existing public rotation-resolution failure.
+enum FollowTurnFailureCause: String, Sendable {
+    case burstPreSendExpired = "burst_pre_send_expired"
+    case calibrationEvidenceIncomplete = "calibration_evidence_incomplete"
+    case poseSourceStale = "pose_source_stale"
+}
+
 struct FollowMotionRequestContext: Sendable, Equatable {
     let sessionGeneration: UInt64
     let requestToken: UInt64
@@ -41,14 +48,17 @@ struct FollowMotionOperationContext: Sendable, Equatable {
     let profile: FollowScanRotationProfile?
     let requestedRotation: Double?
     let targetYaw: Double?
+    let failureCause: FollowTurnFailureCause?
     init(request: FollowMotionRequestContext?, controllerOperationID: UInt64?, purpose: FollowMotionPurpose?,
-         profile: FollowScanRotationProfile?, requestedRotation: Double? = nil, targetYaw: Double? = nil) {
+         profile: FollowScanRotationProfile?, requestedRotation: Double? = nil, targetYaw: Double? = nil,
+         failureCause: FollowTurnFailureCause? = nil) {
         self.request = request
         self.controllerOperationID = controllerOperationID
         self.purpose = purpose
         self.profile = profile
         self.requestedRotation = requestedRotation
         self.targetYaw = targetYaw
+        self.failureCause = failureCause
     }
     static let unknown = Self(request: nil, controllerOperationID: nil, purpose: nil, profile: nil)
 }
@@ -131,6 +141,7 @@ final class FollowMotionOperationEvidence {
     var ownedGeneration: UInt?
     var callerCancellationStop: Task<Bool?, Never>?
     private(set) var primaryFailure: NavigationFailure?
+    private var failureCause: FollowTurnFailureCause?
     private(set) var stopOutcome: FollowMotionStopOutcome = .unknown
     private(set) var commandReceipt: RoverCommandDiagnosticReceipt?
     private(set) var stopReceipt: RoverCommandDiagnosticReceipt?
@@ -147,10 +158,16 @@ final class FollowMotionOperationEvidence {
     var context: FollowMotionOperationContext {
         .init(request: initialContext.request, controllerOperationID: initialContext.controllerOperationID,
             purpose: initialContext.purpose, profile: initialContext.profile,
-            requestedRotation: recovery?.requestedDelta ?? initialContext.requestedRotation, targetYaw: targetYaw)
+            requestedRotation: recovery?.requestedDelta ?? initialContext.requestedRotation, targetYaw: targetYaw,
+            failureCause: failureCause)
     }
-    func recordFailure(_ reason: NavigationFailure) {
-        if primaryFailure == nil || primaryFailure == .commandFailed { primaryFailure = reason }
+    func recordFailure(_ reason: NavigationFailure, cause: FollowTurnFailureCause? = nil) {
+        if primaryFailure == nil || primaryFailure == .commandFailed {
+            primaryFailure = reason
+            failureCause = cause
+        } else if primaryFailure == reason, let cause {
+            failureCause = failureCause ?? cause
+        }
     }
     func recordStop(_ outcome: FollowMotionStopOutcome) {
         // A stale success cannot erase an independently observed confirmation failure.

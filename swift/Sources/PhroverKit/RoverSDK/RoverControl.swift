@@ -34,14 +34,20 @@ public actor RoverControl {
     // MARK: - Motion
 
     func sendNavigationWithReceipt(_ cmd: WheelCommand) async -> RoverCommandDiagnosticResult {
-        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left],
-            authorization: cmd.left != 0 || cmd.right != 0 ? FollowTurnBurstTransportScope.authorization : nil)
+        let authorization = cmd.left != 0 || cmd.right != 0 ? FollowTurnBurstTransportScope.authorization : nil
+        if let authorization {
+            authorization.transportCapture?.recordTiming(.init(boundary: .actorEntry, uptime: authorization.uptime()))
+        }
+        return await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left],
+            authorization: authorization)
     }
 
     func sendNavigationWithReceipt(_ cmd: WheelCommand,
                                    authorization: FollowTurnBurstAuthorization) async -> RoverCommandDiagnosticResult {
-        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left],
-            authorization: cmd.left != 0 || cmd.right != 0 ? authorization : nil)
+        let selected = cmd.left != 0 || cmd.right != 0 ? authorization : nil
+        selected?.transportCapture?.recordTiming(.init(boundary: .actorEntry, uptime: authorization.uptime()))
+        return await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": cmd.right, "R": cmd.left],
+            authorization: selected)
     }
 
     func stopWithReceipt() async -> RoverCommandDiagnosticResult {
@@ -133,32 +139,63 @@ public actor RoverControl {
         var lastStatusCode: Int?
 
         for attempt in 1...attempts {
+            var requestEntry: TimeInterval?
             if let authorization {
+                authorization.transportCapture?.recordTiming(.init(boundary: .authorizationStart,
+                    uptime: authorization.uptime(), attempt: attempt))
                 let attemptAuthorized = await authorization.authorizeAttempt?() ?? true
-                // No suspension between these final gates and creation of the HTTP task.
+                authorization.transportCapture?.recordTiming(.init(boundary: .authorizationEnd,
+                    uptime: authorization.uptime(), attempt: attempt))
+                let eligibilityTime = authorization.uptime()
+                let time = authorization.uptime() // Last provider read, immediately before final request gates.
+                // Only fixed, locked bookkeeping follows the gates. No injected
+                // callbacks, provider reads, logging or suspension before HTTP.
                 if Task.isCancelled {
+                    authorization.transportCapture?.recordTiming(.init(boundary: .eligibility,
+                        uptime: time, attempt: attempt, eligible: false))
                     return .init(receipt: .init(httpStatus: lastStatusCode, acknowledged: false,
                         acknowledgementUTC: nil, attempts: attempt - 1, outcome: "cancelled"),
                         failure: FollowTurnBurstTransportDenial.cancelled)
                 }
-                let time = authorization.uptime()
                 if !time.isFinite || !authorization.deadline.isFinite || time >= authorization.deadline {
+                    authorization.transportCapture?.recordTiming(.init(boundary: .eligibility,
+                        uptime: time, attempt: attempt, eligible: false))
                     return .init(receipt: .init(httpStatus: lastStatusCode, acknowledged: false,
                         acknowledgementUTC: nil, attempts: attempt - 1, outcome: "expired"),
                         failure: FollowTurnBurstTransportDenial.expired)
                 }
                 if !attemptAuthorized || !authorization.isAuthorized() {
+                    // Prepared authority samples its clock inside the locked
+                    // predicate. Preserve expiry when that final sample crosses
+                    // the immutable budget after the earlier eligibility read.
+                    let deniedAt = authorization.uptime()
+                    let expired = !deniedAt.isFinite || deniedAt >= authorization.deadline
+                    authorization.transportCapture?.recordTiming(.init(boundary: .eligibility,
+                        uptime: deniedAt, attempt: attempt, eligible: false))
                     return .init(receipt: .init(httpStatus: lastStatusCode, acknowledged: false,
-                        acknowledgementUTC: nil, attempts: attempt - 1, outcome: "fenced"),
-                        failure: FollowTurnBurstTransportDenial.fenced)
+                        acknowledgementUTC: nil, attempts: attempt - 1, outcome: expired ? "expired" : "fenced"),
+                        failure: expired ? FollowTurnBurstTransportDenial.expired : .fenced)
                 }
-                authorization.didEnterAttempt?(.init(operationID: authorization.operationID,
-                    attempt: attempt, entryUptime: time))
+                authorization.transportCapture?.recordTiming(.init(boundary: .eligibility,
+                    uptime: eligibilityTime, attempt: attempt, eligible: true))
+                authorization.transportCapture?.recordTiming(.init(boundary: .requestStart,
+                    uptime: time, attempt: attempt))
+                requestEntry = time
             }
             var didLogResponse = false
             var statusCode: Int?
+            var recordedEntry = false
+            func recordActualAttempt() {
+                guard !recordedEntry, let requestEntry, let authorization else { return }
+                recordedEntry = true
+                // The attempt actually entered URLSession. Notify injected
+                // observers only after its drain, never inside final eligibility.
+                authorization.didEnterAttempt?(.init(operationID: authorization.operationID,
+                    attempt: attempt, entryUptime: requestEntry))
+            }
             do {
                 let (_, response) = try await session.data(for: req)
+                recordActualAttempt()
                 guard let http = response as? HTTPURLResponse else {
                     RuntimeFileLog.append("rover_command_request", fields: Self.requestLogFields(url: url,
                                                                                                   attempt: attempt,
@@ -183,6 +220,7 @@ public actor RoverControl {
                 return .init(receipt: .init(httpStatus: http.statusCode, acknowledged: true,
                     acknowledgementUTC: lastAckAt, attempts: attempt, outcome: "acknowledged"), failure: nil)
             } catch {
+                recordActualAttempt()
                 lastError = error
                 if !didLogResponse {
                     RuntimeFileLog.append("rover_command_request", fields: Self.requestLogFields(url: url,

@@ -88,6 +88,7 @@ public final class FollowMeCoordinator {
     private var perceptionReady = false
     private var readinessDeadline: TimeInterval?
     private var stopTask: Task<Bool, Never>?
+    private var stopCleanupOwned = false
     private var confirmationTask: Task<Bool, Never>?
     private var confirmationID: UInt64 = 0
     private var stopBlocked = false
@@ -303,6 +304,11 @@ public final class FollowMeCoordinator {
 
     private func finish(_ result: FollowMeState, resolvingFailure: Bool = false) async -> Bool {
         if let stopTask {
+            // Only one waiter publishes terminal state and clears the task.
+            // Followers must not overwrite resolved failure text or clear a
+            // replacement stop after the original owner's acknowledgement.
+            if stopCleanupOwned { return await stopTask.value }
+            stopCleanupOwned = true
             let recoveryTermination = pendingRecoveryTermination
             pendingRecoveryTermination = nil
             let confirmed = await stopTask.value
@@ -311,6 +317,7 @@ public final class FollowMeCoordinator {
                 state = .failed("Rover stop could not be confirmed.")
             }
             self.stopTask = nil
+            stopCleanupOwned = false
             recordReadinessStop(confirmed)
             if let recoveryTermination { emitRecoveryTermination(recoveryTermination, confirmed: confirmed) }
             return confirmed
@@ -321,6 +328,7 @@ public final class FollowMeCoordinator {
                 do { try await motion.stopAndConfirm(); return true }
                 catch { return false }
             }
+            stopCleanupOwned = true
             stopTask = retry
             let confirmed = await retry.value
             if confirmed {
@@ -330,6 +338,7 @@ public final class FollowMeCoordinator {
                 state = .stopped
             }
             stopTask = nil
+            stopCleanupOwned = false
             recordReadinessStop(confirmed)
             return confirmed
         }
@@ -365,6 +374,7 @@ public final class FollowMeCoordinator {
             do { try await motion.stopAndConfirm(); return true }
             catch { return false }
         }
+        stopCleanupOwned = true
         stopTask = task
         let confirmed = await task.value
         if !confirmed {
@@ -383,6 +393,7 @@ public final class FollowMeCoordinator {
             if updated.stopOutcome == .failed { stopBlocked = true }
         }
         stopTask = nil
+        stopCleanupOwned = false
         pruneFailureResolution()
         if let terminalRecovery { emitRecoveryTermination(terminalRecovery, confirmed: confirmed) }
         return confirmed
@@ -404,7 +415,8 @@ public final class FollowMeCoordinator {
         } else { context = supplied.context }
         let delivery = FollowMotionFailureDelivery(context: context, reason: supplied.reason,
             stopOutcome: supplied.stopOutcome, source: supplied.source, stale: supplied.stale,
-            commandReceipt: supplied.commandReceipt, stopReceipt: supplied.stopReceipt)
+            commandReceipt: supplied.commandReceipt, stopReceipt: supplied.stopReceipt,
+            turnDiagnosticFields: supplied.turnDiagnosticFields)
         let retained = failureResolution.map { matches(context, $0.context) } ?? false
         let current = !delivery.stale && (context.request.map {
             $0.sessionGeneration == generation && $0.requestToken == activeRequest?.requestToken

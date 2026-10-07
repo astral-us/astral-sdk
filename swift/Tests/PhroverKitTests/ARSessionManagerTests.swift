@@ -6,6 +6,48 @@ import XCTest
 
 @MainActor
 final class ARSessionManagerTests: XCTestCase {
+    func testTurnEvidencePreservesIngressFramesWhileControlSnapshotsCoalesce() async throws {
+        let manager = ARSessionManager()
+        manager.resetForTesting()
+        var control = manager.snapshots().makeAsyncIterator()
+        let firstTime = ProcessInfo.processInfo.systemUptime - 0.001
+        for index in 0..<8 {
+            manager.ingestForTesting(image: makeImage(), timestamp: firstTime + Double(index) * 0.000001,
+                cameraTransform: transform(x: Float(index), z: 0), intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 8, height: 6), depthMap: nil, trackingQuality: .normal)
+        }
+        let latest = await control.next()
+        XCTAssertEqual(latest?.id.sequence, 8, "Control delivery remains newest-only")
+        let evidence = try XCTUnwrap(manager.turnPoseEvidence(from: .init(generation: 1, sequence: 1),
+            through: .init(generation: 1, sequence: 8)))
+        XCTAssertEqual(evidence.map(\.sequence), (1...8).map { UInt64($0) })
+        XCTAssertTrue(evidence.allSatisfy { $0.healthy && $0.clockDomain == "ar_system_uptime" })
+        XCTAssertEqual(evidence.first?.sourceTimestamp, firstTime)
+        XCTAssertTrue(evidence.allSatisfy { $0.collectedUptime >= $0.sourceTimestamp! })
+        manager.resetForTesting()
+        XCTAssertNil(manager.turnPoseEvidence(from: .init(generation: 1, sequence: 1),
+            through: .init(generation: 1, sequence: 8)), "Reset invalidates the old generation's evidence")
+    }
+
+    func testTurnEvidenceEvictionAndInterruptionAreExplicitlyUnavailable() throws {
+        let manager = ARSessionManager()
+        manager.resetForTesting()
+        let firstTime = ProcessInfo.processInfo.systemUptime - 0.001
+        for index in 0..<140 {
+            manager.ingestForTesting(image: makeImage(), timestamp: firstTime + Double(index) * 0.000001,
+                cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 8, height: 6), depthMap: nil, trackingQuality: .normal)
+        }
+        XCTAssertNil(manager.turnPoseEvidence(from: .init(generation: 1, sequence: 1),
+            through: .init(generation: 1, sequence: 140)))
+        let bounded = try XCTUnwrap(manager.turnPoseEvidence(from: .init(generation: 1, sequence: 13),
+            through: .init(generation: 1, sequence: 140)))
+        XCTAssertEqual(bounded.count, 128)
+        manager.interruptionBeganForTesting()
+        XCTAssertNil(manager.turnPoseEvidence(from: .init(generation: 1, sequence: 13),
+            through: .init(generation: 1, sequence: 140)))
+    }
+
     func testIngressHighWaterRetainsPendingTimestampEvenWhenNewestSnapshotRegresses() {
         let manager = ARSessionManager()
         manager.resetForTesting()

@@ -45,12 +45,15 @@ struct FollowTurnBurstObservation {
 struct FollowTurnResponseBracket {
     private(set) var samples: [FollowTurnBurstPlanner.Sample] = []
     private(set) var unambiguous = true
+    private(set) var ingressRejection: String?
+    private var invalidCollection = false
     let generation: UInt64
 
     init(start: NavigationPoseSample, at uptime: Double, generation: UInt64,
          boundary: FollowTurnBurstPlanner.Sample?) {
         self.generation = generation
         let captured = Self.capture(start, at: uptime, generation: generation, healthy: true)
+        invalidCollection = !captured.healthy
         if let boundary, Self.sameSource(boundary, captured), boundary.healthy {
             samples = [boundary] // Exact immutable boundary shared by adjacent bursts.
         } else { samples = [captured] }
@@ -59,6 +62,7 @@ struct FollowTurnResponseBracket {
     mutating func collect(_ source: NavigationPoseSample, at uptime: Double, healthy: Bool,
                           settled: Bool = false) {
         let captured = Self.capture(source, at: uptime, generation: generation, healthy: healthy)
+        if !captured.healthy { invalidCollection = true }
         if let previous = samples.last, Self.sameSource(previous, captured) {
             if !captured.healthy { unambiguous = false }
             // A strict stopped evaluation is a real collection, not a fabricated
@@ -67,12 +71,46 @@ struct FollowTurnResponseBracket {
             return
         }
         if let previous = samples.last {
+            if captured.sequence == nil || captured.sequence! <= (previous.sequence ?? 0) ||
+                (captured.sourceTimestamp ?? -.infinity) <= (previous.sourceTimestamp ?? -.infinity) {
+                invalidCollection = true
+            }
             if previous.sequence == UInt64.max || captured.sequence != previous.sequence.map({ $0 + 1 }) {
                 unambiguous = false // Coalesced/dropped, reordered or replayed source.
             }
         }
-        guard samples.count < 128 else { unambiguous = false; return }
+        guard samples.count < 128 else { unambiguous = false; invalidCollection = true; return }
         samples.append(captured)
+    }
+
+    /// Replace only coalesced delivery evidence with complete ingress witnesses.
+    /// Both control boundaries must match exactly; missing/evicted ranges stay
+    /// unlearnable. The stopped endpoint keeps its actual evaluation timestamp.
+    func usingIngressEvidence(_ ingress: [FollowTurnBurstPlanner.Sample]?) -> Self {
+        var result = self
+        guard !invalidCollection else {
+            result.unambiguous = false; result.ingressRejection = "control_collection_invalid"; return result
+        }
+        guard let ingress else {
+            result.unambiguous = false; result.ingressRejection = "ingress_range_unavailable"; return result
+        }
+        guard let first = samples.first, let last = samples.last,
+              let firstSequence = first.sequence, let lastSequence = last.sequence,
+              lastSequence >= firstSequence,
+              lastSequence - firstSequence < UInt64(FollowTurnPoseEvidenceArchive.capacity),
+              ingress.count == Int(lastSequence - firstSequence) + 1,
+              let ingressFirst = ingress.first, let ingressLast = ingress.last,
+              Self.sameSource(first, ingressFirst), Self.sameSource(last, ingressLast),
+              ingress.enumerated().allSatisfy({ index, sample in
+                  sample.generation == generation && sample.sequence == firstSequence + UInt64(index)
+              }) else {
+            result.unambiguous = false; result.ingressRejection = "ingress_range_or_boundary_mismatch"; return result
+        }
+        result.samples = ingress
+        result.samples[0] = first // Preserve a valid adjacent-burst boundary.
+        result.samples[result.samples.count - 1] = last // Actual post-stop evaluation.
+        result.unambiguous = true
+        return result
     }
 
     private static func capture(_ source: NavigationPoseSample, at uptime: Double,

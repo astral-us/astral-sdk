@@ -37,7 +37,8 @@ final class FollowScanDiagnosticTrace {
     func failure(_ reason: NavigationFailure, evidence: FollowMotionOperationEvidence, latch: Bool) {
         let resolution = evidence.failure(source: .stream).map { FollowMotionFailureResolution($0) }
         emit("failure", evidence: evidence, latch: latch, outcome: "failed",
-            reason: reason == .stalled ? "no_yaw_progress" : (reason == .rotationResolutionInsufficient ? "rotation_resolution_insufficient" : String(describing: reason)), fields: [
+            reason: reason == .stalled ? "no_yaw_progress" : (reason == .rotationResolutionInsufficient ?
+                (resolution?.diagnosticReason ?? "rotation_resolution_insufficient") : String(describing: reason)), fields: [
                 "failed_stage": .string(reason == .stalled ? "watchdog" : (failedStage ?? stage)),
                 "typed_reason": .string(String(describing: reason)),
                 "formatter_message": resolution.map { .string($0.message) } ?? .null,

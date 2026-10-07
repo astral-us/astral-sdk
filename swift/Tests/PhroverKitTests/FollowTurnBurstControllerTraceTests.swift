@@ -4,6 +4,195 @@ import RoverNav
 
 @MainActor
 final class FollowTurnBurstControllerTraceTests: XCTestCase {
+    func testHealthyIngressCannotEraseUnhealthyControlCollection() throws {
+        let start = sample(2, 10.2)
+        let end = sample(3, 10.81, yaw: 0.03)
+        var archive = FollowTurnPoseEvidenceArchive()
+        archive.record(start, at: 10.3)
+        archive.record(end, at: 10.82)
+        var bracket = FollowTurnResponseBracket(start: start, at: 10.3, generation: 4, boundary: nil)
+        bracket.collect(start, at: 10.8, healthy: true) // Duplicate now has source age 600 ms.
+        bracket.collect(end, at: 10.82, healthy: true, settled: true)
+        let repaired = bracket.usingIngressEvidence(archive.evidence(
+            from: .init(generation: 4, sequence: 2), through: .init(generation: 4, sequence: 3)))
+        XCTAssertFalse(repaired.unambiguous, "Ingress evidence may repair gaps, never observed collection invalidity")
+        let response = FollowTurnBurstPlanner.Response(operationID: 1, generation: 4, targetYaw: 0.5,
+            clockDomain: "ar_system_uptime", requestedBudget: 0.080, sendEntryUptime: 10.3,
+            sendResponseUptime: 10.4, stopObligationUptime: 10.4, stopAcknowledgementUptime: 10.5,
+            samples: repaired.samples, traversalUnambiguous: repaired.unambiguous)
+        let calibration = FollowTurnBurstPlanner.Calibration(operationID: 1, generation: 4,
+            targetYaw: 0.5, clockDomain: "ar_system_uptime")
+        let reduced = FollowTurnBurstPlanner.recording(response, in: calibration, profile: .init(purpose: .alignment))
+        XCTAssertNotNil(reduced.rejection)
+        XCTAssertEqual(reduced.calibration.completedResponses, 0)
+    }
+
+    func testNormalTrackingSourceExpiringDuringPlanningReportsStalePose() async throws {
+        let state = PreparationState(snapshot: sample(1, 9.99))
+        let emitter = FollowDiagnosticEmitter(streamID: "stale-planning", monotonic: { state.uptime }, utc: { Date() }) { event, _ in
+            if event == "follow_scan.burst_plan" { state.uptime = 10.701 }
+        }
+        state.controller = NavigationController(currentPose: { state.snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in state.sends += 1 },
+            stopRover: {}, sleep: { try? await Task.sleep(for: $0) }, diagnosticEmitter: emitter,
+            poseSample: { state.snapshot }, sourceNow: { state.uptime }, sourceStopSnapshot: { state.snapshot })
+        let task = Task { await NavigationFollowMeMotion(navigation: state.controller).perform(.alignment(0.5), context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followAlignment, phase: "aligning")) }
+        for _ in 0..<2000 where state.controller.followTurnStopFence == nil { await Task.yield() }
+        state.uptime = 10.690; state.snapshot = sample(2, 10.2)
+        state.controller.ingestFollowTurnSource(state.snapshot)
+        let result = await task.value
+        XCTAssertEqual(state.sends, 0)
+        XCTAssertEqual(result.result, .failed(.trackingLost))
+        XCTAssertEqual(result.context.failureCause, .poseSourceStale)
+        let resolution = FollowMotionFailureResolution(try XCTUnwrap(result.failure))
+        XCTAssertEqual(resolution.diagnosticReason, "pose_source_stale")
+        XCTAssertEqual(resolution.message, "Camera pose is stale. Motion stopped; wait for fresh camera frames.")
+    }
+    func testIngressEvidenceAllowsLearningDespiteCoalescedControlDelivery() async throws {
+        try await exerciseIngressEvidence(available: true, coalescedControl: true)
+    }
+
+    func testMissingIngressArchiveCannotFallBackToOtherwiseCompleteControlEvidence() async throws {
+        try await exerciseIngressEvidence(available: false, coalescedControl: false)
+    }
+
+    private func exerciseIngressEvidence(available: Bool, coalescedControl: Bool) async throws {
+        var uptime = 10.0
+        var snapshot = sample(1, 9.99)
+        var archive = FollowTurnPoseEvidenceArchive()
+        archive.record(snapshot, at: uptime)
+        let sink = FollowDiagnosticRecordingSink()
+        var stops = 0
+        var sends = 0
+        var learned = false
+        let holder = PreparationState(snapshot: snapshot)
+        let emitter = FollowDiagnosticEmitter(streamID: "ingress-evidence", monotonic: { uptime }, utc: { Date() }) { event, fields in
+            sink.append(event, fields: fields)
+            if event == "follow_scan.burst_plan", let text = fields["payload"],
+               let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
+               json["completed_responses"] as? Int == 1 {
+                learned = true
+                holder.controller.inhibitFollowScanContinuation(origin: .detection)
+            }
+        }
+        let controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in
+                sends += 1
+                // Frame 3 exists at ingress but is intentionally not delivered
+                // to the newest-only control consumer.
+                let intermediate = self.sample(3, 10.32, yaw: 0.01)
+                archive.record(intermediate, at: 10.33)
+                if !coalescedControl {
+                    uptime = 10.33
+                    holder.controller.ingestFollowTurnSource(intermediate)
+                }
+                uptime = 10.4; snapshot = self.sample(4, 10.39, yaw: 0.02)
+                archive.record(snapshot, at: uptime)
+                holder.controller.ingestFollowTurnSource(snapshot)
+            }, stopRover: { stops += 1 }, sleep: { try? await Task.sleep(for: $0) },
+            diagnosticEmitter: emitter, poseSample: { snapshot }, sourceNow: { uptime },
+            sourceStopSnapshot: { snapshot }, turnPoseEvidence: { available ? archive.evidence(from: $0, through: $1) : nil })
+        holder.controller = controller
+        let task = Task { await NavigationFollowMeMotion(navigation: controller).perform(.alignment(0.5), context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followAlignment, phase: "aligning")) }
+        for _ in 0..<2000 where stops == 0 { await Task.yield() }
+        uptime = 10.301; snapshot = sample(2, 10.2)
+        archive.record(snapshot, at: uptime); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<2000 where stops < 2 { await Task.yield() }
+        XCTAssertEqual(stops, 2)
+        uptime = 10.701; snapshot = sample(5, 10.70, yaw: 0.025)
+        archive.record(snapshot, at: uptime); controller.ingestFollowTurnSource(snapshot)
+        let result = await task.value
+        XCTAssertEqual(learned, available, "Missing archive evidence cannot authorize calibration from a substitute delivery stream")
+        XCTAssertEqual(sends, 1, "Detection fences the next correction once learning succeeds")
+        XCTAssertEqual(result.result, available ? .cancelled : .failed(.rotationResolutionInsufficient))
+        let response = try XCTUnwrap(try records(sink).first { $0["event"] as? String == "follow_scan.burst_response" })
+        XCTAssertEqual(response["bracket_valid"] as? Bool, available)
+        XCTAssertEqual(response["bracket_sample_count"] as? Int, 4)
+        XCTAssertEqual(response["completed_responses"] as? Int, available ? 1 : 0)
+    }
+
+    private final class PreparationState {
+        var uptime = 10.0
+        var snapshot: NavigationPoseSample
+        var controller: NavigationController!
+        var sends = 0
+        var completed = false
+        var synchronousIngressRecords = 0
+        init(snapshot: NavigationPoseSample) { self.snapshot = snapshot }
+    }
+
+    func testEarlyPreparationHealthFailureIsNotFlattenedIntoTransportFailure() async throws {
+        let state = PreparationState(snapshot: sample(1, 9.99))
+        let emitter = FollowDiagnosticEmitter(streamID: "planning-health", monotonic: { state.uptime }, utc: { Date() }) { event, _ in
+            if event == "follow_scan.burst_plan" {
+                state.snapshot = .init(pose: .init(position: .zero, yaw: 0.6),
+                    frameID: .init(generation: 1, sequence: 3), sourceTimestamp: 10.29, trackingQuality: .unavailable)
+                state.controller.ingestFollowTurnSource(state.snapshot)
+            }
+        }
+        state.controller = NavigationController(currentPose: { state.snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in state.sends += 1 },
+            stopRover: {}, sleep: { try? await Task.sleep(for: $0) }, diagnosticEmitter: emitter,
+            poseSample: { state.snapshot }, sourceNow: { state.uptime }, sourceStopSnapshot: { state.snapshot })
+        let task = Task {
+            let result = await NavigationFollowMeMotion(navigation: state.controller).perform(.alignment(0.5),
+                context: .init(sessionGeneration: 1, requestToken: 1, purpose: .followAlignment, phase: "aligning"))
+            state.completed = true
+            return result
+        }
+        for _ in 0..<2000 where state.controller.followTurnStopFence == nil { await Task.yield() }
+        state.uptime = 10.301; state.snapshot = sample(2, 10.2)
+        state.controller.ingestFollowTurnSource(state.snapshot)
+        for _ in 0..<4000 where !state.completed { await Task.yield() }
+        if !state.completed { task.cancel() }
+        let result = await task.value
+        XCTAssertEqual(state.sends, 0)
+        XCTAssertEqual(result.result, .failed(.trackingLost))
+        XCTAssertEqual(result.failure?.reason, .trackingLost)
+        XCTAssertNil(result.context.failureCause)
+    }
+
+    func testSourceChangeDuringPreparationCannotCreatePreArmCrossingOrSendStalePlan() async throws {
+        for preparationEvent in ["follow_scan.burst_plan", "follow_scan.pulse_begin", "follow_scan.send_begin"] {
+            let state = PreparationState(snapshot: sample(1, 9.99))
+            let sink = FollowDiagnosticRecordingSink()
+            let emitter = FollowDiagnosticEmitter(streamID: "pre-arm-source", monotonic: { state.uptime }, utc: { Date() }) { event, fields in
+                sink.append(event, fields: fields)
+                if event == preparationEvent {
+                    let before = sink.records.count
+                    state.snapshot = self.sample(3, 10.29, yaw: 0.6) // Crosses the frozen target BEFORE entry.
+                    state.controller.ingestFollowTurnSource(state.snapshot)
+                    state.synchronousIngressRecords = sink.records.count - before
+                }
+            }
+            state.controller = NavigationController(currentPose: { state.snapshot.pose }, forwardClearance: { .infinity },
+                plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in state.sends += 1 },
+                stopRover: {}, sleep: { try? await Task.sleep(for: $0) }, diagnosticEmitter: emitter,
+                poseSample: { state.snapshot }, sourceNow: { state.uptime }, sourceStopSnapshot: { state.snapshot })
+            let task = Task {
+                let result = await NavigationFollowMeMotion(navigation: state.controller).perform(.alignment(0.5),
+                    context: .init(sessionGeneration: 1, requestToken: 1, purpose: .followAlignment, phase: "aligning"))
+                state.completed = true
+                return result
+            }
+            for _ in 0..<2000 where state.controller.followTurnStopFence == nil { await Task.yield() }
+            state.uptime = 10.301; state.snapshot = sample(2, 10.2)
+            state.controller.ingestFollowTurnSource(state.snapshot)
+            for _ in 0..<4000 where !state.completed { await Task.yield() }
+            if !state.completed { task.cancel() }
+            let result = await task.value
+            XCTAssertTrue(state.completed)
+            XCTAssertEqual(state.synchronousIngressRecords, 0, "Unarmed observers cannot publish a motor-budget/crossing claim")
+            XCTAssertEqual(state.sends, 0, "The prepared direction/budget cannot survive changed actual source yaw")
+            XCTAssertEqual(result.result, .failed(.commandFailed))
+            XCTAssertNil(result.context.failureCause, "A source/plan fence is not scheduling expiry")
+            XCTAssertEqual(result.context.targetYaw, 0.5, "Frozen target is never rebased")
+            XCTAssertEqual(result.commandReceipt?.outcome, "fenced")
+        }
+    }
+
     func testCoalescedBracketCannotVetoFreshStoppedArrivalAtInclusivePurposeBoundaries() async throws {
         let scanTolerance = 7 * Double.pi / 180
         for (purpose, startYaw, delta, endYaw, expected) in [
@@ -39,6 +228,13 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
             uptime = 10.701; snapshot = sample(5, 10.70, yaw: endYaw); controller.ingestFollowTurnSource(snapshot)
             let result = await task.value
             XCTAssertEqual(result.result, expected, "purpose=\(purpose), stopped yaw=\(endYaw)")
+            if case .failed = expected {
+                XCTAssertEqual(result.context.failureCause, .calibrationEvidenceIncomplete)
+                let resolution = FollowMotionFailureResolution(try XCTUnwrap(result.failure))
+                XCTAssertEqual(resolution.diagnosticReason, "calibration_evidence_incomplete")
+                XCTAssertTrue(resolution.message.contains("calibration pose evidence is incomplete"))
+                XCTAssertFalse(resolution.message.contains("too coarse"))
+            }
             XCTAssertEqual(sends, 1)
             XCTAssertEqual(stops, 2)
             let measured = try XCTUnwrap(try records(sink).first { $0["event"] as? String == "follow_scan.burst_response" })

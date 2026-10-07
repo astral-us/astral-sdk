@@ -4,6 +4,617 @@ import CoreVideo
 @testable import PhroverKit
 
 final class RoverControlTests: XCTestCase {
+    func testPreparedSnapshotRechecksBurstExpiryAtItsFinalClockRead() async {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+            statusCode: 200, httpVersion: nil, headerFields: nil)!))]
+        let clock = BurstScriptedClock([10.001, 10.002, 10.003, 10.004, 10.079, 10.081])
+        let fence = FollowTurnBurstFence()
+        XCTAssertTrue(fence.publishValidity(from: 10, untilExclusive: 10.5))
+        XCTAssertNotNil(fence.arm(entry: 10, budget: 0.080))
+        let authority = FollowTurnBurstAuthorization(operationID: 1, preparedFence: fence,
+            uptime: { clock.now }, didEnterAttempt: { _ in }, transportCapture: .init())
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let result = await control.sendNavigationWithReceipt(.init(left: -0.25, right: 0.25), authorization: authority)
+        XCTAssertEqual(StubURLProtocol.requestCount, 0)
+        XCTAssertEqual(result.receipt.attempts, 0)
+        XCTAssertEqual(result.receipt.outcome, "expired")
+    }
+
+    @MainActor
+    func testRevocationPrecedesCancellationDiagnosticCallbacks() async {
+        for origin in ["detection", "stop", "cancel"] {
+            let clock = BurstTestClock(10)
+            var snapshot = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+                frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 9.99, trackingQuality: .normal)
+            var authority: FollowTurnBurstAuthorization?
+            var sendWaiter: CheckedContinuation<Void, Never>?
+            var checkedRevocation = false
+            let emitter = FollowDiagnosticEmitter(streamID: "revoke-\(origin)", monotonic: { clock.now }, utc: { Date() }) { event, _ in
+                if event == "follow_scan.cancel", let authority {
+                    // The transport may concurrently execute while this synchronous
+                    // diagnostic callback performs formatting or disk writes.
+                    checkedRevocation = true
+                    XCTAssertFalse(authority.isAuthorized(), "Revoke before logging: \(origin)")
+                }
+            }
+            let controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+                plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in }, stopRover: {},
+                sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { _ in
+                    authority = FollowTurnBurstTransportScope.authorization
+                    await withCheckedContinuation { sendWaiter = $0 }
+                    return .init(receipt: .unknown, failure: CancellationError())
+                }, diagnosticEmitter: emitter, poseSample: { snapshot }, sourceNow: { clock.now },
+                sourceStopSnapshot: { snapshot }, transportUptime: { clock.now })
+            let motion = NavigationFollowMeMotion(navigation: controller)
+            let operation = Task { await motion.perform(.alignment(0.5), context:
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followAlignment, phase: "aligning")) }
+            for _ in 0..<2000 where controller.followTurnStopFence == nil { await Task.yield() }
+            XCTAssertNotNil(controller.followTurnStopFence)
+            clock.set(10.301)
+            snapshot = .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 2),
+                sourceTimestamp: 10.2, trackingQuality: .normal)
+            controller.ingestFollowTurnSource(snapshot)
+            for _ in 0..<2000 where sendWaiter == nil { await Task.yield() }
+            XCTAssertNotNil(sendWaiter)
+            if origin == "detection" { controller.inhibitFollowScanContinuation(origin: .detection) }
+            if origin == "cancel" { controller.cancel() }
+            let stop = Task { try? await controller.stopAndConfirm() }
+            for _ in 0..<2000 where !checkedRevocation { await Task.yield() }
+            XCTAssertTrue(checkedRevocation)
+            sendWaiter?.resume(); sendWaiter = nil
+            _ = await stop.value
+            _ = await operation.value
+        }
+    }
+
+    func testSynchronousSnapshotRefusesExpiredOrInhibitedAuthorityBeforeHTTP() async {
+        for scenario in ["freshness", "inhibited", "unvalidated", "retry"] {
+            StubURLProtocol.reset()
+            StubURLProtocol.results = scenario == "retry"
+                ? [.failure(URLError(.timedOut))]
+                : [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+                    statusCode: 200, httpVersion: nil, headerFields: nil)!))]
+            let clock = BurstTestClock(10)
+            let fence = FollowTurnBurstFence()
+            if scenario != "unvalidated" { XCTAssertTrue(fence.publishValidity(from: 10, untilExclusive: 10.020)) }
+            XCTAssertNotNil(fence.arm(entry: 10, budget: 0.080))
+            let authorization = FollowTurnBurstAuthorization(operationID: 7, preparedFence: fence,
+                uptime: { clock.now }, didEnterAttempt: { _ in }, transportCapture: .init())
+            if scenario == "inhibited" { fence.inhibit() }
+            if scenario == "freshness" { clock.set(10.020) }
+            let control = RoverControl(session: URLSession(configuration: .stubbed), retrySleep: { _ in clock.set(10.020) })
+            let result = await control.sendNavigationWithReceipt(.init(left: -0.25, right: 0.25), authorization: authorization)
+            XCTAssertEqual(result.receipt.outcome, "fenced", scenario)
+            XCTAssertEqual(result.receipt.attempts, scenario == "retry" ? 1 : 0, scenario)
+            XCTAssertEqual(StubURLProtocol.requestCount, scenario == "retry" ? 1 : 0, scenario)
+            XCTAssertLessThan(clock.now, authorization.deadline, "This is authority expiry, not burst-budget expiry")
+        }
+    }
+
+    @MainActor
+    func testControllerSnapshotExpiresWithSourceWithoutWaitingForMainActorMonitor() async {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = Array(repeating: .success((Data(), HTTPURLResponse(
+            url: URL(string: "http://192.168.4.1/js")!, statusCode: 200, httpVersion: nil, headerFields: nil)!)), count: 4)
+        let clock = BurstTestClock(10)
+        var snapshot = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+            frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 9.99, trackingQuality: .normal)
+        var motionResult: RoverCommandDiagnosticResult?
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { await control.lastAckAt }, sendCommand: { _ in },
+            stopRover: { _ = try await control.stopWithReceipt().get() }, sleep: { try? await Task.sleep(for: $0) },
+            sendCommandReceipt: { command in
+                // Still inside the 80 ms burst, but the validated source becomes
+                // stale without delivering an event to the MainActor observer.
+                clock.set(10.701)
+                let result = await control.sendNavigationWithReceipt(command)
+                motionResult = result
+                return result
+            }, poseSample: { snapshot }, sourceNow: { clock.now }, sourceStopSnapshot: { snapshot },
+            transportUptime: { clock.now })
+        let task = Task { await NavigationFollowMeMotion(navigation: controller).alignTowardPerson(by: 0.5) }
+        for _ in 0..<2000 where controller.followTurnStopFence == nil { await Task.yield() }
+        XCTAssertNotNil(controller.followTurnStopFence)
+        clock.set(10.690)
+        snapshot = .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 2),
+            sourceTimestamp: 10.200, trackingQuality: .normal)
+        controller.ingestFollowTurnSource(snapshot)
+        _ = await task.value
+        XCTAssertEqual(motionResult?.receipt.outcome, "fenced")
+        XCTAssertEqual(motionResult?.receipt.attempts, 0)
+        XCTAssertEqual(StubURLProtocol.requestCount, 2, "Initial and final STOP only")
+    }
+
+    @MainActor
+    func testPreparedControllerAuthorityDoesNotSpendBurstBudgetOnActorReauthorization() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+            statusCode: 200, httpVersion: nil, headerFields: nil)!))]
+        let clock = BurstTestClock(10)
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { nil }, sendCommand: { _ in }, stopRover: {},
+            sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { command in
+                let prepared = try! XCTUnwrap(FollowTurnBurstTransportScope.authorization)
+                let delayedCheck: (@Sendable () async -> Bool)?
+                if let check = prepared.authorizeAttempt {
+                    delayedCheck = { clock.set(10.065); return await check() }
+                } else {
+                    delayedCheck = nil
+                }
+                // Model the measured 65 ms MainActor round trip only when the
+                // production authority still requires asynchronous revalidation.
+                let simulated = FollowTurnBurstAuthorization(operationID: prepared.operationID,
+                    sendEntryUptime: prepared.sendEntryUptime,
+                    requestedBudget: prepared.deadline - prepared.sendEntryUptime,
+                    uptime: prepared.uptime, isAuthorized: prepared.isAuthorized,
+                    authorizeAttempt: delayedCheck,
+                    didEnterAttempt: prepared.didEnterAttempt, transportCapture: prepared.transportCapture)
+                return await control.sendNavigationWithReceipt(command, authorization: simulated)
+            }, sourceNow: { clock.now }, transportUptime: { clock.now })
+        let receipt = await controller.sendFollowTurnBurst(.init(left: -0.25, right: 0.25),
+            requestedBudget: 0.015229, purpose: .followAlignment)
+        XCTAssertEqual(receipt.result.receipt.outcome, "acknowledged")
+        XCTAssertEqual(receipt.result.receipt.attempts, 1)
+        XCTAssertEqual(StubURLProtocol.requestCount, 1,
+            "Prepared authority must be checked synchronously on the transport actor")
+        XCTAssertEqual(receipt.deadline - receipt.sendEntryUptime, 0.015229, accuracy: 1e-12)
+    }
+
+    @MainActor
+    func testHealthFailureRetainsPrecedenceOverDefiniteZeroAttemptExpiry() async throws {
+        let result = try await classifiedTurnFailure(holdAuthorization: true, healthLoss: true)
+        XCTAssertEqual(result.result, .failed(.trackingLost))
+        XCTAssertEqual(result.failure?.reason, .trackingLost)
+        XCTAssertNil(result.context.failureCause)
+        XCTAssertEqual(result.commandReceipt?.outcome, "expired")
+        XCTAssertEqual(result.commandReceipt?.attempts, 0)
+    }
+
+    func testRequestStartClockExpiryCannotEnterHTTPAfterEarlierEligibility() async {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+            statusCode: 200, httpVersion: nil, headerFields: nil)!))]
+        let clock = BurstScriptedClock([10.001, 10.002, 10.003, 10.004, 10.080])
+        let capture = FollowTurnTransportCapture()
+        let authorization = FollowTurnBurstAuthorization(operationID: 1, sendEntryUptime: 10,
+            requestedBudget: 0.080, uptime: { clock.now }, didEnterAttempt: capture.record,
+            transportCapture: capture)
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let result = await control.sendNavigationWithReceipt(.init(left: -0.25, right: 0.25), authorization: authorization)
+        XCTAssertEqual(result.receipt.outcome, "expired")
+        XCTAssertEqual(result.receipt.attempts, 0)
+        XCTAssertEqual(StubURLProtocol.requestCount, 0, "The last request-start read must still be gated")
+        XCTAssertTrue(capture.attempts.isEmpty, "Denied request creation cannot manufacture an entered attempt")
+    }
+
+    @MainActor
+    func testRealCoordinatorRetainsPreSendCauseAndTimingThroughPendingResultAndConfirmation() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = Array(repeating: .success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+            statusCode: 200, httpVersion: nil, headerFields: nil)!)), count: 12)
+        StubURLProtocol.suspendRequestNumber = 2
+        let clock = BurstTestClock(10)
+        let followClock = ManualFollowClock()
+        followClock.advance(to: 10)
+        let gate = BurstAttemptAdmissionGate()
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let perception = FollowPerceptionFake()
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "coordinator-transport", monotonic: { clock.now }, utc: { Date() }, sink: sink.append)
+        var snapshot = NavigationPoseSample(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 1),
+            sourceTimestamp: 9.99, trackingQuality: .normal)
+        let controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in XCTFail("Scheduling failure cannot enter readiness/departure"); return nil },
+            lastAckAt: { await control.lastAckAt }, sendCommand: { _ in XCTFail("Use real receipt sender") },
+            stopRover: { _ = try await control.stopWithReceipt().get() }, sleep: { try? await Task.sleep(for: $0) },
+            sendCommandReceipt: { command in
+                let original = FollowTurnBurstTransportScope.authorization!
+                let held = FollowTurnBurstAuthorization(operationID: original.operationID,
+                    sendEntryUptime: original.sendEntryUptime, requestedBudget: original.deadline - original.sendEntryUptime,
+                    uptime: original.uptime, isAuthorized: original.isAuthorized, authorizeAttempt: {
+                        await gate.wait()
+                        return await original.authorizeAttempt?() ?? true
+                    }, didEnterAttempt: original.didEnterAttempt, transportCapture: original.transportCapture)
+                return await control.sendNavigationWithReceipt(command, authorization: held)
+            }, diagnosticEmitter: emitter, poseSample: { snapshot }, sourceNow: { clock.now },
+            sourceStopSnapshot: { snapshot }, transportUptime: { clock.now })
+        var config = FollowMeConfiguration()
+        config.stationaryPauseSeconds = 0
+        let coordinator = FollowMeCoordinator(perception: perception, motion: NavigationFollowMeMotion(navigation: controller),
+            clock: followClock, configuration: config, eventSink: sink.append)
+        let started = await coordinator.start()
+        XCTAssertTrue(started)
+        for _ in 0..<100 { await Task.yield() }
+        perception.send(.frame(.init(frameID: .init(generation: 1, sequence: 1), timestamp: 10,
+            pose: snapshot.pose, depthAvailable: true, people: [], trackingQuality: .normal)))
+        for _ in 0..<2000 where controller.followTurnStopFence == nil { await Task.yield() }
+        XCTAssertNotNil(controller.followTurnStopFence)
+        clock.set(10.301); followClock.advance(to: 10.301)
+        snapshot = .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 2),
+            sourceTimestamp: 10.2, trackingQuality: .normal)
+        controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<4000 {
+            if await gate.isWaiting { break }
+            await Task.yield()
+        }
+        let waiting = await gate.isWaiting
+        XCTAssertTrue(waiting)
+        clock.set(10.434); followClock.advance(to: 10.434)
+        await gate.release()
+        let pendingText = "Turn not started: command scheduling exceeded burst budget. Confirming motor stop…"
+        for _ in 0..<4000 where coordinator.state != .failed(pendingText) { await Task.yield() }
+        XCTAssertEqual(coordinator.state, .failed(pendingText))
+        XCTAssertNotNil(StubURLProtocol.suspended)
+        StubURLProtocol.releaseFirst()
+        let confirmedText = "Turn not started: command scheduling exceeded burst budget. Stop confirmed. Restart following to try again."
+        for _ in 0..<4000 where coordinator.state != .failed(confirmedText) { await Task.yield() }
+        XCTAssertEqual(coordinator.state, .failed(confirmedText))
+        let resolutions = try sink.records.filter { $0.event == "follow_motion.failure_resolution" }.map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap($0.fields["payload"]).utf8)) as? [String: Any])
+        }
+        XCTAssertTrue(resolutions.contains { $0["source"] as? String == "stream" })
+        XCTAssertTrue(resolutions.contains { $0["source"] as? String == "result" })
+        XCTAssertTrue(resolutions.contains { $0["source"] as? String == "confirmation" })
+        XCTAssertTrue(resolutions.allSatisfy { $0["reason"] as? String == "burst_pre_send_expired" })
+        XCTAssertTrue(resolutions.allSatisfy { $0["primary_typed_reason"] as? String == "rotationResolutionInsufficient" })
+        XCTAssertTrue(resolutions.allSatisfy { $0["sender_outcome"] as? String == "expired" },
+            "The actual coordinator must retain controller timing/context, not drop it while copying deliveries")
+        XCTAssertTrue(resolutions.allSatisfy { $0["send_entry_uptime_s"] as? Double == 10.301 })
+        XCTAssertFalse(sink.records.contains { $0.event == "follow_scan.burst_response" || $0.event == "follow_ready.admission_authorized" })
+        XCTAssertEqual(StubURLProtocol.requests.count, StubURLProtocol.requestCount)
+        for request in StubURLProtocol.requests {
+            let json = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "json" }?.value)
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            XCTAssertEqual(payload["T"] as? Int, 0, "Every actual HTTP command is a stop; no motion/retry")
+        }
+        _ = await coordinator.stop()
+    }
+
+    @MainActor
+    func testFailedStopAndContradictoryAttemptEvidenceCannotPublishSafeNotStartedOutcome() async throws {
+        let failedStop = try await classifiedTurnFailure(holdAuthorization: true, failStop: true)
+        XCTAssertEqual(failedStop.result, .failed(.commandFailed))
+        XCTAssertEqual(failedStop.stopOutcome, .failed)
+        XCTAssertEqual(FollowMotionFailureResolution(try XCTUnwrap(failedStop.failure)).message,
+            "Motor stop could not be confirmed. Motion is blocked.")
+        let contradictory = try await classifiedTurnFailure(holdAuthorization: true, contradictoryEntry: true)
+        XCTAssertEqual(contradictory.result, .failed(.commandFailed))
+        XCTAssertNil(contradictory.context.failureCause)
+        XCTAssertEqual(FollowMotionFailureResolution(try XCTUnwrap(contradictory.failure)).diagnosticReason,
+            "transport_failed")
+    }
+
+    @MainActor
+    func testCancellationAndOwnerReplacementDuringPreparationNeverArmOrInvokeSender() async throws {
+        for interruption in ["cancel", "replacement", "clock_replacement"] {
+            let clock = BurstTestClock(10)
+            var controller: NavigationController!
+            var sends = 0
+            var stops = 0
+            var replaceAtClockRead = false
+            let sink = FollowDiagnosticRecordingSink()
+            let emitter = FollowDiagnosticEmitter(streamID: "abandoned-preparation", monotonic: { clock.now }, utc: { Date() }) { event, fields in
+                sink.append(event, fields: fields)
+                if event == "follow_scan.send_begin" {
+                    if interruption == "clock_replacement" { replaceAtClockRead = true }
+                    else if interruption == "replacement" { controller.cancel() }
+                    else { withUnsafeCurrentTask { $0?.cancel() } }
+                }
+            }
+            let evidence = FollowMotionOperationEvidence(context: .init(request: nil, controllerOperationID: 1,
+                purpose: .followAlignment, profile: .turnBurst(purpose: .followAlignment)))
+            evidence.scanTrace = .init(emitter: emitter)
+            evidence.burstTrace = .init()
+            controller = NavigationController(currentPose: { nil }, forwardClearance: { .infinity },
+                plan: { _, _ in nil }, lastAckAt: { nil }, sendCommand: { _ in }, stopRover: { stops += 1 },
+                sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { _ in
+                    sends += 1
+                    XCTFail("Abandoned preparation cannot enter sender")
+                    return .init(receipt: .unknown, failure: nil)
+                }, sourceNow: {
+                    if replaceAtClockRead { replaceAtClockRead = false; controller.cancel() }
+                    return clock.now
+                }, transportUptime: { clock.now })
+            let task = Task {
+                await FollowMotionTaskScope.$evidence.withValue(evidence) {
+                    try? await controller.executeFollowTurnBurst(.init(left: -0.25, right: 0.25),
+                        requestedBudget: 0.002374, purpose: .followAlignment)
+                }
+            }
+            _ = await task.value
+            for _ in 0..<1000 where stops == 0 { await Task.yield() }
+            XCTAssertEqual(sends, 0)
+            XCTAssertGreaterThanOrEqual(stops, 1, "Serialized stop still drains abandoned work")
+            XCTAssertNil(controller.followTurnBurstPendingStatus)
+            XCTAssertNil(evidence.context.failureCause)
+            let begin = try XCTUnwrap(sink.records.first { $0.event == "follow_scan.send_begin" })
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(begin.fields["payload"]).utf8)) as? [String: Any])
+            XCTAssertTrue(json["send_entry_uptime_s"] is NSNull)
+            XCTAssertTrue(json["burst_deadline_uptime_s"] is NSNull)
+        }
+    }
+
+    @MainActor
+    func testRealTransportReportsActorAuthorizationEligibilityAndRequestStartSeparately() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+            statusCode: 200, httpVersion: nil, headerFields: nil)!))]
+        let clock = BurstTestClock(10)
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "transport-timing", monotonic: { clock.now }, utc: { Date() }, sink: sink.append)
+        let evidence = FollowMotionOperationEvidence(context: .init(request: nil, controllerOperationID: 1,
+            purpose: .followAlignment, profile: .turnBurst(purpose: .followAlignment)))
+        evidence.scanTrace = .init(emitter: emitter)
+        evidence.burstTrace = .init()
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { nil }, sendCommand: { _ in }, stopRover: {},
+            sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { command in
+                clock.set(10.003) // Sender-to-control actor queue/setup cost remains inside budget.
+                return await control.sendNavigationWithReceipt(command)
+            }, sourceNow: { clock.now }, transportUptime: { clock.now })
+        let receipt = await FollowMotionTaskScope.$evidence.withValue(evidence) {
+            await controller.sendFollowTurnBurst(.init(left: -0.25, right: 0.25), requestedBudget: 0.080, purpose: .followAlignment)
+        }
+        XCTAssertEqual(receipt.sendEntryUptime, 10)
+        XCTAssertEqual(receipt.deadline, 10.080)
+        let ack = try XCTUnwrap(sink.records.first { $0.event == "follow_scan.send_ack" })
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(ack.fields["payload"]).utf8)) as? [String: Any])
+        XCTAssertEqual(json["transport_actor_entry_uptime_s"] as? Double, 10.003)
+        XCTAssertEqual(json["transport_timing_availability"] as? String, "available")
+        let timeline = try XCTUnwrap(json["transport_timing_entries"] as? [[String: Any]])
+        XCTAssertEqual(timeline.compactMap { $0["boundary"] as? String },
+            ["actor_entry", "authorization_start", "authorization_end", "eligibility", "request_start"])
+        XCTAssertEqual(timeline.compactMap { $0["uptime_s"] as? Double }, Array(repeating: 10.003, count: 5))
+        XCTAssertEqual(timeline.last?["attempt"] as? Int, 1)
+    }
+
+    @MainActor
+    func testPreSendExpiryPublishesTypedCauseWhileRealStopConfirmationIsHeld() async throws {
+        let result = try await classifiedTurnFailure(holdAuthorization: true, holdStop: true)
+        XCTAssertEqual(result.context.failureCause, .burstPreSendExpired)
+        XCTAssertEqual(result.failure?.context.failureCause, .burstPreSendExpired)
+    }
+
+    @MainActor
+    func testDiagnosticSetupCostPrecedesActualSenderBudgetOrigin() async throws {
+        StubURLProtocol.reset()
+        let accepted = (Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+            statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        StubURLProtocol.results = [.success(accepted), .success(accepted)]
+        let clock = BurstTestClock(10)
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "budget-origin", monotonic: { clock.now }, utc: { Date() },
+            sink: { event, fields in
+                sink.append(event, fields: fields)
+                if event == "follow_scan.send_begin" { clock.set(10.100) }
+            })
+        let evidence = FollowMotionOperationEvidence(context: .init(request: nil, controllerOperationID: 99,
+            purpose: .followAlignment, profile: .turnBurst(purpose: .followAlignment)))
+        evidence.scanTrace = .init(emitter: emitter)
+        evidence.burstTrace = .init()
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        var invokedAt: Double?
+        let controller = NavigationController(currentPose: { nil }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { nil }, sendCommand: { _ in },
+            stopRover: { _ = try await control.stopWithReceipt().get() },
+            sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { command in
+                invokedAt = clock.now
+                let result = await control.sendNavigationWithReceipt(command)
+                clock.set(10.200) // Response/drain is late, so no remaining motor wait is permitted.
+                return result
+            }, sourceNow: { clock.now }, transportUptime: { clock.now })
+        let receipt = try await FollowMotionTaskScope.$evidence.withValue(evidence) {
+            try await controller.executeFollowTurnBurst(.init(left: -0.25, right: 0.25),
+                requestedBudget: 0.0023742724180478418, purpose: .followAlignment)
+        }
+        XCTAssertEqual(invokedAt, 10.100)
+        XCTAssertEqual(receipt.send.sendEntryUptime, 10.100,
+            "Synchronous formatting/sink work is pre-entry setup, not sender queue time")
+        XCTAssertEqual(receipt.send.deadline, 10.1023742724180478418, accuracy: 1e-12)
+        XCTAssertEqual(receipt.send.transportAttempts.count, 1)
+        XCTAssertEqual(receipt.send.transportAttempts.first?.entryUptime, 10.100)
+        XCTAssertEqual(receipt.send.result.receipt.outcome, "acknowledged")
+        XCTAssertEqual(StubURLProtocol.requestCount, 2, "One real motion request, then confirmed stop")
+        XCTAssertNotNil(receipt.confirmedStopFence)
+        let ack = try XCTUnwrap(sink.records.first { $0.event == "follow_scan.send_ack" })
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(ack.fields["payload"]).utf8)) as? [String: Any])
+        XCTAssertEqual(payload["send_preparation_start_uptime_s"] as? Double, 10)
+        XCTAssertEqual(try XCTUnwrap(payload["send_preparation_duration_s"] as? Double), 0.100, accuracy: 1e-12)
+        XCTAssertEqual(payload["send_entry_uptime_s"] as? Double, 10.100)
+        XCTAssertEqual(payload["send_entry_availability"] as? String, "captured_sender_invocation")
+    }
+
+    @MainActor
+    func testPreSendExpiryReportsSchedulingResolutionWithoutMotionLearningOrRetry() async throws {
+        let result = try await classifiedTurnFailure(holdAuthorization: true)
+        XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient))
+        let failure = try XCTUnwrap(result.failure)
+        XCTAssertEqual(failure.reason, .rotationResolutionInsufficient)
+        XCTAssertEqual(failure.commandReceipt?.outcome, "expired")
+        XCTAssertEqual(failure.commandReceipt?.attempts, 0)
+        XCTAssertEqual(failure.commandReceipt?.acknowledged, false)
+        var resolution = FollowMotionFailureResolution(failure)
+        XCTAssertNotNil(resolution.key)
+        XCTAssertEqual(resolution.diagnosticReason, "burst_pre_send_expired")
+        XCTAssertEqual(resolution.message, "Turn not started: command scheduling exceeded burst budget. Stop confirmed. Restart following to try again.")
+        resolution.consume(.init(context: result.context, reason: .commandFailed,
+            stopOutcome: .pending, source: .stream))
+        resolution.consume(.init(context: result.context, reason: .cancelled,
+            stopOutcome: .confirmed, source: .confirmation))
+        XCTAssertEqual(resolution.primaryReason, .rotationResolutionInsufficient)
+        XCTAssertEqual(resolution.diagnosticReason, "burst_pre_send_expired")
+        var pending = FollowMotionFailureResolution(.init(context: result.context,
+            reason: failure.reason, stopOutcome: .pending, source: .stream,
+            commandReceipt: failure.commandReceipt, turnDiagnosticFields: failure.turnDiagnosticFields))
+        XCTAssertEqual(pending.message, "Turn not started: command scheduling exceeded burst budget. Confirming motor stop…")
+        pending.consume(failure)
+        XCTAssertEqual(pending.message, resolution.message)
+        pending.consume(.init(context: result.context, reason: .commandFailed,
+            stopOutcome: .failed, source: .confirmation))
+        XCTAssertEqual(pending.message, "Motor stop could not be confirmed. Motion is blocked.")
+    }
+
+    @MainActor
+    func testActualHTTPFailureRetainsTransportClassificationAndConfirmedSafetyStop() async throws {
+        for expiryAfterAttempt in [false, true] {
+            let result = try await classifiedTurnFailure(holdAuthorization: false,
+                expiryAfterAttempt: expiryAfterAttempt)
+            XCTAssertEqual(result.result, .failed(.commandFailed))
+            let failure = try XCTUnwrap(result.failure)
+            XCTAssertEqual(failure.reason, .commandFailed)
+            XCTAssertEqual(failure.commandReceipt?.outcome, expiryAfterAttempt ? "expired" : "failed")
+            XCTAssertEqual(failure.commandReceipt?.attempts, 1)
+            XCTAssertEqual(failure.commandReceipt?.httpStatus, expiryAfterAttempt ? nil : 503)
+            let resolution = FollowMotionFailureResolution(failure)
+            XCTAssertEqual(resolution.diagnosticReason, "transport_failed",
+                "Expiry after an entered request retains uncertain-motion transport failure")
+            XCTAssertEqual(resolution.message, "Navigation command failed.")
+        }
+    }
+
+    @MainActor
+    private func classifiedTurnFailure(holdAuthorization: Bool,
+                                       expiryAfterAttempt: Bool = false, holdStop: Bool = false,
+                                       failStop: Bool = false, contradictoryEntry: Bool = false,
+                                       healthLoss: Bool = false) async throws -> FollowMotionResult {
+        func http(_ status: Int) -> Result<(Data, URLResponse), Error> {
+            .success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+                statusCode: status, httpVersion: nil, headerFields: nil)!))
+        }
+        StubURLProtocol.reset()
+        StubURLProtocol.results = holdAuthorization ? [http(200), http(200)] : [http(200), http(503), http(200)]
+        if failStop { StubURLProtocol.results = [http(200), .failure(URLError(.badURL))] }
+        let clock = BurstTestClock(10)
+        if expiryAfterAttempt {
+            StubURLProtocol.results = [http(200), .failure(URLError(.timedOut)), http(200)]
+            StubURLProtocol.onRequest = {
+                if StubURLProtocol.requestCount == 2 { clock.set(10.434) }
+            }
+        }
+        let backoffs = BurstTestClock(0)
+        let control = RoverControl(session: URLSession(configuration: .stubbed), retrySleep: { _ in
+            backoffs.set(backoffs.now + 1)
+        })
+        let gate = BurstAttemptAdmissionGate()
+        let sink = FollowDiagnosticRecordingSink()
+        let emitter = FollowDiagnosticEmitter(streamID: "classification", monotonic: { clock.now },
+            utc: { Date() }, sink: sink.append)
+        var snapshot = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+            frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 9.99, trackingQuality: .normal)
+        var stops = 0
+        var senderCalls = 0
+        var completed = false
+        let controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { await control.lastAckAt }, sendCommand: { _ in
+                XCTFail("Follow turn must use receipt transport")
+            }, stopRover: {
+                stops += 1
+                _ = try await control.stopWithReceipt().get()
+            }, sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { command in
+                senderCalls += 1
+                let original = FollowTurnBurstTransportScope.authorization!
+                if holdAuthorization {
+                    let held = FollowTurnBurstAuthorization(operationID: original.operationID,
+                        sendEntryUptime: original.sendEntryUptime,
+                        requestedBudget: original.deadline - original.sendEntryUptime,
+                        uptime: original.uptime, isAuthorized: original.isAuthorized,
+                        authorizeAttempt: {
+                            await gate.wait()
+                            return await original.authorizeAttempt?() ?? true
+                        }, didEnterAttempt: original.didEnterAttempt, transportCapture: original.transportCapture)
+                    let result = await control.sendNavigationWithReceipt(command, authorization: held)
+                    if contradictoryEntry {
+                        original.didEnterAttempt?(.init(operationID: original.operationID, attempt: 1, entryUptime: clock.now))
+                    }
+                    return result
+                }
+                return await control.sendNavigationWithReceipt(command)
+            }, diagnosticEmitter: emitter, poseSample: { snapshot }, sourceNow: { clock.now },
+            sourceStopSnapshot: { snapshot }, transportUptime: { clock.now })
+        let motion = NavigationFollowMeMotion(navigation: controller)
+        var deliveries: [FollowMotionFailureDelivery] = []
+        let failures = motion.motionFailures()
+        let collector = Task { for await delivery in failures { deliveries.append(delivery) } }
+        defer { collector.cancel() }
+        if holdStop { StubURLProtocol.suspendRequestNumber = 2 }
+        let request = FollowMotionRequestContext(sessionGeneration: 7, requestToken: 2,
+            purpose: .followAlignment, phase: "aligning")
+        // This independently worked angle yields a 2.374ms provisional budget.
+        let task = Task {
+            let result = await motion.perform(.alignment(0.05497266452410665), context: request)
+            completed = true
+            return result
+        }
+        for _ in 0..<2000 where controller.followTurnStopFence == nil { await Task.yield() }
+        XCTAssertEqual(stops, 1, "Initial stop must acknowledge before source admission")
+        clock.set(10.301)
+        snapshot = .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 2),
+            sourceTimestamp: 10.2, trackingQuality: .normal)
+        controller.ingestFollowTurnSource(snapshot)
+        if holdAuthorization {
+            for _ in 0..<2000 {
+                if await gate.isWaiting { break }
+                await Task.yield()
+            }
+            let waiting = await gate.isWaiting
+            XCTAssertTrue(waiting, "Suspend inside real RoverControl before the MainActor attempt check")
+            XCTAssertEqual(StubURLProtocol.requestCount, 1, "No nonzero HTTP attempt before eligibility")
+            clock.set(10.434) // 133ms scheduling delay consumes the original 2.374ms budget.
+            if healthLoss { controller.ingestFollowTurnSource(.unavailable) }
+            await gate.release()
+        }
+        if holdStop {
+            for _ in 0..<4000 where StubURLProtocol.suspended == nil { await Task.yield() }
+            XCTAssertNotNil(StubURLProtocol.suspended)
+            for _ in 0..<100 { await Task.yield() }
+            XCTAssertFalse(completed, "Stop response is held")
+            XCTAssertEqual(deliveries.count, 1, "Specific failure must be published before stop returns")
+            if let pending = deliveries.first {
+                XCTAssertEqual(pending.reason, .rotationResolutionInsufficient)
+                XCTAssertEqual(pending.context.failureCause, .burstPreSendExpired)
+                XCTAssertEqual(pending.stopOutcome, .pending)
+                XCTAssertEqual(FollowMotionFailureResolution(pending).message,
+                    "Turn not started: command scheduling exceeded burst budget. Confirming motor stop…")
+            }
+            StubURLProtocol.releaseFirst()
+        }
+        for _ in 0..<4000 where !completed { await Task.yield() }
+        if !completed { task.cancel(); await gate.release() }
+        let result = await task.value
+        XCTAssertTrue(completed)
+        XCTAssertEqual(senderCalls, 1, "Terminal failure cannot retry or launch another burst")
+        XCTAssertEqual(stops, 2, "Real transport confirms serialized safety stop")
+        XCTAssertEqual(StubURLProtocol.requestCount, holdAuthorization ? 2 : 3)
+        XCTAssertEqual(backoffs.now, 0)
+        XCTAssertEqual(result.stopOutcome, failStop ? .failed : .confirmed)
+        if holdStop, let pending = deliveries.first, let terminal = result.failure {
+            var resolution = FollowMotionFailureResolution(pending)
+            resolution.consume(terminal)
+            XCTAssertEqual(resolution.context.failureCause, .burstPreSendExpired)
+            XCTAssertEqual(resolution.stopOutcome, .confirmed)
+        }
+        XCTAssertFalse(sink.records.contains { $0.event == "follow_scan.burst_response" },
+            "Failed/unexecuted work must not learn a response")
+        let ack = try XCTUnwrap(sink.records.first { $0.event == "follow_scan.send_ack" })
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try XCTUnwrap(ack.fields["payload"]).utf8)) as? [String: Any])
+        XCTAssertEqual(payload["sender_outcome"] as? String,
+            holdAuthorization || expiryAfterAttempt ? "expired" : "failed")
+        XCTAssertEqual(payload["attempts"] as? Int, holdAuthorization ? 0 : 1)
+        XCTAssertEqual((payload["transport_attempt_entries"] as? [Any])?.count, holdAuthorization && !contradictoryEntry ? 0 : 1)
+        XCTAssertEqual(try XCTUnwrap(payload["requested_host_budget_s"] as? Double),
+            0.0023742724180478418, accuracy: 1e-12)
+        XCTAssertEqual(payload["requested_additional_wait_s"] as? Double, 0)
+        if holdAuthorization {
+            XCTAssertEqual(try XCTUnwrap(payload["send_entry_to_response_s"] as? Double), 0.133, accuracy: 1e-12)
+            XCTAssertEqual(payload["sender_failure_reason"] as? String, "expired")
+        }
+        return result
+    }
+
     @MainActor
     func testControllerTraceRecordsActualAttemptAndExpiredBackoffWithoutRetryOrInventedAck() async throws {
         StubURLProtocol.results = Array(repeating: .failure(URLError(.timedOut)), count: 3)
@@ -623,20 +1234,50 @@ private extension URLSessionConfiguration {
 }
 
 private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var suspendFirst = false
-    nonisolated(unsafe) static var suspended: StubURLProtocol?
-    nonisolated(unsafe) static var onRequest: (@Sendable () -> Void)?
-    nonisolated(unsafe) static var results: [Result<(Data, URLResponse), Error>] = []
-    nonisolated(unsafe) static var requestCount = 0
-    nonisolated(unsafe) static var lastRequest: URLRequest?
+    private final class State: @unchecked Sendable {
+        let lock = NSLock()
+        var suspendFirst = false
+        var suspendRequestNumber: Int?
+        var suspended: StubURLProtocol?
+        var onRequest: (@Sendable () -> Void)?
+        var results: [Result<(Data, URLResponse), Error>] = []
+        var requestCount = 0
+        var lastRequest: URLRequest?
+        var requests: [URLRequest] = []
+    }
+    private static let state = State()
+    static var suspendFirst: Bool {
+        get { state.lock.withLock { state.suspendFirst } }
+        set { state.lock.withLock { state.suspendFirst = newValue } }
+    }
+    static var suspendRequestNumber: Int? {
+        get { state.lock.withLock { state.suspendRequestNumber } }
+        set { state.lock.withLock { state.suspendRequestNumber = newValue } }
+    }
+    static var suspended: StubURLProtocol? { state.lock.withLock { state.suspended } }
+    static var onRequest: (@Sendable () -> Void)? {
+        get { state.lock.withLock { state.onRequest } }
+        set { state.lock.withLock { state.onRequest = newValue } }
+    }
+    static var results: [Result<(Data, URLResponse), Error>] {
+        get { state.lock.withLock { state.results } }
+        set { state.lock.withLock { state.results = newValue } }
+    }
+    static var requestCount: Int { state.lock.withLock { state.requestCount } }
+    static var lastRequest: URLRequest? { state.lock.withLock { state.lastRequest } }
+    static var requests: [URLRequest] { state.lock.withLock { state.requests } }
 
     static func reset() {
-        suspendFirst = false
-        suspended = nil
-        onRequest = nil
-        results = []
-        requestCount = 0
-        lastRequest = nil
+        state.lock.withLock {
+            state.suspendFirst = false
+            state.suspendRequestNumber = nil
+            state.suspended = nil
+            state.onRequest = nil
+            state.results = []
+            state.requestCount = 0
+            state.lastRequest = nil
+            state.requests = []
+        }
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -644,29 +1285,39 @@ private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        Self.requestCount += 1
-        Self.lastRequest = request
-        Self.onRequest?()
-        if Self.suspendFirst, Self.requestCount == 1 {
-            Self.suspended = self
-            return
+        let (callback, held) = Self.state.lock.withLock {
+            Self.state.requestCount += 1
+            Self.state.lastRequest = request
+            Self.state.requests.append(request)
+            let held = (Self.state.suspendFirst && Self.state.requestCount == 1) ||
+                Self.state.suspendRequestNumber == Self.state.requestCount
+            if held { Self.state.suspended = self }
+            return (Self.state.onRequest, held)
         }
+        callback?() // Client/injected callbacks never execute under the fixture lock.
+        if held { return }
         deliverNextResult()
     }
 
     static func releaseFirst() {
-        let first = suspended
-        suspended = nil
+        let first = state.lock.withLock {
+            let first = state.suspended
+            state.suspended = nil
+            return first
+        }
         first?.deliverNextResult()
     }
 
     private func deliverNextResult() {
-        guard !Self.results.isEmpty else {
+        let next = Self.state.lock.withLock {
+            Self.state.results.isEmpty ? nil : Self.state.results.removeFirst()
+        }
+        guard let next else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
 
-        switch Self.results.removeFirst() {
+        switch next {
         case .success(let result):
             client?.urlProtocol(self, didReceive: result.1, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: result.0)
@@ -685,4 +1336,26 @@ private final class BurstTestClock: @unchecked Sendable {
     init(_ value: Double) { self.value = value }
     var now: Double { lock.withLock { value } }
     func set(_ value: Double) { lock.withLock { self.value = value } }
+}
+
+private actor BurstAttemptAdmissionGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    var isWaiting: Bool { continuation != nil }
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private final class BurstScriptedClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Double]
+    init(_ values: [Double]) { self.values = values }
+    var now: Double { lock.withLock { values.count > 1 ? values.removeFirst() : values[0] } }
 }

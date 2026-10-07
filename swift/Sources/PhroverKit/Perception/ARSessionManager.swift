@@ -92,6 +92,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     public private(set) var latestDepthMap: CVPixelBuffer?
     private var lastClearanceLogAt = Date.distantPast
     private var frameSequence: UInt64 = 0
+    private var turnEvidence = FollowTurnPoseEvidenceArchive()
     private var snapshotContinuations: [UUID: AsyncStream<ARFrameSnapshot>.Continuation] = [:]
     private var lifecycleContinuations: [UUID: AsyncStream<ARSessionLifecycleEvent>.Continuation] = [:]
 
@@ -126,6 +127,11 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
                 Task { @MainActor in self?.snapshotContinuations.removeValue(forKey: id) }
             }
         }
+    }
+
+    /// Compact ingress evidence, separate from newest-only image delivery.
+    func turnPoseEvidence(from first: ARFrameID, through last: ARFrameID) -> [FollowTurnBurstPlanner.Sample]? {
+        turnEvidence.evidence(from: first, through: last)
     }
 
     public func lifecycleEvents() -> AsyncStream<ARSessionLifecycleEvent> {
@@ -197,6 +203,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
             trackingQuality: trackingQuality, depthConfidenceMap: depthConfidenceMap, depthSource: depthSource
         )
         latestSnapshot = snapshot
+        turnEvidence.record(.init(snapshot: snapshot), at: ProcessInfo.processInfo.systemUptime)
         // ARFrame.timestamp is seconds since device boot, the system-uptime domain.
         // Preserve actual ingress maxima even while snapshot consumers/detection are suspended.
         sourceHighWater = .init(frameID: snapshot.id, sourceTimestamp: timestamp.isFinite
@@ -223,6 +230,7 @@ public final class ARSessionManager: NSObject, @preconcurrency ARSessionDelegate
     }
 
     private func clearCurrentFrame() {
+        turnEvidence.clear()
         latestSnapshot = nil
         latestPixelBuffer = nil
         latestCamera = nil

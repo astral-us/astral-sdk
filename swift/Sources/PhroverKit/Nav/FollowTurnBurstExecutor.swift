@@ -33,7 +33,7 @@ enum FollowTurnOperationExecutor {
                          runtime: FollowTurnRuntimeState,
                         uptime: () -> Double, now: () -> Date, authorized: () -> Bool,
                         admit: (FollowTurnWaitingProgress) async -> FollowTurnSourceResult,
-                         burst: (WheelCommand, Double, FollowTurnWaitingProgress, FollowTurnBurstPlanner.Sample?) async throws -> FollowTurnBurstExecutionReceipt,
+                          burst: (WheelCommand, Double, FollowTurnWaitingProgress, FollowTurnBurstPlanner.Sample?, NavigationPoseSample) async throws -> FollowTurnBurstExecutionReceipt,
                           stoppedSource: (FollowTurnStopFence, FollowTurnWaitingProgress) async -> FollowTurnSourceResult,
                           diagnostic: (FollowTurnBurstPlanner.Calibration, NavigationPoseSample, FollowTurnBurstPlanner.Decision, Double) -> Void,
                           reduced: (FollowTurnBurstPlanner.Response, FollowTurnBurstPlanner.Reduction) -> Void,
@@ -71,16 +71,28 @@ enum FollowTurnOperationExecutor {
                 }
                 let signed = Double(direction) * profile.fixedWheelMagnitude
                 let receipt: FollowTurnBurstExecutionReceipt
-                do { receipt = try await burst(.init(left: -signed, right: signed), budget, progress, calibration.lastSourceSample) }
+                do { receipt = try await burst(.init(left: -signed, right: signed), budget, progress, calibration.lastSourceSample, sample) }
                 catch {
-                    return authorized() && !Task.isCancelled ? .failed(.commandFailed) : .cancelled
+                    guard authorized(), !Task.isCancelled else { return .cancelled }
+                    if let failure = runtime.failure { return .failed(failure) }
+                    return .failed(.commandFailed)
                 }
                 probeIssued = true
                 guard authorized(), !Task.isCancelled else { return .cancelled }
                 guard let fence = receipt.confirmedStopFence else { return .failed(.commandFailed) }
                 runtime.expire(at: now())
                 if let failure = runtime.failure { return .failed(failure) }
-                if receipt.send.result.failure != nil { return .failed(.commandFailed) }
+                if receipt.send.result.failure != nil {
+                    let send = receipt.send
+                    // An entered request may have moved the rover even if its response
+                    // failed. Only an unambiguous, typed, zero-attempt expiry is not-started.
+                    if send.definitePreSendExpiry {
+                        FollowMotionTaskScope.evidence?.recordFailure(.rotationResolutionInsufficient,
+                            cause: .burstPreSendExpired)
+                        return .failed(.rotationResolutionInsufficient)
+                    }
+                    return .failed(.commandFailed)
+                }
                 let settled: NavigationPoseSample
                 switch await stoppedSource(fence, progress) {
                 case .sample(let sample): settled = sample
@@ -104,8 +116,11 @@ enum FollowTurnOperationExecutor {
                     diagnostic(reduction?.calibration ?? calibration, settled, .arrived, uptime())
                     return .arrived
                 }
-                guard let reduction else { return .failed(.rotationResolutionInsufficient) }
-                guard reduction.rejection == nil else { return .failed(.rotationResolutionInsufficient) }
+                guard let reduction, reduction.rejection == nil else {
+                    FollowMotionTaskScope.evidence?.recordFailure(.rotationResolutionInsufficient,
+                        cause: .calibrationEvidenceIncomplete)
+                    return .failed(.rotationResolutionInsufficient)
+                }
                 calibration = reduction.calibration
             }
         }

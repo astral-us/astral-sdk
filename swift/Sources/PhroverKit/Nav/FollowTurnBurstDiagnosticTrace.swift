@@ -11,6 +11,12 @@ final class FollowTurnBurstDiagnosticTrace {
     private var sourceFenceID: UUID?
     private var hasObservedRate = false
 
+    func evidenceDelivery(ingress: Bool, rejection: String?) {
+        fields["calibration_evidence_delivery"] = .string(ingress ? "bounded_AR_ingress_archive" : "control_stream_compatibility")
+        fields["calibration_evidence_capacity"] = ingress ? .number(Double(FollowTurnPoseEvidenceArchive.capacity)) : .null
+        fields["calibration_evidence_delivery_rejection"] = rejection.map { .string($0) } ?? .null
+    }
+
     func planning(_ calibration: FollowTurnBurstPlanner.Calibration, sample: NavigationPoseSample,
                   profile: FollowTurnBurstPlanner.Profile, decision: FollowTurnBurstPlanner.Decision, uptime: Double) {
         let error = sample.pose.map { FollowReacquisitionPlanner.wrap(calibration.targetYaw - $0.yaw) }
@@ -171,7 +177,7 @@ final class FollowTurnBurstDiagnosticTrace {
             evidence: evidence, latch: latch, outcome: reason == "accepted" ? "accepted" : "waiting_or_rejected", reason: reason)
     }
 
-    func senderEntry(_ entry: Double, deadline: Double, budget: Double) {
+    func prepareSender(budget: Double, uptime: Double) {
         obligationRecorded = false
         for key in ["stop_obligation_uptime_s", "stop_trigger_reason", "stop_admission_uptime_s",
                     "stop_obligation_observed_uptime_s",
@@ -183,17 +189,20 @@ final class FollowTurnBurstDiagnosticTrace {
                     "post_ack_sample_endpoints", "send_response_uptime_s", "send_entry_to_response_s",
                     "remaining_budget_at_response_s", "ack_overrun_s", "sender_outcome", "sender_failure_reason",
                     "transport_attempt_entries", "transport_entry_uptime_s", "transport_entry_availability",
+                    "transport_actor_entry_uptime_s", "transport_timing_entries", "transport_timing_availability",
                     "additional_wait_start_uptime_s", "additional_wait_end_uptime_s", "wait_wake_reason",
                     "stop_admission_to_ack_s", "pending_send_drain_s", "send_return_to_stop_admission_s",
                     "stop_fence_id", "stop_fence_operation_generation", "stop_fence_source_generation",
                     "stop_fence_highest_sequence", "stop_fence_highest_source_timestamp_s"] {
             fields[key] = .null
         }
-        fields["controller_phase"] = .string("sending")
+        fields["controller_phase"] = .string("send_preparation")
         fields.merge([
             "burst_clock": .string("ar_system_uptime"),
             "requested_host_budget_s": .number(budget),
-            "send_entry_uptime_s": .number(entry), "burst_deadline_uptime_s": .number(deadline),
+            "send_entry_uptime_s": .null, "burst_deadline_uptime_s": .null,
+            "send_entry_availability": .string("not_armed"),
+            "send_preparation_start_uptime_s": .number(uptime), "send_preparation_duration_s": .null,
             "physical_motor_duration_s": .null,
             "physical_motor_duration_confidence": .string("unknown"),
             "physical_80ms_guarantee": .bool(false),
@@ -204,10 +213,22 @@ final class FollowTurnBurstDiagnosticTrace {
         ]) { _, value in value }
     }
 
+    /// Cheap captured stamps only; no formatting, emitter or I/O at arm.
+    func senderEntry(_ entry: Double, deadline: Double, budget: Double) {
+        fields["controller_phase"] = .string("sending")
+        fields["send_entry_uptime_s"] = .number(entry)
+        fields["burst_deadline_uptime_s"] = .number(deadline)
+        fields["send_entry_availability"] = .string("captured_sender_invocation")
+    }
+
     func senderResponse(entry: Double, deadline: Double, response: Double,
-                        attempts: [FollowTurnTransportAttempt], obligated: Bool, result: RoverCommandDiagnosticResult) {
+                        attempts: [FollowTurnTransportAttempt], timings: [FollowTurnTransportTiming] = [],
+                        obligated: Bool, result: RoverCommandDiagnosticResult) {
         fields["controller_phase"] = .string("send_response")
         fields["send_response_uptime_s"] = .number(response)
+        if case .number(let preparationStart) = fields["send_preparation_start_uptime_s"] {
+            fields["send_preparation_duration_s"] = Self.number(entry - preparationStart)
+        }
         fields["send_entry_to_response_s"] = .number(response - entry)
         fields["remaining_budget_at_response_s"] = .number(max(0, deadline - response))
         fields["ack_overrun_s"] = .number(max(0, response - deadline))
@@ -224,6 +245,13 @@ final class FollowTurnBurstDiagnosticTrace {
         })
         fields["transport_entry_uptime_s"] = attempts.first.map { .number($0.entryUptime) } ?? .null
         fields["transport_entry_availability"] = .string(attempts.isEmpty ? "not_exposed_by_sender" : "available")
+        fields["transport_actor_entry_uptime_s"] = Self.number(timings.first { $0.boundary == .actorEntry }?.uptime)
+        fields["transport_timing_availability"] = .string(timings.isEmpty ? "not_exposed_by_sender" : "available")
+        fields["transport_timing_entries"] = timings.isEmpty ? .null : .array(timings.map {
+            .object(["boundary": .string($0.boundary.rawValue), "uptime_s": Self.number($0.uptime),
+                "attempt": $0.attempt.map { .number(Double($0)) } ?? .null,
+                "eligible": $0.eligible.map { .bool($0) } ?? .null])
+        })
     }
 
     func obligation(at uptime: Double, observedAt: Double? = nil, reason: String, pending: Bool,
