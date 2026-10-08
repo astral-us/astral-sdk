@@ -21,6 +21,7 @@ struct FollowRecoveryHeadingRequest: Sendable {
     /// Correlation only; the coordinator still owns cursor advancement.
     var stageIndex: Int? = nil
     var segmentIndex: Int? = nil
+    var maximumSegment: Double = .pi / 6
 }
 
 struct FollowRecoverySegmentEvidence: Sendable {

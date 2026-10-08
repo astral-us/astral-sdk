@@ -303,7 +303,7 @@ public final class NavigationController {
 
     private static func runtimeDiagnosticEmitter() -> FollowDiagnosticEmitter {
         .init(streamID: UUID().uuidString, monotonic: { ProcessInfo.processInfo.systemUptime },
-            utc: Date.init, sink: { RuntimeFileLog.append($0, fields: $1) })
+            utc: Date.init, sink: { RuntimeFileLog.append($0, fields: $1) }, deferredRuntime: true)
     }
 
     private static func diagnosticSender(
@@ -650,7 +650,8 @@ public final class NavigationController {
         let target: Double
         if purpose == .followScan, let recovery = FollowRecoveryScope.heading {
             let delta: Double
-            switch FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: recovery.stageHeading, actualYaw: yaw) {
+            switch FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: recovery.stageHeading, actualYaw: yaw,
+                maximumSegment: recovery.maximumSegment) {
             case .turn(let resolvedDelta, let resolvedTarget): delta = resolvedDelta; target = resolvedTarget
             case .stageArrived: delta = 0; target = FollowReacquisitionPlanner.wrap(yaw)
             case .unavailable, .exhausted: return .cancelled
@@ -712,6 +713,8 @@ public final class NavigationController {
             defer { self.followTurnSourceObservers.removeValue(forKey: bracketObserver) }
             return await FollowTurnOperationExecutor.execute(targetYaw: target, generation: initial.frameID!.generation,
                 operationID: evidence?.context.controllerOperationID ?? UInt64(owner), profile: profile, runtime: runtime,
+                responseRateFloor: purpose == .followScan && evidence?.context.request?.scanResponseSeed?.sourceGeneration == initial.frameID!.generation
+                    ? evidence!.context.request!.scanResponseSeed!.responseRate : 2 * .pi / 3,
                 uptime: self.sourceNow, now: self.now,
                 authorized: { self.operationGeneration == owner && evidence?.fenced != true && self.recoveryAuthorized && !self.stopUnconfirmed },
                 admit: { progress in
@@ -765,6 +768,11 @@ public final class NavigationController {
                     if let evidence { evidence.scanTrace?.emit("burst_plan", evidence: evidence, latch: self.stopUnconfirmed) }
                 },
                 reduced: { response, reduction in
+                    if purpose == .followScan, reduction.rejection == nil, reduction.signedResponse != nil,
+                       reduction.calibration.responseRate.isFinite {
+                        evidence?.measuredScanResponse = .init(sourceGeneration: initial.frameID!.generation,
+                            responseRate: reduction.calibration.responseRate)
+                    }
                     evidence?.burstTrace?.reduction(response, reduction)
                     if let evidence { evidence.scanTrace?.emit("burst_response", evidence: evidence, latch: self.stopUnconfirmed,
                         outcome: reduction.rejection == nil ? "accepted" : "rejected", reason: reduction.rejection) }
@@ -1370,7 +1378,9 @@ public final class NavigationController {
                            requireEnriched: true) == nil else { fence.inhibit(at: self.sourceNow()); return }
                 if observation?.observe(sample, at: self.sourceNow()) == true {
                     sourceStopped = true
-                    fence.inhibit(at: self.sourceNow())
+                    if let reason = observation?.triggerReason.flatMap(FollowTurnTargetStop.init(rawValue:)) {
+                        fence.inhibitForTarget(reason, at: self.sourceNow())
+                    } else { fence.inhibit(at: self.sourceNow()) }
                     if let evidence { evidence.burstTrace?.obligation(at: self.sourceNow(),
                         reason: observation?.triggerReason ?? "source", pending: true, evidence: evidence, latch: self.stopUnconfirmed) }
                 } else if !refreshTransportAuthority() {
@@ -1547,7 +1557,7 @@ public final class NavigationController {
                 }
                 evidence?.burstTrace?.senderResponse(entry: entry, deadline: deadline, response: response,
                     attempts: transportCapture.attempts, timings: transportCapture.timings,
-                    obligated: fence.status?.stopObligation == true, result: result)
+                    obligated: fence.status?.stopObligation == true, result: result, targetStop: fence.targetStop)
                 monitor.cancel()
                 deadlineMonitor?.cancel()
                 drain.finish()
@@ -1573,7 +1583,7 @@ public final class NavigationController {
         }
         return .init(transportAttempts: transportCapture.attempts, sendEntryUptime: entry, deadline: deadline,
             responseUptime: response, result: result, stopObligation: fence.status?.stopObligation == true,
-            stopObligationUptime: fence.stopObligationUptime)
+            stopObligationUptime: fence.stopObligationUptime, targetStop: fence.targetStop)
     }
 
     /// Task 2 boundary seam. It remains disconnected from the motor burst executor until Task 4.
@@ -2023,7 +2033,8 @@ public final class NavigationController {
             }
             if mode == .followScan, let recovery = FollowRecoveryScope.heading, !recoveryResolved {
                 let delta: Double
-                switch FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: recovery.stageHeading, actualYaw: pose.yaw) {
+                switch FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: recovery.stageHeading, actualYaw: pose.yaw,
+                    maximumSegment: recovery.maximumSegment) {
                 case .turn(let resolvedDelta, let target):
                     delta = resolvedDelta
                     targetYaw = target

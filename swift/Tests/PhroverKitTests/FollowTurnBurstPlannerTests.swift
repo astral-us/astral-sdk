@@ -2,6 +2,16 @@ import XCTest
 import PhroverKit
 
 final class FollowTurnBurstPlannerTests: XCTestCase {
+    func testInheritedSearchGainReducesNewStepProbeWithoutReusingTargetOrSourceHistory() {
+        let seed = Planner.Calibration(operationID: 2, generation: 7, targetYaw: .pi / 18,
+            clockDomain: "test_uptime", responseRateFloor: 10)
+        let decision = Planner.plan(.init(actualYaw: 0, profile: .init(purpose: .scan), calibration: seed, sendEntryUptime: 10))
+        guard case .burst(_, let budget) = decision else { return XCTFail() }
+        XCTAssertEqual(budget, 0.00523598775598299, accuracy: 1e-12)
+        XCTAssertEqual(seed.completedResponses, 0)
+        XCTAssertNil(seed.lastSourceSample)
+        XCTAssertEqual(seed.targetYaw, .pi / 18)
+    }
     func testRecordedSearchResponseDoesNotPayLatencyAndCoastTwice() {
         let calibration = initial(0.5230183705041618)
         let profile = Planner.Profile(purpose: .scan)

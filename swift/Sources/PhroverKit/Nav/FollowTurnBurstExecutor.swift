@@ -30,7 +30,8 @@ enum FollowTurnBurstExecutor {
 enum FollowTurnOperationExecutor {
     static func execute(targetYaw: Double, generation: UInt64, operationID: UInt64,
                          profile: FollowTurnBurstPlanner.Profile,
-                         runtime: FollowTurnRuntimeState,
+                          runtime: FollowTurnRuntimeState,
+                         responseRateFloor: Double = 2 * .pi / 3,
                         uptime: () -> Double, now: () -> Date, authorized: () -> Bool,
                         admit: (FollowTurnWaitingProgress) async -> FollowTurnSourceResult,
                           burst: (WheelCommand, Double, FollowTurnWaitingProgress, FollowTurnBurstPlanner.Sample?, NavigationPoseSample) async throws -> FollowTurnBurstExecutionReceipt,
@@ -39,7 +40,7 @@ enum FollowTurnOperationExecutor {
                           reduced: (FollowTurnBurstPlanner.Response, FollowTurnBurstPlanner.Reduction) -> Void,
                          response: (FollowTurnBurstExecutionReceipt, Double, NavigationPoseSample) -> FollowTurnBurstPlanner.Response?) async -> NavigationResult {
         var calibration = FollowTurnBurstPlanner.Calibration(operationID: operationID, generation: generation,
-            targetYaw: targetYaw, clockDomain: "ar_system_uptime")
+            targetYaw: targetYaw, clockDomain: "ar_system_uptime", responseRateFloor: responseRateFloor)
         var progress: FollowTurnWaitingProgress {
             get { runtime.progress }
             set { runtime.progress = newValue }
@@ -84,6 +85,26 @@ enum FollowTurnOperationExecutor {
                 if let failure = runtime.failure { return .failed(failure) }
                 if receipt.send.result.failure != nil {
                     let send = receipt.send
+                    if send.definiteUnsentTargetStop {
+                        // A valid source inhibited an unnecessary request before
+                        // HTTP. It is not a transport failure or a motion response.
+                        let settled: NavigationPoseSample
+                        switch await stoppedSource(fence, progress) {
+                        case .sample(let value): settled = value
+                        case .failed(let reason): return .failed(reason)
+                        case .cancelled: return .cancelled
+                        }
+                        guard authorized(), !Task.isCancelled else { return .cancelled }
+                        runtime.expire(at: now())
+                        if let failure = runtime.failure { return .failed(failure) }
+                        guard let pose = settled.pose else { return .failed(.trackingLost) }
+                        let error = abs(FollowReacquisitionPlanner.wrap(targetYaw - pose.yaw))
+                        guard error.isFinite, error <= profile.tolerance else {
+                            return .failed(.rotationResolutionInsufficient)
+                        }
+                        diagnostic(calibration, settled, .arrived, uptime())
+                        return .arrived
+                    }
                     // An entered request may have moved the rover even if its response
                     // failed. Only an unambiguous, typed, zero-attempt expiry is not-started.
                     if send.definitePreSendExpiry {

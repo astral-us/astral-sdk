@@ -11,7 +11,26 @@ import ImageIO
 /// Detections feed two consumers: `ObstacleGuard` (people directly ahead) and dialog/
 /// "who's there" behaviors. This is the on-device half of the hybrid AI split — heavy
 /// vision-language reasoning can be offloaded to the cloud via `DialogEscalating`.
-public final class Detector {
+public final class Detector: @unchecked Sendable {
+    // Vision requests are serial; reading the preview cache never waits for
+    // inference. Async follow callers retain one active and one newest job.
+    private let inferenceLock = NSRecursiveLock()
+    private let cacheLock = NSLock()
+    private let jobLock = NSLock()
+    private let worker = DispatchQueue(label: "us.astral.follow-inference", qos: .userInitiated)
+    private var workerRunning = false
+    private var pendingJob: InferenceJob?
+    private struct InferenceJob: Sendable {
+        let snapshot: ARFrameSnapshot
+        let cancellation: InferenceCancellation
+        let continuation: CheckedContinuation<EvaluationReceipt?, Never>
+    }
+    private final class InferenceCancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        var cancelled: Bool { lock.withLock { value } }
+        func cancel() { lock.withLock { value = true } }
+    }
     public enum EvaluationStatus: String, Sendable { case executed, failed }
     public enum FailureReason: String, Sendable {
         case unavailable = "detector_unavailable", inferenceFailed = "inference_failed"
@@ -33,7 +52,8 @@ public final class Detector {
         public let snapshot: ARFrameSnapshot
         public let receipt: EvaluationReceipt
     }
-    public private(set) var latestFollowEvaluation: FollowEvaluation?
+    private var cachedFollowEvaluation: FollowEvaluation?
+    public var latestFollowEvaluation: FollowEvaluation? { cacheLock.withLock { cachedFollowEvaluation } }
     public struct Detection: Sendable {
         public let label: String
         public let confidence: Float
@@ -143,6 +163,8 @@ public final class Detector {
     private func evaluate(_ pixelBuffer: CVPixelBuffer,
                           orientations: [CGImagePropertyOrientation] = Detector.detectionOrientations(preferred: .right))
         -> (detections: [Detection], reason: FailureReason?, orientation: CGImagePropertyOrientation?) {
+        inferenceLock.lock()
+        defer { inferenceLock.unlock() }
         if let detectionHandler {
             do { return (try detectionHandler(pixelBuffer), nil, nil) }
             catch { return ([], .inferenceFailed, nil) }
@@ -173,6 +195,8 @@ public final class Detector {
 
     /// Follow projection uses the inverse .right transform; never feed fallback boxes to it.
     public func evaluateForFollow(_ snapshot: ARFrameSnapshot) -> EvaluationReceipt {
+        inferenceLock.lock()
+        defer { inferenceLock.unlock() }
         let result = evaluate(snapshot.image, orientations: [.right])
         let people = result.detections.filter { $0.label.lowercased() == "person" }
         let verification: [PersonBodyVerifier.Decision]
@@ -196,8 +220,48 @@ public final class Detector {
                                   status: result.reason == nil ? .executed : .failed,
                                   failureReason: result.reason, orientation: result.orientation,
                                   personVerification: verification)
-        latestFollowEvaluation = .init(snapshot: snapshot, receipt: receipt)
+        cacheLock.withLock { cachedFollowEvaluation = .init(snapshot: snapshot, receipt: receipt) }
         return receipt
+    }
+
+    @MainActor public func evaluateForFollowAsync(_ snapshot: ARFrameSnapshot) async -> EvaluationReceipt? {
+        let cancellation = InferenceCancellation()
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return nil }
+            return await withCheckedContinuation { continuation in
+                let job = InferenceJob(snapshot: snapshot, cancellation: cancellation, continuation: continuation)
+                var superseded: InferenceJob?
+                let start = jobLock.withLock {
+                    if workerRunning { superseded = pendingJob; pendingJob = job; return false }
+                    workerRunning = true
+                    return true
+                }
+                superseded?.continuation.resume(returning: nil)
+                if start { worker.async { self.run(job) } }
+            }
+        } onCancel: { cancellation.cancel() }
+    }
+
+    private func run(_ job: InferenceJob) {
+        let receipt = job.cancellation.cancelled ? nil : evaluateForFollow(job.snapshot)
+        job.continuation.resume(returning: job.cancellation.cancelled ? nil : receipt)
+        let next: InferenceJob? = jobLock.withLock {
+            guard let next = pendingJob else { workerRunning = false; return nil }
+            pendingJob = nil
+            return next
+        }
+        if let next { worker.async { self.run(next) } }
+    }
+
+    @MainActor public func followPreviewEvaluationAsync(_ snapshot: ARFrameSnapshot, at uptime: TimeInterval) async -> FollowEvaluation? {
+        if let cached = latestFollowEvaluation, uptime.isFinite,
+           cached.snapshot.id.generation == snapshot.id.generation, cached.snapshot.id.sequence <= snapshot.id.sequence,
+           cached.snapshot.timestamp <= snapshot.timestamp,
+           uptime - cached.snapshot.timestamp >= 0, uptime - cached.snapshot.timestamp <= 0.5 {
+            return cached
+        }
+        guard let receipt = await evaluateForFollowAsync(snapshot), !Task.isCancelled else { return nil }
+        return .init(snapshot: snapshot, receipt: receipt)
     }
 
     /// Preview and receipt always refer to the same upright snapshot.

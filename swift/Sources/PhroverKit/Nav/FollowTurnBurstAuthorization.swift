@@ -61,7 +61,10 @@ enum FollowTurnBurstTransportDenial: Error {
     case expired, fenced, cancelled, invalidBudget
 }
 
+enum FollowTurnTargetStop: String, Sendable { case tolerance, crossing }
+
 struct FollowTurnBurstSendReceipt {
+    let targetStop: FollowTurnTargetStop?
     let transportAttempts: [FollowTurnTransportAttempt]
     let sendEntryUptime: TimeInterval
     let deadline: TimeInterval
@@ -77,9 +80,16 @@ struct FollowTurnBurstSendReceipt {
             transportAttempts.isEmpty
     }
 
+    var definiteUnsentTargetStop: Bool {
+        targetStop != nil && result.failure as? FollowTurnBurstTransportDenial == .fenced &&
+            result.receipt.outcome == "fenced" && result.receipt.attempts == 0 &&
+            result.receipt.acknowledged == false && result.receipt.httpStatus == nil && transportAttempts.isEmpty
+    }
+
     init(transportAttempts: [FollowTurnTransportAttempt] = [], sendEntryUptime: TimeInterval,
          deadline: TimeInterval, responseUptime: TimeInterval, result: RoverCommandDiagnosticResult,
-          stopObligation: Bool, stopObligationUptime: Double? = nil) {
+           stopObligation: Bool, stopObligationUptime: Double? = nil, targetStop: FollowTurnTargetStop? = nil) {
+        self.targetStop = targetStop
         self.transportAttempts = transportAttempts
         self.sendEntryUptime = sendEntryUptime
         self.deadline = deadline
@@ -138,6 +148,20 @@ final class FollowTurnBurstFence: @unchecked Sendable {
     private var obligated = false
     private var obligationTime: Double?
     private var validity: Range<TimeInterval>?
+    private var targetStopReason: FollowTurnTargetStop?
+    var targetStop: FollowTurnTargetStop? { lock.withLock { targetStopReason } }
+    /// Only the first, currently authorized inhibition can be target completion.
+    /// Later source events cannot relabel an earlier expiry or safety fence.
+    func inhibitForTarget(_ reason: FollowTurnTargetStop, at uptime: Double) {
+        lock.withLock {
+            if permitted, let epoch = armedEpoch, uptime.isFinite,
+               uptime >= epoch.entry, uptime < epoch.deadline,
+               validity?.contains(uptime) == true { targetStopReason = reason }
+            permitted = false
+            obligated = true
+            obligationTime = min(obligationTime ?? .infinity, uptime)
+        }
+    }
     var epoch: FollowTurnBurstEpoch? { lock.withLock { armedEpoch } }
     func arm(entry: TimeInterval, budget: TimeInterval) -> FollowTurnBurstEpoch? {
         lock.withLock {

@@ -133,7 +133,8 @@ final class FollowTurnBurstDiagnosticTrace {
     private func retain(_ calibration: FollowTurnBurstPlanner.Calibration) {
         fields["reference_rate_rad_s"] = .number(2 * .pi / 3)
         fields["retained_response_rate_rad_s"] = .number(calibration.responseRate)
-        fields["response_rate_confidence"] = .string(hasObservedRate ? "observed_effective_not_physical_bound" : "provisional_reference")
+        fields["response_rate_confidence"] = .string(hasObservedRate ? "observed_effective_not_physical_bound" :
+            (calibration.responseRate > 2 * .pi / 3 ? "inherited_search_response_floor" : "provisional_reference"))
         fields["maximum_send_duration_s"] = Self.number(calibration.maximumSendDuration)
         fields["maximum_stop_duration_s"] = Self.number(calibration.maximumStopDuration)
         fields["latency_allowance_s"] = Self.number(calibration.maximumSendDuration.flatMap { send in calibration.maximumStopDuration.map { send + $0 } })
@@ -197,7 +198,7 @@ final class FollowTurnBurstDiagnosticTrace {
                     "response_sampled_absolute_travel_rad", "net_source_rate_rad_s", "net_source_interval_s",
                     "maximum_consecutive_source_rate_rad_s", "effective_budget_response_rate_rad_s",
                     "post_ack_sample_endpoints", "send_response_uptime_s", "send_entry_to_response_s",
-                    "remaining_budget_at_response_s", "ack_overrun_s", "sender_outcome", "sender_failure_reason",
+                    "remaining_budget_at_response_s", "ack_overrun_s", "sender_outcome", "sender_failure_reason", "target_inhibition_reason",
                     "transport_attempt_entries", "transport_entry_uptime_s", "transport_entry_availability",
                     "transport_actor_entry_uptime_s", "transport_timing_entries", "transport_timing_availability",
                     "additional_wait_start_uptime_s", "additional_wait_end_uptime_s", "wait_wake_reason",
@@ -233,7 +234,7 @@ final class FollowTurnBurstDiagnosticTrace {
 
     func senderResponse(entry: Double, deadline: Double, response: Double,
                         attempts: [FollowTurnTransportAttempt], timings: [FollowTurnTransportTiming] = [],
-                        obligated: Bool, result: RoverCommandDiagnosticResult) {
+                        obligated: Bool, result: RoverCommandDiagnosticResult, targetStop: FollowTurnTargetStop? = nil) {
         fields["controller_phase"] = .string("send_response")
         fields["send_response_uptime_s"] = .number(response)
         if case .number(let preparationStart) = fields["send_preparation_start_uptime_s"] {
@@ -244,6 +245,7 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["ack_overrun_s"] = .number(max(0, response - deadline))
         fields["stop_obligation_at_response"] = .bool(obligated || response >= deadline)
         fields["sender_outcome"] = .string(String(result.receipt.outcome.prefix(64)))
+        fields["target_inhibition_reason"] = targetStop.map { .string($0.rawValue) } ?? .null
         if let denial = result.failure as? FollowTurnBurstTransportDenial {
             fields["sender_failure_reason"] = .string(String(describing: denial))
         } else {

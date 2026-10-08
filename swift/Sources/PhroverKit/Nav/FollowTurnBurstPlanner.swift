@@ -35,12 +35,13 @@ public enum FollowTurnBurstPlanner {
         public let lastSourceSequence: UInt64?
         public let lastSourceTimestamp: Double?
         public let lastSourceSample: Sample?
-        public init(operationID: UInt64, generation: UInt64, targetYaw: Double, clockDomain: String) {
+        public init(operationID: UInt64, generation: UInt64, targetYaw: Double, clockDomain: String,
+                    responseRateFloor: Double = 2 * .pi / 3) {
             self.operationID = operationID
             self.generation = generation
             self.targetYaw = targetYaw
             self.clockDomain = clockDomain
-            responseRate = 2 * .pi / 3
+            responseRate = responseRateFloor.isFinite ? max(2 * .pi / 3, responseRateFloor) : .infinity
             maximumSendDuration = nil
             maximumStopDuration = nil
             observedPostAckTravel = nil

@@ -37,6 +37,9 @@ extension NavigationController: RoverMotion {}
 public protocol RoverPerception: AnyObject {
     var pose: Pose2D? { get }
     func detectObjects() -> [PerceivedObject]
+    func refreshDetections() async
+    /// Project a point produced by the latest local detection receipt.
+    func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2?
     func unproject(normalizedPoint: CGPoint) -> Vec2?
     func capturedFrameJPEG() -> Data?
     /// Resolve a free-text description ("the green chair") to a normalized point in the
@@ -49,6 +52,8 @@ public protocol RoverPerception: AnyObject {
 }
 
 extension RoverPerception {
+    public func refreshDetections() async {}
+    public func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2? { unproject(normalizedPoint: normalizedPoint) }
     /// Default grounding: case-insensitive substring match against `detectObjects()`
     /// labels, picking the highest-confidence match. No attribute/color understanding —
     /// "green chair" matches the same as "chair". Override for anything smarter.
@@ -68,6 +73,23 @@ extension RoverPerception {
 public final class ARPerceptionSource: RoverPerception {
     private let ar: ARSessionManager
     private let detector: Detector?
+    private var detectionFrame: ARFrameSnapshot?
+    private var detections: [Detector.Detection] = []
+
+    public func refreshDetections() async {
+        guard let detector, let snapshot = ar.latestSnapshot else { detectionFrame = nil; detections = []; return }
+        guard let evaluation = await detector.followPreviewEvaluationAsync(snapshot, at: ProcessInfo.processInfo.systemUptime),
+              !Task.isCancelled, evaluation.snapshot.id.generation == ar.sessionGeneration else { return }
+        detectionFrame = evaluation.snapshot
+        detections = evaluation.receipt.frame.detections
+    }
+
+    private var freshDetectionFrame: ARFrameSnapshot? {
+        guard let frame = detectionFrame, frame.id.generation == ar.sessionGeneration,
+              ar.trackingQuality == .normal, frame.trackingQuality == .normal else { return nil }
+        let age = ProcessInfo.processInfo.systemUptime - frame.timestamp
+        return age.isFinite && age >= 0 && age <= 0.5 ? frame : nil
+    }
 
     public init(ar: ARSessionManager, detector: Detector?) {
         self.ar = ar
@@ -77,8 +99,8 @@ public final class ARPerceptionSource: RoverPerception {
     public var pose: Pose2D? { ar.pose }
 
     public func detectObjects() -> [PerceivedObject] {
-        guard let detector, let buffer = ar.latestPixelBuffer else { return [] }
-        return detector.detect(buffer).map {
+        guard freshDetectionFrame != nil else { return [] }
+        return detections.map {
             PerceivedObject(label: $0.label,
                             confidence: $0.confidence,
                             normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
@@ -87,6 +109,11 @@ public final class ARPerceptionSource: RoverPerception {
 
     public func unproject(normalizedPoint: CGPoint) -> Vec2? {
         ar.unproject(normalizedPoint: normalizedPoint)
+    }
+
+    public func unprojectDetectedObject(normalizedPoint: CGPoint) -> Vec2? {
+        guard let frame = freshDetectionFrame else { return nil }
+        return ARSessionManager.unproject(normalizedPoint: normalizedPoint, in: frame)
     }
 
     public func capturedFrameJPEG() -> Data? {
@@ -394,6 +421,8 @@ public final class MissionAgent {
             }
 
             setPhase(.thinking, missionID: missionID)
+            await perception.refreshDetections()
+            guard isCurrentMission(missionID), !Task.isCancelled else { return }
             let rememberedCountBefore = memory.rememberedObjects.count
             updateWorldModel()
             let newObjects = memory.rememberedObjects.count - rememberedCountBefore
@@ -735,7 +764,7 @@ public final class MissionAgent {
     private func updateWorldModel() {
         // Object permanence: pin every current detection to the nav plane.
         for object in perception.detectObjects() {
-            if let world = perception.unproject(normalizedPoint: object.normalizedPoint) {
+            if let world = perception.unprojectDetectedObject(normalizedPoint: object.normalizedPoint) {
                 memory.rememberObject(label: object.label, at: world)
             }
         }
@@ -784,7 +813,7 @@ public final class MissionAgent {
         case .imagePoint(let p): return perception.unproject(normalizedPoint: p)
         case .visualQuery(let q):
             guard let point = lockedVisualTargetPoint(query: q, missionID: missionID) else { return nil }
-            return perception.unproject(normalizedPoint: point)
+            return perception.unprojectDetectedObject(normalizedPoint: point)
         }
     }
 
@@ -950,11 +979,12 @@ public final class MissionAgent {
 
     private func waitForVisualTarget(query: String, missionID: Int) async -> VisualTargetWaitResult {
         if visualTargetScanDelay <= 0 {
+            await perception.refreshDetections()
             guard isCurrentMission(missionID) else { return .cancelled }
             let objects = perception.detectObjects()
             guard !objects.isEmpty else { return .timedOut }
             if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
-               let goal = perception.unproject(normalizedPoint: point) {
+               let goal = perception.unprojectDetectedObject(normalizedPoint: point) {
                 return .found(goal)
             }
             return .timedOut
@@ -963,6 +993,7 @@ public final class MissionAgent {
         let deadline = Date().addingTimeInterval(visualTargetScanDelay)
         var sawVisibleObjects = false
         while Date() < deadline {
+            await perception.refreshDetections()
             guard isCurrentMission(missionID) else { return .cancelled }
             let objects = perception.detectObjects()
             guard !objects.isEmpty else {
@@ -971,7 +1002,7 @@ public final class MissionAgent {
             }
             sawVisibleObjects = true
             if let point = lockedVisualTargetPoint(query: query, objects: objects, missionID: missionID),
-               let goal = perception.unproject(normalizedPoint: point) {
+               let goal = perception.unprojectDetectedObject(normalizedPoint: point) {
                 RuntimeFileLog.append("mission_target_scan_wait_match", fields: [
                     "mission": "\(missionID)",
                     "target": query

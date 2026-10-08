@@ -6,6 +6,11 @@ enum FollowMotionStopOutcome: String, Sendable { case unknown, pending, confirme
 enum FollowMotionDeliverySource: String, Sendable { case stream, result, confirmation }
 enum FollowMotionStopOrigin: String, Sendable { case pulse, independent, final, detection, cleanup }
 
+struct FollowScanResponseSeed: Sendable, Equatable {
+    let sourceGeneration: UInt64
+    let responseRate: Double
+}
+
 /// Internal subtype of the existing public rotation-resolution failure.
 enum FollowTurnFailureCause: String, Sendable {
     case burstPreSendExpired = "burst_pre_send_expired"
@@ -20,8 +25,10 @@ struct FollowMotionRequestContext: Sendable, Equatable {
     let phase: String
     let scanUsed: Double?
     let scanRemaining: Double?
+    let scanResponseSeed: FollowScanResponseSeed?
     init(sessionGeneration: UInt64, requestToken: UInt64, purpose: FollowMotionPurpose, phase: String,
-         scanUsed: Double? = nil, scanRemaining: Double? = nil) {
+          scanUsed: Double? = nil, scanRemaining: Double? = nil, scanResponseSeed: FollowScanResponseSeed? = nil) {
+        self.scanResponseSeed = scanResponseSeed
         self.sessionGeneration = sessionGeneration
         self.requestToken = requestToken
         self.purpose = purpose
@@ -88,6 +95,7 @@ struct FollowMotionFailureDelivery: Sendable {
 }
 
 struct FollowMotionResult: Sendable {
+    let measuredScanResponse: FollowScanResponseSeed?
     let turnStopFence: FollowTurnStopFence?
     var outcome: FollowMotionOutcome {
         if let deferred, failure == nil, stopOutcome != .failed { return .notStarted(deferred) }
@@ -105,7 +113,9 @@ struct FollowMotionResult: Sendable {
     init(result: NavigationResult, context: FollowMotionOperationContext, failure: FollowMotionFailureDelivery?,
          stopOutcome: FollowMotionStopOutcome = .unknown, commandReceipt: RoverCommandDiagnosticReceipt? = nil,
          stopReceipt: RoverCommandDiagnosticReceipt? = nil, deferred: FollowReadyDeferral? = nil,
-         recovery: FollowRecoverySegmentEvidence? = nil, turnStopFence: FollowTurnStopFence? = nil) {
+          recovery: FollowRecoverySegmentEvidence? = nil, turnStopFence: FollowTurnStopFence? = nil,
+          measuredScanResponse: FollowScanResponseSeed? = nil) {
+        self.measuredScanResponse = measuredScanResponse
         self.turnStopFence = turnStopFence
         self.recovery = recovery
         self.deferred = deferred
@@ -122,6 +132,7 @@ struct FollowMotionResult: Sendable {
 /// Facts are captured synchronously by NavigationController and frozen for delivery.
 @MainActor
 final class FollowMotionOperationEvidence {
+    var measuredScanResponse: FollowScanResponseSeed?
     let recoveryEpisodeID: UUID?
     let recoveryDeadline: Double?
     let recoveryStageHeading: Double?
@@ -190,7 +201,7 @@ final class FollowMotionOperationEvidence {
         .init(result: result, context: context, failure: failure(source: .result),
             stopOutcome: stopOutcome, commandReceipt: commandReceipt, stopReceipt: stopReceipt,
             deferred: primaryFailure == nil && stopOutcome != .failed ? FollowReadyAdmissionScope.current?.deferred : nil,
-            recovery: recovery, turnStopFence: turnStopFence)
+            recovery: recovery, turnStopFence: turnStopFence, measuredScanResponse: measuredScanResponse)
     }
 }
 

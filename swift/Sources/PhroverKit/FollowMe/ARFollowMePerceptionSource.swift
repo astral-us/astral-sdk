@@ -34,7 +34,8 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                         continue
                     }
                     let started = ProcessInfo.processInfo.systemUptime
-                    let receipt = detector.evaluateForFollow(snapshot)
+                    guard let receipt = await detector.evaluateForFollowAsync(snapshot), !Task.isCancelled else { continue }
+                    guard ar.sessionGeneration == snapshot.id.generation else { continue }
                     let duration = ProcessInfo.processInfo.systemUptime - started
                     continuation.yield(.frame(Self.batch(from: snapshot, detections: receipt.frame.detections,
                                                         trackingReason: reason, inferenceDuration: duration,

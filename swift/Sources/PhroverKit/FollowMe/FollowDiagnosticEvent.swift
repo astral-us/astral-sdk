@@ -68,10 +68,12 @@ final class FollowDiagnosticEmitter {
     private let monotonic: @MainActor () -> Double
     private let utc: @MainActor () -> Date
     private var sequence: UInt64 = 0
+    private let deferredRuntime: Bool
 
     init(streamID: String, monotonic: @escaping @MainActor () -> Double,
          utc: @escaping @MainActor () -> Date,
-         sink: @escaping @MainActor (String, [String: String]) -> Void) {
+          sink: @escaping @MainActor (String, [String: String]) -> Void, deferredRuntime: Bool = false) {
+        self.deferredRuntime = deferredRuntime
         self.sink = sink
         self.streamID = streamID
         self.monotonic = monotonic
@@ -80,13 +82,28 @@ final class FollowDiagnosticEmitter {
 
     func emit(_ event: FollowDiagnosticEvent) {
         sequence += 1
+        let time = monotonic()
+        let date = utc()
+        if deferredRuntime {
+            let sequence = sequence
+            let streamID = streamID
+            RuntimeFileLog.appendDeferred(event.event, now: date) {
+                Self.serialize(event, sequence: sequence, streamID: streamID, time: time, date: date)
+            }
+        } else if let fields = Self.serialize(event, sequence: sequence, streamID: streamID, time: time, date: date) {
+            sink(event.event, fields)
+        }
+    }
+
+    nonisolated private static func serialize(_ event: FollowDiagnosticEvent, sequence: UInt64,
+                                              streamID: String, time: Double, date: Date) -> [String: String]? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var payload = FollowDiagnosticValue.jsonObject(event.payload)
         let envelope: [String: Any] = [
             "event": event.event, "schema_version": 1,
             "stream_id": streamID, "event_sequence": sequence,
-            "monotonic_s": monotonic(), "utc_time": formatter.string(from: utc()),
+            "monotonic_s": time, "utc_time": formatter.string(from: date),
             "stale": event.context.stale,
             "session_generation": event.context.sessionGeneration as Any? ?? NSNull(),
             "operation_id": event.context.operationID as Any? ?? NSNull(),
@@ -98,8 +115,8 @@ final class FollowDiagnosticEmitter {
         ]
         payload.merge(envelope) { _, authoritative in authoritative }
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              let json = String(data: data, encoding: .utf8) else { return }
-        sink(event.event, ["payload": json])
+              let json = String(data: data, encoding: .utf8) else { return nil }
+        return ["payload": json]
     }
 
     func hostTime() -> Double { monotonic() }

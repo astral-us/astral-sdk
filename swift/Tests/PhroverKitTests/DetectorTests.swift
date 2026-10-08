@@ -7,6 +7,97 @@ import simd
 @testable import PhroverKit
 
 final class DetectorTests: XCTestCase {
+    @MainActor
+    func testGenericImagePointProjectionDoesNotDependOnLocalInferenceCache() throws {
+        let ar = ARSessionManager()
+        var depth: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 8, 6, kCVPixelFormatType_DepthFloat32, nil, &depth)
+        let map = try XCTUnwrap(depth)
+        CVPixelBufferLockBaseAddress(map, [])
+        let values = CVPixelBufferGetBaseAddress(map)!.assumingMemoryBound(to: Float.self)
+        for row in 0..<6 { for col in 0..<8 { values[row * CVPixelBufferGetBytesPerRow(map) / 4 + col] = 2 } }
+        CVPixelBufferUnlockBaseAddress(map, [])
+        ar.ingestForTesting(image: makeImage(), timestamp: ProcessInfo.processInfo.systemUptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: map, trackingQuality: .normal)
+        let perception = ARPerceptionSource(ar: ar, detector: nil)
+        XCTAssertTrue(perception.detectObjects().isEmpty)
+        XCTAssertNotNil(perception.unproject(normalizedPoint: CGPoint(x: 0.5, y: 0.5)),
+            "Generic normalized image-point projection must not require a local object detector receipt")
+    }
+    @MainActor
+    func testSlowInferenceDoesNotBlockControlAndOnlyNewestQueuedFrameSurvives() async {
+        let entered = expectation(description: "inference held off actor")
+        let gate = DispatchSemaphore(value: 0)
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in
+            entered.fulfill()
+            _ = gate.wait(timeout: .now() + 3)
+            return []
+        })
+        entered.expectedFulfillmentCount = 1
+        entered.assertForOverFulfill = false
+        func snapshot(_ sequence: UInt64) -> ARFrameSnapshot {
+            .init(id: .init(generation: 1, sequence: sequence), timestamp: Double(sequence),
+                image: makeImage(), cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 8, height: 6), depthMap: nil,
+                pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        }
+        let first = Task { await detector.evaluateForFollowAsync(snapshot(1)) }
+        await fulfillment(of: [entered], timeout: 1)
+        // These actor operations must remain runnable while native inference is held.
+        XCTAssertNil(detector.latestFollowEvaluation)
+        let second = Task { await detector.evaluateForFollowAsync(snapshot(2)) }
+        for _ in 0..<20 { await Task.yield() }
+        let third = Task { await detector.evaluateForFollowAsync(snapshot(3)) }
+        for _ in 0..<20 { await Task.yield() }
+        first.cancel()
+        gate.signal(); gate.signal()
+        let a = await first.value
+        let b = await second.value
+        let c = await third.value
+        XCTAssertNil(a, "Cancelled inference cannot be handed to the control loop")
+        XCTAssertNil(b, "Superseded queued work is dropped rather than building a frame backlog")
+        XCTAssertEqual(c?.frame.frameID.sequence, 3)
+    }
+
+    @MainActor
+    func testMissionPerceptionDoesNotWaitForBusyPreviewInferenceLock() async {
+        let entered = expectation(description: "preview busy")
+        let gate = DispatchSemaphore(value: 0)
+        let detector = Detector(supportedLabels: ["chair"], detectionHandler: { _ in
+            entered.fulfill()
+            _ = gate.wait(timeout: .now() + 0.5)
+            return []
+        })
+        entered.assertForOverFulfill = false
+        let ar = ARSessionManager()
+        ar.ingestForTesting(image: makeImage(), timestamp: ProcessInfo.processInfo.systemUptime,
+            cameraTransform: matrix_identity_float4x4, intrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil, trackingQuality: .normal)
+        let preview = Task { await detector.evaluateForFollowAsync(ar.latestSnapshot!) }
+        await fulfillment(of: [entered], timeout: 1)
+        let perception = ARPerceptionSource(ar: ar, detector: detector)
+        let started = ProcessInfo.processInfo.systemUptime
+        XCTAssertTrue(perception.detectObjects().isEmpty)
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.1,
+            "Synchronous mission reads must use cached facts, never join inference")
+        gate.signal()
+        _ = await preview.value
+    }
+    @MainActor
+    func testFollowInferenceRunsAwayFromMainThreadAndKeepsSnapshotIdentity() async throws {
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in
+            XCTAssertFalse(Thread.isMainThread, "Inference must not occupy the control/UI actor")
+            return []
+        })
+        let snapshot = ARFrameSnapshot(id: .init(generation: 1, sequence: 7), timestamp: 100,
+            image: makeImage(), cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil,
+            pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        let result = await detector.evaluateForFollowAsync(snapshot)
+        XCTAssertEqual(result?.frame.frameID, snapshot.id)
+        XCTAssertEqual(result?.frame.monotonicTimestamp, 100)
+    }
     func testNativeBodyRequestDoesNotVerifyUniformEmptyImage() throws {
         var buffer: CVPixelBuffer?
         CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, nil, &buffer)

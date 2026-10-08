@@ -71,11 +71,12 @@ public enum FollowReacquisitionPlanner {
 
     /// Resolve only against an authoritative current yaw; the returned segment target
     /// stays fixed while the controller executes its pulses and corrections.
-    public static func resolveAbsoluteStage(stageHeading: Double, actualYaw: Double) -> SegmentDecision {
-        guard stageHeading.isFinite, actualYaw.isFinite else { return .unavailable }
+    public static func resolveAbsoluteStage(stageHeading: Double, actualYaw: Double,
+                                            maximumSegment: Double = .pi / 6) -> SegmentDecision {
+        guard stageHeading.isFinite, actualYaw.isFinite, maximumSegment.isFinite, maximumSegment > tolerance else { return .unavailable }
         let error = wrap(wrap(stageHeading) - actualYaw)
         if abs(error) <= tolerance { return .stageArrived }
-        let delta = min(abs(error), .pi / 6) * (error > 0 ? 1 : -1)
+        let delta = min(abs(error), maximumSegment, .pi / 6) * (error > 0 ? 1 : -1)
         return .turn(delta: delta, target: wrap(actualYaw + delta))
     }
     public static func wrap(_ angle: Double) -> Double {

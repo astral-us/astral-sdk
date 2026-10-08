@@ -3,6 +3,13 @@ import RoverNav
 import PhroverKit
 
 final class FollowReacquisitionPlannerTests: XCTestCase {
+    func testObservationSearchCanCapRecoverySegmentsAtTenDegrees() {
+        guard case .turn(let delta, _) = FollowReacquisitionPlanner.resolveAbsoluteStage(
+            stageHeading: 1, actualYaw: 0, maximumSegment: .pi / 18) else { return XCTFail() }
+        XCTAssertEqual(delta, .pi / 18, accuracy: 1e-12)
+        XCTAssertEqual(FollowReacquisitionPlanner.resolveAbsoluteStage(stageHeading: 1, actualYaw: 0,
+            maximumSegment: .nan), .unavailable)
+    }
     func testAbsoluteStageResolverContractUsesShortestSignedBoundedSegmentFromActualYaw() {
         let degrees = Double.pi / 180
         // Independently worked headings in degrees: crossing the seam, exact half

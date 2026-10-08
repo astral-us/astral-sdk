@@ -4,6 +4,118 @@ import CoreVideo
 @testable import PhroverKit
 
 final class RoverControlTests: XCTestCase {
+    func testTargetFenceCannotRelabelEarlierExpiryOrOwnershipInhibition() {
+        for earlier in ["expiry", "owner", "stale_snapshot"] {
+            let fence = FollowTurnBurstFence()
+            XCTAssertTrue(fence.publishValidity(from: 10, untilExclusive: earlier == "stale_snapshot" ? 10.010 : 11))
+            XCTAssertNotNil(fence.arm(entry: 10, budget: 0.080))
+            if earlier == "owner" { fence.inhibit() }
+            fence.inhibitForTarget(.tolerance, at: earlier == "expiry" ? 10.080 : 10.020)
+            XCTAssertNil(fence.targetStop, earlier)
+            XCTAssertFalse(fence.authorized(at: 10.021))
+        }
+    }
+
+    @MainActor
+    func testTargetReachedBeforeHTTPCompletesOnlyAfterConfirmedStopAndFreshPose() async throws {
+        for purpose in [FollowMotionPurpose.followScan, .followAlignment] {
+            try await runUnsentTargetFence(purpose: purpose, scenario: "within_tolerance")
+            try await runUnsentTargetFence(purpose: purpose, scenario: "crossed")
+        }
+    }
+
+    @MainActor
+    func testUnsentTargetFenceDoesNotMaskLostAuthorityOrUncertainTransport() async throws {
+        for scenario in ["drifted", "stale", "stop_failed", "entered_attempt", "expired", "unknown_fence", "tracking_lost"] {
+            try await runUnsentTargetFence(purpose: .followScan, scenario: scenario)
+        }
+    }
+
+    @MainActor
+    private func runUnsentTargetFence(purpose: FollowMotionPurpose, scenario: String) async throws {
+            StubURLProtocol.reset()
+            StubURLProtocol.results = Array(repeating: .success((Data(), HTTPURLResponse(
+                url: URL(string: "http://192.168.4.1/js")!, statusCode: 200, httpVersion: nil, headerFields: nil)!)), count: 5)
+            let clock = BurstTestClock(10)
+            let control = RoverControl(session: URLSession(configuration: .stubbed))
+            if scenario == "stop_failed" {
+                StubURLProtocol.results = [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,
+                    statusCode: 200, httpVersion: nil, headerFields: nil)!)), .failure(URLError(.badURL))]
+            }
+            var snapshot = NavigationPoseSample(pose: .init(position: .zero, yaw: 0),
+                frameID: .init(generation: 1, sequence: 1), sourceTimestamp: 9.99, trackingQuality: .normal)
+            var stops = 0
+            var completed = false
+            var denied: RoverCommandDiagnosticResult?
+            let sink = FollowDiagnosticRecordingSink()
+            var controller: NavigationController!
+            controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+                plan: { _, _ in nil }, lastAckAt: { await control.lastAckAt }, sendCommand: { _ in XCTFail() },
+                stopRover: { _ = try await control.stopWithReceipt().get(); stops += 1 },
+                sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { command in
+                    // A real fresh ingress event reaches tolerance while the
+                    // transport is queued, before its first HTTP attempt.
+                    clock.set(scenario == "expired" ? 10.400 : 10.302)
+                    snapshot = .init(pose: .init(position: .zero, yaw: scenario == "crossed" ? 0.31 : 0.29),
+                        frameID: .init(generation: 1, sequence: 3), sourceTimestamp: 10.301,
+                        trackingQuality: scenario == "tracking_lost" ? .limited : .normal)
+                    if scenario != "unknown_fence" { controller.ingestFollowTurnSource(snapshot) }
+                    let receipt: RoverCommandDiagnosticResult
+                    if scenario == "unknown_fence" {
+                        receipt = .init(receipt: .init(httpStatus: nil, acknowledged: false,
+                            acknowledgementUTC: nil, attempts: 0, outcome: "fenced"), failure: FollowTurnBurstTransportDenial.fenced)
+                    } else {
+                        receipt = await control.sendNavigationWithReceipt(command)
+                    }
+                    if scenario == "entered_attempt", let authority = FollowTurnBurstTransportScope.authorization {
+                        authority.didEnterAttempt?(.init(operationID: authority.operationID, attempt: 1, entryUptime: clock.now))
+                    }
+                    denied = receipt
+                    return receipt
+                }, diagnosticEmitter: .init(streamID: "target-before-http", monotonic: { clock.now }, utc: { Date() }, sink: sink.append),
+                poseSample: { snapshot }, sourceNow: { clock.now }, sourceStopSnapshot: { snapshot }, transportUptime: { clock.now })
+            let motion = NavigationFollowMeMotion(navigation: controller)
+            let task = Task {
+                let result = await motion.perform(purpose == .followScan ? .scan(0.3) : .alignment(0.3), context:
+                    .init(sessionGeneration: 1, requestToken: 1, purpose: purpose, phase: "searching"))
+                completed = true
+                return result
+            }
+            for _ in 0..<2000 where stops < 1 { await Task.yield() }
+            clock.set(10.301)
+            snapshot = .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 2),
+                sourceTimestamp: 10.2, trackingQuality: .normal)
+            controller.ingestFollowTurnSource(snapshot)
+            for _ in 0..<4000 where stops < 2 && !completed { await Task.yield() }
+            for _ in 0..<100 { await Task.yield() }
+            if ["within_tolerance", "crossed", "drifted", "stale"].contains(scenario) {
+                XCTAssertFalse(completed, "A pre-send tolerance trigger is not stopped arrival")
+            }
+            XCTAssertEqual(denied?.receipt.outcome, scenario == "expired" ? "expired" : "fenced", scenario)
+            XCTAssertEqual(denied?.receipt.attempts, 0)
+            clock.set(10.603)
+            snapshot = .init(pose: .init(position: .zero, yaw: 0.3), frameID: .init(generation: 1, sequence: 4),
+                sourceTimestamp: scenario == "stale" ? 10.0 : 10.602, trackingQuality: .normal)
+            if scenario == "drifted" {
+                snapshot = .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 4),
+                    sourceTimestamp: 10.602, trackingQuality: .normal)
+            }
+            controller.ingestFollowTurnSource(snapshot)
+            let result = await task.value
+            let expected: NavigationResult
+            switch scenario {
+            case "within_tolerance", "crossed": expected = .arrived
+            case "drifted", "expired": expected = .failed(.rotationResolutionInsufficient)
+            case "stale", "tracking_lost": expected = .failed(.trackingLost)
+            default: expected = .failed(.commandFailed)
+            }
+            XCTAssertEqual(result.result, expected, scenario)
+            if scenario == "within_tolerance" || scenario == "crossed" { XCTAssertNil(result.failure) }
+            XCTAssertEqual(result.stopOutcome, scenario == "stop_failed" ? .failed : .confirmed, scenario)
+            XCTAssertEqual(stops, scenario == "stop_failed" ? 1 : 2, scenario)
+            XCTAssertEqual(StubURLProtocol.requestCount, 2, "Only initial and final stop HTTP requests")
+            XCTAssertFalse(sink.records.contains { $0.event == "follow_scan.burst_response" }, "Unsent commands cannot train calibration")
+    }
     func testPreparedSnapshotRechecksBurstExpiryAtItsFinalClockRead() async {
         StubURLProtocol.reset()
         StubURLProtocol.results = [.success((Data(), HTTPURLResponse(url: URL(string: "http://192.168.4.1/js")!,

@@ -117,6 +117,12 @@ public final class FollowMeCoordinator {
     private var poseDeadline: TimeInterval?
     private var scanRotation: Double = 0
     private var scanning = false
+    private struct ScanObservationGate {
+        let until: TimeInterval
+        let afterFrame: ARFrameID
+    }
+    private var scanObservation: ScanObservationGate?
+    private var scanResponseSeed: FollowScanResponseSeed?
     private var lastGoal: Vec2?
     private var lastGoalTime: TimeInterval?
     private var latestFrame: ARFrameID?
@@ -192,6 +198,8 @@ public final class FollowMeCoordinator {
         perceptionReady = false
         scanRotation = 0
         scanning = false
+        scanObservation = nil
+        scanResponseSeed = nil
         lastGoal = nil
         lastGoalTime = nil
         latestFrame = nil
@@ -1158,11 +1166,18 @@ public final class FollowMeCoordinator {
         operation &+= 1
         let id = operation
         let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id, purpose: purpose,
-            phase: String(describing: state), scanUsed: scanUsed, scanRemaining: scanRemaining)
+            phase: String(describing: state), scanUsed: scanUsed, scanRemaining: scanRemaining,
+            scanResponseSeed: purpose == .followScan && scanResponseSeed?.sourceGeneration == latestFrame?.generation ? scanResponseSeed : nil)
         activeRequest = context
         movementTask = Task { [weak self] in
             let result = await action(context)
             guard let self else { return }
+            if self.generation == token, self.operation == id, result.result == .arrived,
+               result.context.request == context, result.failure == nil, result.stopOutcome == .confirmed,
+               let learned = result.measuredScanResponse,
+               learned.sourceGeneration == self.latestFrame?.generation, learned.responseRate.isFinite {
+                self.retainScanResponse(learned)
+            }
             _ = await self.consumeResult(result)
         }
     }
@@ -1177,8 +1192,27 @@ public final class FollowMeCoordinator {
         return age >= 0 && age <= config.maximumObservationAge
     }
 
+    private func retainScanResponse(_ learned: FollowScanResponseSeed) {
+        let previous = scanResponseSeed?.sourceGeneration == learned.sourceGeneration ? scanResponseSeed?.responseRate ?? 0 : 0
+        scanResponseSeed = .init(sourceGeneration: learned.sourceGeneration, responseRate: max(previous, learned.responseRate))
+    }
+
+    private func beginScanObservation() {
+        guard config.scanObservationSeconds > 0, let latestFrame else { return }
+        let gate = ScanObservationGate(until: clock.now + config.scanObservationSeconds, afterFrame: latestFrame)
+        scanObservation = gate
+        log("follow_search.look_started", extra: ["until_uptime_s": String(gate.until)])
+    }
+
     private func scan(generation token: UInt64) {
         guard generation == token, !scanning, canScan else { return }
+        if let gate = scanObservation {
+            guard clock.now >= gate.until, let batch = latestBatch, batch.timestamp >= gate.until,
+                  batch.frameID.generation == gate.afterFrame.generation,
+                  batch.frameID.sequence > gate.afterFrame.sequence else { return }
+            scanObservation = nil
+            log("follow_search.look_completed")
+        }
         if state == .reacquiring { scanRecovery(generation: token); return }
         let limit = min(2 * .pi, config.maximumScanRotation)
         if state == .searching && scanRotation >= limit - 0.0001 {
@@ -1203,6 +1237,9 @@ public final class FollowMeCoordinator {
             await rotation?.value
             guard let self, self.generation == token, self.operation == id else { return }
             self.scanning = false
+            if self.state == .searching, self.config.scanObservationSeconds > 0 {
+                self.beginScanObservation()
+            }
             if self.state == .searching || self.state == .reacquiring { self.scan(generation: token) }
         }
     }
@@ -1387,9 +1424,11 @@ public final class FollowMeCoordinator {
         guard let authorization = recoveryAuthorization(generation: token, operation: id) else { return }
         let request = FollowRecoveryHeadingRequest(stageHeading: FollowReacquisitionPlanner.wrap(
             center.heading + FollowReacquisitionPlanner.offsets[episode.stageIndex]), authorization: authorization,
-            stageIndex: episode.stageIndex, segmentIndex: episode.segmentIndex)
+            stageIndex: episode.stageIndex, segmentIndex: episode.segmentIndex,
+            maximumSegment: min(config.scanIncrement, .pi / 6))
         let context = FollowMotionRequestContext(sessionGeneration: token, requestToken: id,
-            purpose: .followScan, phase: String(describing: state))
+            purpose: .followScan, phase: String(describing: state),
+            scanResponseSeed: scanResponseSeed?.sourceGeneration == latestFrame?.generation ? scanResponseSeed : nil)
         activeRequest = context
         scanning = true
         emitRecovery("request_started", reason: "absolute_stage_requested", episode: episode,
@@ -1403,6 +1442,7 @@ public final class FollowMeCoordinator {
             if self.recoveryExpired { _ = await self.expireRecovery(generation: token); return }
             self.scanning = false
             self.movementTask = nil
+            if result.result == .arrived, result.stopOutcome == .confirmed { self.beginScanObservation() }
             self.emitRecovery("request_completed", reason: String(describing: result.result),
                 stop: result.stopOutcome.rawValue,
                 extra: FollowReacquisitionDiagnostics.segmentPayload(result.recovery).merging([
@@ -1411,7 +1451,10 @@ public final class FollowMeCoordinator {
             guard self.canScan, result.result == .arrived, result.stopOutcome == .confirmed,
                   let evidence = result.recovery, let source = evidence.arrivalSource,
                   let actual = self.recoveryPose(source, expectedGeneration: anchor.frameID.generation),
-                  let current = self.recoveryEpisode else { return }
+                   let current = self.recoveryEpisode else { return }
+            if result.context.request == context, result.failure == nil,
+               let learned = result.measuredScanResponse, learned.sourceGeneration == anchor.frameID.generation,
+               learned.responseRate.isFinite { self.retainScanResponse(learned) }
             // The measured stage gate owns progression; command counts and result labels do not.
             let stageArrival = current.recordingArrival(actual: actual, now: self.clock.now)
             if stageArrival.stageIndex != current.stageIndex {

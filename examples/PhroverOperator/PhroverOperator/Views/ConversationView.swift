@@ -277,13 +277,13 @@ private struct LiveCameraDebugPanel: View {
     @MainActor
     private func refreshLoop() async {
         while !Task.isCancelled {
-            refresh()
+            await refresh()
             try? await Task.sleep(for: .milliseconds(500))
         }
     }
 
     @MainActor
-    private func refresh() {
+    private func refresh() async {
         guard let snapshot = ar.latestSnapshot else {
             previewImage = nil
             predictions = []
@@ -299,7 +299,8 @@ private struct LiveCameraDebugPanel: View {
             return
         }
         let now = ProcessInfo.processInfo.systemUptime
-        let evaluation = detector.followPreviewEvaluation(snapshot, at: now)
+        guard let evaluation = await detector.followPreviewEvaluationAsync(snapshot, at: now), !Task.isCancelled,
+              ar.sessionGeneration == evaluation.snapshot.id.generation else { return }
         previewImage = Self.previewImage(from: evaluation.snapshot.image)
         predictions = evaluation.receipt.frame.detections
         personVerification = evaluation.receipt.personVerification

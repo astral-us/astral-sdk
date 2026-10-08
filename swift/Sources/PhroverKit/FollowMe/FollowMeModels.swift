@@ -43,7 +43,10 @@ public struct FollowMeConfiguration {
     public var minimumHoldDistance: Double = 1.25
     public var readySignalClearance: Double { minimumHoldDistance + 0.12 }
     public var maximumHoldDistance: Double = 1.75
-    public var scanIncrement: Double = .pi / 6
+    public var scanIncrement: Double = .pi / 18
+    /// Stationary observation after each completed search step. The next step
+    /// requires a healthy processed capture taken after this interval.
+    public var scanObservationSeconds: TimeInterval = 1
     public var maximumScanRotation: Double = 2 * .pi
     public var minimumGoalChange: Double = 0.30
     public var maximumGoalUpdatesPerSecond: Double = 3
