@@ -2,7 +2,65 @@ import XCTest
 import PhroverKit
 
 final class FollowTurnBurstPlannerTests: XCTestCase {
+    func testRecordedSearchResponseDoesNotPayLatencyAndCoastTwice() {
+        let calibration = initial(0.5230183705041618)
+        let profile = Planner.Profile(purpose: .scan)
+        let response = Planner.Response(operationID: 1, generation: 7, targetYaw: calibration.targetYaw,
+            clockDomain: "test_uptime", requestedBudget: 0.080, sendEntryUptime: 100,
+            sendResponseUptime: 100.119902333332, stopObligationUptime: 100.080,
+            stopAcknowledgementUptime: 100.234568791666,
+            samples: [sample(0, 1, 99.99), sample(0.094628303215284, 2, 100.24),
+                      sample(0.21568743294197268, 3, 100.55)])
+        let reduced = Planner.recording(response, in: calibration, profile: profile)
+        XCTAssertNil(reduced.rejection)
+        XCTAssertEqual(reduced.calibration.responseRate, 2.6960929117746586, accuracy: 1e-10)
+        XCTAssertEqual(reduced.calibration.observedPostAckTravel ?? -1, 0.12105912972668875, accuracy: 1e-10)
+        let actual = calibration.targetYaw - 0.27021642704802606
+        guard case let .burst(direction, budget) = Planner.plan(.init(actualYaw: actual, profile: profile,
+            calibration: reduced.calibration, sendEntryUptime: 101, provisionalProbeIssued: true)) else {
+            return XCTFail("A valid 12.36-degree response must not become an impossible search solely from double-counted latency")
+        }
+        XCTAssertEqual(direction, 1)
+        XCTAssertEqual(budget, 0.05491034035283891, accuracy: 1e-10)
+        XCTAssertLessThan(budget, 0.080)
+    }
     private typealias Planner = FollowTurnBurstPlanner
+    func testLearningUsesWholeBurstTravelPerRequestedBudgetNotPeakSourceVelocity() {
+        let calibration = initial(1)
+        let profile = Planner.Profile(purpose: .scan)
+        // The same total response sampled at different source cadences must
+        // produce the same end-to-end gain, not a peak-velocity time model.
+        for middleTime in [99.901, 100.0] {
+            let reduced = Planner.recording(response(calibration, samples: [sample(0),
+                sample(0.1, 2, middleTime), sample(0.2, 3, 100.4)]), in: calibration, profile: profile)
+            XCTAssertNil(reduced.rejection)
+            XCTAssertEqual(reduced.calibration.responseRate, 2.5, accuracy: 1e-10)
+        }
+        let reversing = Planner.recording(response(calibration, samples: [sample(0),
+            sample(0.5, 2, 100), sample(0.2, 3, 100.4)]), in: calibration, profile: profile)
+        XCTAssertEqual(reversing.calibration.responseRate, 10, accuracy: 1e-10,
+            "Reversal must not cancel travelled angle and underestimate the next response")
+    }
+
+    func testIncompleteResponseCannotAuthorizeAnotherProbeAndPurposeTolerancesStayDistinct() {
+        let calibration = initial(0.3)
+        let unknown = Planner.recording(response(calibration), in: calibration, profile: .init(purpose: .scan))
+        XCTAssertEqual(Planner.plan(.init(actualYaw: 0, profile: .init(purpose: .scan),
+            calibration: unknown.calibration, sendEntryUptime: 101, provisionalProbeIssued: true)),
+            .resolutionFailure(.rotationResolutionInsufficient))
+        let measured = Planner.recording(response(calibration, samples: [sample(0), sample(0.2, 2, 100.4)]),
+            in: calibration, profile: .init(purpose: .scan))
+        XCTAssertEqual(Planner.plan(.init(actualYaw: 0.2, profile: .init(purpose: .scan),
+            calibration: measured.calibration, sendEntryUptime: 101)), .arrived)
+        guard case .burst(_, let budget) = Planner.plan(.init(actualYaw: 0.2, profile: .init(purpose: .alignment),
+            calibration: measured.calibration, sendEntryUptime: 101)) else { return XCTFail("Alignment retains its tighter gate") }
+        XCTAssertEqual(budget, 0.020, accuracy: 1e-10)
+        let laterMissing = Planner.recording(response(calibration, entry: 101),
+            in: measured.calibration, profile: .init(purpose: .alignment))
+        XCTAssertEqual(Planner.plan(.init(actualYaw: 0, profile: .init(purpose: .alignment),
+            calibration: laterMissing.calibration, sendEntryUptime: 102)),
+            .resolutionFailure(.rotationResolutionInsufficient), "Earlier calibration cannot rescue missing current response evidence")
+    }
     private func plan(target: Double, actual: Double = 0, purpose: Planner.Purpose = .alignment,
                       entry: Double = 100, authorized: Bool = true) -> Planner.Decision {
         Planner.plan(.init(actualYaw: actual, profile: .init(purpose: purpose),
@@ -69,7 +127,7 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
         XCTAssertEqual(reduced.calibration.responseRate, 2.0943951023931953, accuracy: 1e-14)
     }
 
-    func testMeasuredLatencyTerminatesSmallCorrectionAndUnrepresentableDeadlineWithoutRetry() {
+    func testUnmeasuredResponseAndUnrepresentableDeadlineCannotAuthorizeRetry() {
         let calibration = initial()
         let reduced = Planner.recording(response(calibration), in: calibration, profile: .init(purpose: .alignment)).calibration
         XCTAssertEqual(Planner.plan(.init(actualYaw: 0, profile: .init(purpose: .alignment), calibration: reduced,
@@ -137,7 +195,7 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
         guard case let .burst(direction, budget) = Planner.plan(.init(actualYaw: -0.4, profile: profile,
             calibration: first.calibration, sendEntryUptime: 101)) else { return XCTFail() }
         XCTAssertEqual(direction, 1)
-        XCTAssertEqual(budget, 0.04666666666666667, accuracy: 1e-12)
+        XCTAssertEqual(budget, 0.080, accuracy: 1e-12, "Full-response gain already includes latency and post-ack travel")
         let low = Planner.recording(response(calibration, samples: [sample(0, 4, 100.9), sample(0, 5, 101.4)],
             send: 0.001, stop: 0.001, entry: 101), in: first.calibration, profile: profile)
         XCTAssertNil(low.rejection)
@@ -149,7 +207,7 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
         XCTAssertNil(single.calibration.observedPostAckTravel, "A single post-ack frame cannot establish zero coast")
         let consecutive = Planner.recording(response(calibration, samples: [sample(0), sample(0.5, 2, 100),
             sample(0.2, 3, 100.4)]), in: calibration, profile: profile)
-        XCTAssertEqual(consecutive.calibration.responseRate, 5, accuracy: 1e-10)
+        XCTAssertEqual(consecutive.calibration.responseRate, 10, accuracy: 1e-10)
         let negative = Planner.recording(response(calibration, samples: [sample(-3.1), sample(2.983185307179586, 2, 100.1),
             sample(2.883185307179586, 3, 100.4)]), in: calibration, profile: profile)
         XCTAssertEqual(negative.calibration.responseRate, 3.75, accuracy: 1e-12)
@@ -231,14 +289,14 @@ final class FollowTurnBurstPlannerTests: XCTestCase {
         XCTAssertEqual(forged.calibration, first.calibration)
     }
 
-    func testExactlyZeroCandidateIsTerminalAndStopAllowanceIncludesPendingSendDrain() {
+    func testLatencyTelemetryIncludesPendingDrainWithoutDeductingItFromMeasuredResponse() {
         let calibration = initial(0.3625)
         let profile = Planner.Profile(purpose: .alignment)
         let measured = Planner.recording(response(calibration, samples: [sample(0), sample(0.2, 2, 100.6)],
             send: 0, stop: 0.125), in: calibration, profile: profile)
         XCTAssertNil(measured.rejection)
         XCTAssertEqual(Planner.plan(.init(actualYaw: 0, profile: profile, calibration: measured.calibration,
-            sendEntryUptime: 101)), .resolutionFailure(.rotationResolutionInsufficient))
+            sendEntryUptime: 101)), .burst(direction: 1, budget: 0.080))
         let drain = Planner.Response(operationID: 1, generation: 7, targetYaw: 1, clockDomain: "test_uptime",
             requestedBudget: 0.080, sendEntryUptime: 100, sendResponseUptime: 100.2,
             stopObligationUptime: 100.08, stopAcknowledgementUptime: 100.23, samples: [])

@@ -7,6 +7,53 @@ import ImageIO
 
 @MainActor
 final class ARFollowMePerceptionSourceTests: XCTestCase {
+    func testLiveFollowRequiresMatchingBodyDespitePerfectRawPersonScore() async throws {
+        for scenario in ["none", "matched", "failed", "unavailable"] {
+            try await checkLiveBodyVerification(scenario)
+        }
+    }
+
+    private func checkLiveBodyVerification(_ scenario: String) async throws {
+        var bodyOrientations: [CGImagePropertyOrientation] = []
+        let handler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])?
+        if scenario == "unavailable" { handler = nil }
+        else {
+            handler = { _, orientation in
+                bodyOrientations.append(orientation)
+                if scenario == "failed" { throw URLError(.cannotDecodeContentData) }
+                if scenario == "none" { return [] }
+                func joint(_ x: Double, _ y: Double) -> PersonBodyVerifier.Joint {
+                    .init(location: CGPoint(x: x, y: y), confidence: 0.9)
+                }
+                return [.init(leftShoulder: joint(0.4, 0.7), rightShoulder: joint(0.6, 0.7),
+                    leftHip: joint(0.43, 0.4), rightHip: joint(0.57, 0.4))]
+            }
+        }
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in
+            [.init(label: "person", confidence: 1, boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6))]
+        }, bodyPoseHandler: handler)
+        var image: CVPixelBuffer?
+        var depth: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_32BGRA, nil, &image)
+        CVPixelBufferCreate(kCFAllocatorDefault, 20, 20, kCVPixelFormatType_DepthFloat32, nil, &depth)
+        let map = try XCTUnwrap(depth)
+        CVPixelBufferLockBaseAddress(map, [])
+        let base = CVPixelBufferGetBaseAddress(map)!.assumingMemoryBound(to: Float.self)
+        for row in 0..<20 { for col in 0..<20 { base[row * CVPixelBufferGetBytesPerRow(map) / 4 + col] = 2 } }
+        CVPixelBufferUnlockBaseAddress(map, [])
+        let ar = ARSessionManager()
+        var stream = ARFollowMePerceptionSource(ar: ar, detector: detector).events().makeAsyncIterator()
+        ar.ingestForTesting(image: try XCTUnwrap(image), timestamp: 1, cameraTransform: matrix_identity_float4x4,
+            intrinsics: matrix_identity_float3x3, imageResolution: CGSize(width: 20, height: 20),
+            depthMap: map, trackingQuality: .normal)
+        guard case .frame(let batch)? = await stream.next() else { return XCTFail("Expected frame") }
+        XCTAssertEqual(bodyOrientations, scenario == "unavailable" ? [] : [.right])
+        XCTAssertEqual(batch.perceptionDiagnostics?.rawPersonCount, 1)
+        XCTAssertEqual(batch.perceptionDiagnostics?.projectionAttemptedCount, scenario == "matched" ? 1 : 0)
+        XCTAssertEqual(batch.people.count, scenario == "matched" ? 1 : 0, "Raw score alone cannot create a motion-eligible person")
+        XCTAssertEqual(batch.perceptionDiagnostics?.personVerification?.first?.accepted, scenario == "matched")
+        XCTAssertEqual(detector.latestFollowEvaluation?.receipt.frame.frameID, batch.frameID)
+    }
     func testLiveFollowDoesNotProjectAsymmetricFallbackBoxUsingRightInverse() async throws {
         var orientations: [CGImagePropertyOrientation] = []
         let detector = Detector(supportedLabels: ["person"], visionHandler: { _, orientation in

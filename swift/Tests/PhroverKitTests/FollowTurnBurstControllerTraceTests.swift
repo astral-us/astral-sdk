@@ -4,6 +4,83 @@ import RoverNav
 
 @MainActor
 final class FollowTurnBurstControllerTraceTests: XCTestCase {
+    func testSeparateReadTimesRejectInvalidEvaluationAndPreserveAdjacentIngressBoundary() throws {
+        func point(_ sequence: UInt64, _ sourceTime: Double, _ collected: Double, _ yaw: Double) -> FollowTurnBurstPlanner.Sample {
+            .init(yaw: yaw, sequence: sequence, generation: 4, sourceTimestamp: sourceTime,
+                collectedUptime: collected, clockDomain: "ar_system_uptime", healthy: true)
+        }
+        let first = point(2, 10.2, 10.205, 0)
+        let middle = point(3, 10.24, 10.250, 0.01)
+        let last = point(4, 10.72, 10.725, 0.03)
+        let planning = point(2, 10.2, 10.301, 0)
+        let stopped = point(4, 10.72, 10.82, 0.03)
+        let calibration = FollowTurnBurstPlanner.Calibration(operationID: 1, generation: 4,
+            targetYaw: 0.5, clockDomain: "ar_system_uptime")
+        let profile = FollowTurnBurstPlanner.Profile(purpose: .alignment)
+        func response(_ plan: FollowTurnBurstPlanner.Sample, _ stop: FollowTurnBurstPlanner.Sample,
+                      samples: [FollowTurnBurstPlanner.Sample] = [first, middle, last]) -> FollowTurnBurstPlanner.Response {
+            .init(operationID: 1, generation: 4, targetYaw: 0.5, clockDomain: "ar_system_uptime",
+                requestedBudget: 0.080, sendEntryUptime: 10.301, sendResponseUptime: 10.4,
+                stopObligationUptime: 10.4, stopAcknowledgementUptime: 10.5, samples: samples,
+                planningEvaluation: plan, stoppedEvaluation: stop)
+        }
+        for read in [point(4, 10.72, 11.3, 0.03), point(4, 10.72, 10.799, 0.03),
+                     point(5, 10.72, 10.82, 0.03), point(4, 10.73, 10.82, 0.03)] {
+            XCTAssertEqual(FollowTurnBurstPlanner.recording(response(planning, read), in: calibration,
+                profile: profile).rejection, "invalid_control_evaluation")
+        }
+        XCTAssertEqual(FollowTurnBurstPlanner.recording(response(point(2, 10.2, 10.701, 0), stopped),
+            in: calibration, profile: profile).rejection, "invalid_control_evaluation")
+        XCTAssertEqual(FollowTurnBurstPlanner.recording(response(planning, stopped,
+            samples: [first, point(3, 10.24, 10.204, 0.01), last]), in: calibration,
+            profile: profile).rejection, "invalid_source_at_collection")
+        XCTAssertEqual(FollowTurnBurstPlanner.recording(response(planning, stopped,
+            samples: [first, point(3, 10.201, 10.204, 0.01), last]), in: calibration,
+            profile: profile).rejection, "nonadvancing_source", "Genuine ingress time regression is still invalid")
+        XCTAssertEqual(FollowTurnBurstPlanner.recording(response(planning, stopped,
+            samples: [first, point(3, 10.24, 10.250, 0.01), point(4, 10.23, 10.725, 0.03)]),
+            in: calibration, profile: profile).rejection, "nonadvancing_source")
+        let valid = FollowTurnBurstPlanner.recording(response(planning, stopped), in: calibration, profile: profile)
+        XCTAssertNil(valid.rejection)
+        XCTAssertEqual(valid.calibration.lastSourceSample, last, "Reuse retains the immutable ingress endpoint, not its later read")
+        let next = FollowTurnBurstPlanner.Response(operationID: 1, generation: 4, targetYaw: 0.5,
+            clockDomain: "ar_system_uptime", requestedBudget: 0.002, sendEntryUptime: 10.901,
+            sendResponseUptime: 10.95, stopObligationUptime: 10.903, stopAcknowledgementUptime: 11,
+            samples: [last, point(5, 10.84, 10.845, 0.04), point(6, 11.21, 11.215, 0.05)],
+            planningEvaluation: point(4, 10.72, 10.9, 0.03),
+            stoppedEvaluation: point(6, 11.21, 11.32, 0.05))
+        let repeated = FollowTurnBurstPlanner.recording(next, in: valid.calibration, profile: profile)
+        XCTAssertNil(repeated.rejection)
+        XCTAssertEqual(repeated.calibration.completedResponses, 2)
+    }
+
+    func testArchiveCaptureTimesRemainOrderedDespiteDelayedBoundaryReads() throws {
+        let first = sample(2, 10.2)
+        let middle = sample(3, 10.24, yaw: 0.01)
+        let last = sample(4, 10.72, yaw: 0.03)
+        var archive = FollowTurnPoseEvidenceArchive()
+        archive.record(first, at: 10.205)
+        archive.record(middle, at: 10.250)
+        archive.record(last, at: 10.725)
+        var bracket = FollowTurnResponseBracket(start: first, at: 10.301, generation: 4, boundary: nil)
+        bracket.collect(last, at: 10.82, healthy: true, settled: true)
+        let complete = bracket.usingIngressEvidence(archive.evidence(
+            from: .init(generation: 4, sequence: 2), through: .init(generation: 4, sequence: 4)))
+        XCTAssertEqual(complete.samples.map(\.collectedUptime), [10.205, 10.250, 10.725])
+        XCTAssertEqual(complete.planningEvaluation.collectedUptime, 10.301)
+        XCTAssertEqual(complete.stoppedEvaluation?.collectedUptime, 10.82)
+        let response = FollowTurnBurstPlanner.Response(operationID: 1, generation: 4, targetYaw: 0.5,
+            clockDomain: "ar_system_uptime", requestedBudget: 0.080, sendEntryUptime: 10.301,
+            sendResponseUptime: 10.4, stopObligationUptime: 10.4, stopAcknowledgementUptime: 10.5,
+            samples: complete.samples, traversalUnambiguous: complete.unambiguous,
+            planningEvaluation: complete.planningEvaluation, stoppedEvaluation: complete.stoppedEvaluation)
+        let calibration = FollowTurnBurstPlanner.Calibration(operationID: 1, generation: 4,
+            targetYaw: 0.5, clockDomain: "ar_system_uptime")
+        let reduction = FollowTurnBurstPlanner.recording(response, in: calibration, profile: .init(purpose: .alignment))
+        XCTAssertNil(reduction.rejection)
+        XCTAssertEqual(reduction.calibration.completedResponses, 1)
+        XCTAssertEqual(reduction.signedResponse ?? -1, 0.03, accuracy: 1e-12)
+    }
     func testHealthyIngressCannotEraseUnhealthyControlCollection() throws {
         let start = sample(2, 10.2)
         let end = sample(3, 10.81, yaw: 0.03)
@@ -81,8 +158,8 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
                 sends += 1
                 // Frame 3 exists at ingress but is intentionally not delivered
                 // to the newest-only control consumer.
-                let intermediate = self.sample(3, 10.32, yaw: 0.01)
-                archive.record(intermediate, at: 10.33)
+                let intermediate = self.sample(3, 10.24, yaw: 0.01)
+                archive.record(intermediate, at: 10.25)
                 if !coalescedControl {
                     uptime = 10.33
                     holder.controller.ingestFollowTurnSource(intermediate)
@@ -98,7 +175,7 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
             .init(sessionGeneration: 1, requestToken: 1, purpose: .followAlignment, phase: "aligning")) }
         for _ in 0..<2000 where stops == 0 { await Task.yield() }
         uptime = 10.301; snapshot = sample(2, 10.2)
-        archive.record(snapshot, at: uptime); controller.ingestFollowTurnSource(snapshot)
+        archive.record(snapshot, at: 10.205); controller.ingestFollowTurnSource(snapshot)
         for _ in 0..<2000 where stops < 2 { await Task.yield() }
         XCTAssertEqual(stops, 2)
         uptime = 10.701; snapshot = sample(5, 10.70, yaw: 0.025)
@@ -111,6 +188,15 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
         XCTAssertEqual(response["bracket_valid"] as? Bool, available)
         XCTAssertEqual(response["bracket_sample_count"] as? Int, 4)
         XCTAssertEqual(response["completed_responses"] as? Int, available ? 1 : 0)
+        if available {
+            let points = try XCTUnwrap(response["source_bracket"] as? [[String: Any]])
+            XCTAssertEqual(points.first?["collection_uptime_s"] as? Double, 10.205)
+            XCTAssertEqual(points[1]["collection_uptime_s"] as? Double, 10.25)
+            let planning = try XCTUnwrap(response["planning_control_evaluation"] as? [String: Any])
+            let stopped = try XCTUnwrap(response["stopped_control_evaluation"] as? [String: Any])
+            XCTAssertEqual(planning["evaluation_uptime_s"] as? Double, 10.301)
+            XCTAssertEqual(stopped["evaluation_uptime_s"] as? Double, 10.701)
+        }
     }
 
     private final class PreparationState {
@@ -350,7 +436,8 @@ final class FollowTurnBurstControllerTraceTests: XCTestCase {
         let measured = try XCTUnwrap(try records(sink).first { $0["event"] as? String == "follow_scan.burst_response" })
         XCTAssertEqual(try XCTUnwrap(measured["response_signed_net_rad"] as? Double), 0.3, accuracy: 1e-12)
         XCTAssertEqual(try XCTUnwrap(measured["response_sampled_absolute_travel_rad"] as? Double), 0.4, accuracy: 1e-12)
-        XCTAssertEqual(try XCTUnwrap(measured["effective_budget_response_rate_rad_s"] as? Double), 3.75, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(measured["effective_budget_response_rate_rad_s"] as? Double), 5, accuracy: 1e-12,
+            "End-to-end gain retains reversal travel instead of cancelling it from the net angle")
         XCTAssertEqual(try XCTUnwrap(measured["observed_post_ack_travel_rad"] as? Double), 0.02, accuracy: 1e-12)
         XCTAssertEqual(measured["post_ack_travel_confidence"] as? String, "partial_sampled")
         XCTAssertEqual(measured["unsampled_coast_confidence"] as? String, "unknown")

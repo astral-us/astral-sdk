@@ -24,9 +24,10 @@ final class FollowTurnBurstDiagnosticTrace {
         retain(calibration)
         fields["planning_uptime_s"] = .number(uptime)
         fields["controller_phase"] = .string("stopped_planning")
-        fields["budget_formula"] = .string("min(maximum,max(0,E/R-A-C/R),overshootCeiling)")
+        fields["budget_formula"] = .string("min(maximum,E/R,overshootCeiling)")
         fields["budget_units"] = .string("angles_rad;rates_rad/s;durations_s;wheels_m/s")
-        fields["allowance_policy"] = .string("conservative_send_plus_stop_including_drain;effective_rate_latency_double_count")
+        fields["allowance_policy"] = .string("included_in_measured_response;diagnostic_only")
+        fields["response_model"] = .string("operation_max_sampled_travel_per_requested_budget")
         fields["tolerance_rad"] = .number(profile.tolerance)
         fields["excess_rad"] = Self.number(excess)
         fields["signed_error_rad"] = Self.number(error)
@@ -40,10 +41,7 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["minimum_host_budget_s"] = .null
         fields["budget_floor_policy"] = .string("no_hard_floor")
         fields["reference_rate_provenance"] = .string("provisional_120deg_per_s_not_certified")
-        fields["candidate_budget_s"] = Self.number(excess.map {
-            $0 / calibration.responseRate - (calibration.maximumSendDuration ?? 0)
-                - (calibration.maximumStopDuration ?? 0) - (calibration.observedPostAckTravel ?? 0) / calibration.responseRate
-        })
+        fields["candidate_budget_s"] = Self.number(excess.map { $0 / calibration.responseRate })
         fields["planning_source"] = .object(Self.source(sample, uptime: uptime))
         switch decision {
         case .burst(let direction, let budget):
@@ -72,6 +70,17 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["response_signed_net_rad"] = Self.number(reduction.signedResponse)
         fields["response_sampled_absolute_travel_rad"] = Self.number(reduction.sampledAbsoluteTravel)
         fields["previous_requested_budget_s"] = .number(response.requestedBudget)
+        func evaluation(_ sample: FollowTurnBurstPlanner.Sample?) -> FollowDiagnosticValue {
+            guard let sample else { return .null }
+            return .object(["frame_id": Self.frame(sample),
+                "source_timestamp_s": Self.number(sample.sourceTimestamp),
+                "evaluation_uptime_s": .number(sample.collectedUptime),
+                "age_at_evaluation_s": Self.number(sample.sourceTimestamp.map { sample.collectedUptime - $0 }),
+                "yaw_rad": .number(sample.yaw), "healthy_at_evaluation": .bool(sample.healthy),
+                "clock": sample.clockDomain.map { .string($0) } ?? .null])
+        }
+        fields["planning_control_evaluation"] = evaluation(response.planningEvaluation)
+        fields["stopped_control_evaluation"] = evaluation(response.stoppedEvaluation)
         fields["source_bracket"] = .array(response.samples.prefix(128).map { sample in .object([
             "frame_id": Self.frame(sample),
             "source_timestamp_s": Self.number(sample.sourceTimestamp), "collection_uptime_s": .number(sample.collectedUptime),
@@ -101,7 +110,7 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["maximum_consecutive_source_rate_rad_s"] = Self.number(rates.max())
         fields["response_measurement_provenance"] = .string("captured_ar_visual_inertial_not_physical_peak")
         fields["net_source_rate_rad_s"] = Self.number(reduction.signedResponse.flatMap { net in dt.flatMap { $0 > 0 ? abs(net) / $0 : nil } })
-        fields["effective_budget_response_rate_rad_s"] = Self.number(reduction.signedResponse.map { abs($0) / response.requestedBudget })
+        fields["effective_budget_response_rate_rad_s"] = Self.number(reduction.sampledAbsoluteTravel.map { $0 / response.requestedBudget })
         fields["post_ack_sample_endpoints"] = .array(response.samples.filter {
             ($0.sourceTimestamp ?? -.infinity) > response.stopAcknowledgementUptime
         }.prefix(128).map { sample in .object([
@@ -134,6 +143,7 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["unsampled_coast_confidence"] = .string("unknown")
         fields["overshoot_ceiling_s"] = Self.number(calibration.overshootCeiling)
         fields["completed_responses"] = .number(Double(calibration.completedResponses))
+        fields["measured_responses"] = .number(Double(calibration.measuredResponses))
     }
 
     static func source(_ sample: NavigationPoseSample, uptime: Double) -> [String: FollowDiagnosticValue] {

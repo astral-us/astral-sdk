@@ -22,7 +22,18 @@ public final class Detector {
         public let failureReason: FailureReason?
         /// Orientation actually evaluated for these boxes; nil for unknown legacy handlers/failure.
         public let orientation: CGImagePropertyOrientation?
+        public let personVerification: [PersonBodyVerifier.Decision]?
+        init(frame: FrameDetections, status: EvaluationStatus, failureReason: FailureReason?,
+             orientation: CGImagePropertyOrientation?, personVerification: [PersonBodyVerifier.Decision]? = nil) {
+            self.frame = frame; self.status = status; self.failureReason = failureReason
+            self.orientation = orientation; self.personVerification = personVerification
+        }
     }
+    public struct FollowEvaluation: Sendable {
+        public let snapshot: ARFrameSnapshot
+        public let receipt: EvaluationReceipt
+    }
+    public private(set) var latestFollowEvaluation: FollowEvaluation?
     public struct Detection: Sendable {
         public let label: String
         public let confidence: Float
@@ -44,6 +55,7 @@ public final class Detector {
     private var request: VNCoreMLRequest?
     private let detectionHandler: ((CVPixelBuffer) throws -> [Detection])?
     private var visionHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [Detection])?
+    private let bodyPoseHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])?
     public var isLoaded: Bool { request != nil }
     public private(set) var supportedCanonicalLabels: Set<String> = []
 
@@ -51,6 +63,7 @@ public final class Detector {
     /// package contexts that still ship `.mlpackage`/`.mlmodel` resources.
     public init(modelName: String = "RoverYOLO") async {
         detectionHandler = nil
+        bodyPoseHandler = Self.humanBodies
         guard let modelURL = Self.modelResourceURL(modelName: modelName) else {
             request = nil
             RuntimeFileLog.append("detector_unavailable", fields: [
@@ -86,17 +99,21 @@ public final class Detector {
         }
     }
 
-    init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) throws -> [Detection]) {
+    init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) throws -> [Detection],
+         bodyPoseHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])? = nil) {
         request = nil
         self.detectionHandler = detectionHandler
+        self.bodyPoseHandler = bodyPoseHandler
         supportedCanonicalLabels = supportedLabels
     }
 
     /// Exercises the same orientation selection as the production Vision request.
-    init(supportedLabels: Set<String>, visionHandler: @escaping (CVPixelBuffer, CGImagePropertyOrientation) throws -> [Detection]) {
+    init(supportedLabels: Set<String>, visionHandler: @escaping (CVPixelBuffer, CGImagePropertyOrientation) throws -> [Detection],
+         bodyPoseHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])? = nil) {
         request = nil
         detectionHandler = nil
         self.visionHandler = visionHandler
+        self.bodyPoseHandler = bodyPoseHandler
         supportedCanonicalLabels = supportedLabels
     }
 
@@ -157,10 +174,64 @@ public final class Detector {
     /// Follow projection uses the inverse .right transform; never feed fallback boxes to it.
     public func evaluateForFollow(_ snapshot: ARFrameSnapshot) -> EvaluationReceipt {
         let result = evaluate(snapshot.image, orientations: [.right])
-        return EvaluationReceipt(frame: .init(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
-                                             detections: result.detections),
-                                 status: result.reason == nil ? .executed : .failed,
-                                 failureReason: result.reason, orientation: result.orientation)
+        let people = result.detections.filter { $0.label.lowercased() == "person" }
+        let verification: [PersonBodyVerifier.Decision]
+        if result.reason != nil || people.isEmpty { verification = [] }
+        else if let bodyPoseHandler {
+            do {
+                let bodies = try bodyPoseHandler(snapshot.image, .right)
+                verification = people.enumerated().map { id, detection in
+                    PersonBodyVerifier.verify(box: detection.boundingBox, rawPersonID: id, bodies: bodies)
+                }
+            } catch {
+                verification = people.indices.map { .init(rawPersonID: $0, accepted: false,
+                    reason: "body_verification_failed", matchingBodies: 0) }
+            }
+        } else {
+            verification = people.indices.map { .init(rawPersonID: $0, accepted: false,
+                reason: "body_verification_unavailable", matchingBodies: 0) }
+        }
+        let receipt = EvaluationReceipt(frame: .init(frameID: snapshot.id, monotonicTimestamp: snapshot.timestamp,
+                                              detections: result.detections),
+                                  status: result.reason == nil ? .executed : .failed,
+                                  failureReason: result.reason, orientation: result.orientation,
+                                  personVerification: verification)
+        latestFollowEvaluation = .init(snapshot: snapshot, receipt: receipt)
+        return receipt
+    }
+
+    /// Preview and receipt always refer to the same upright snapshot.
+    public func followPreviewEvaluation(_ snapshot: ARFrameSnapshot, at uptime: TimeInterval) -> FollowEvaluation {
+        if let cached = latestFollowEvaluation, uptime.isFinite,
+           cached.snapshot.id.generation == snapshot.id.generation,
+           cached.snapshot.id.sequence <= snapshot.id.sequence,
+           cached.snapshot.timestamp <= snapshot.timestamp,
+           uptime - cached.snapshot.timestamp >= 0, uptime - cached.snapshot.timestamp <= 0.5 {
+            return cached
+        }
+        let receipt = evaluateForFollow(snapshot)
+        return .init(snapshot: snapshot, receipt: receipt)
+    }
+
+    private enum BodyVerificationError: Error { case noCPUDevice }
+    static func humanBodies(_ image: CVPixelBuffer, _ orientation: CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body] {
+        let request = VNDetectHumanBodyPoseRequest()
+        // Preserve the detector's existing no-GPU background-wind-down policy.
+        for (stage, devices) in try request.supportedComputeStageDevices {
+            guard let cpu = devices.first(where: { if case .cpu = $0 { return true }; return false }) else {
+                throw BodyVerificationError.noCPUDevice
+            }
+            request.setComputeDevice(cpu, for: stage)
+        }
+        try VNImageRequestHandler(cvPixelBuffer: image, orientation: orientation).perform([request])
+        return try (request.results ?? []).map { observation in
+            let points = try observation.recognizedPoints(.all)
+            func joint(_ name: VNHumanBodyPoseObservation.JointName) -> PersonBodyVerifier.Joint? {
+                points[name].map { .init(location: $0.location, confidence: $0.confidence) }
+            }
+            return .init(leftShoulder: joint(.leftShoulder), rightShoulder: joint(.rightShoulder),
+                leftHip: joint(.leftHip), rightHip: joint(.rightHip))
+        }
     }
 
     public func detect(_ snapshot: ARFrameSnapshot) -> FrameDetections {

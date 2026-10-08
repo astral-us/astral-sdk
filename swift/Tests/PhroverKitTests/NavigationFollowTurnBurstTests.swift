@@ -591,18 +591,23 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
     }
 
     @MainActor
-    func testMeasuredOvershootWithNonpositiveCandidateFailsStoppedWithoutReverseOrResend() async {
+    func testMeasuredOvershootAllowsOnlySmallerCorrectionAfterConfirmedStop() async {
         var uptime = 10.0
         var snapshot = sample(1, 9.99)
         let events = AsyncStream<NavigationPoseSample>.makeStream()
         var sends = 0
+        var budgets: [Double] = []
         var stops = 0
         var controller: NavigationController!
         controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
-            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { command in
                 sends += 1
-                uptime = 10.400
-                snapshot = self.sample(3, 10.39, yaw: 0.25)
+                let authorization = FollowTurnBurstTransportScope.authorization!
+                budgets.append(authorization.deadline - authorization.sendEntryUptime)
+                XCTAssertEqual(stops, sends, "Each command follows confirmed stopping")
+                XCTAssertEqual(command.left, sends == 1 ? -0.25 : 0.25)
+                uptime = sends == 1 ? 10.400 : 10.811
+                snapshot = self.sample(sends == 1 ? 3 : 5, uptime - 0.01, yaw: sends == 1 ? 0.25 : 0.1)
                 controller.ingestFollowTurnSource(snapshot)
             }, stopRover: { stops += 1; if stops > 1 { uptime += 0.01 } },
             sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot }, sourceNow: { uptime },
@@ -617,15 +622,20 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         uptime = 10.711
         snapshot = sample(4, 10.6, yaw: 0.25)
         controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where stops < 3 { await Task.yield() }
+        XCTAssertEqual(sends, 2)
+        XCTAssertLessThan(budgets.last ?? .infinity, (budgets.first ?? 0) / 2)
+        uptime = 11.122
+        snapshot = sample(6, 11.02, yaw: 0.1)
+        controller.ingestFollowTurnSource(snapshot)
         let result = await task.value
-        XCTAssertEqual(result, .failed(.rotationResolutionInsufficient))
-        XCTAssertEqual(sends, 1, "Measured latency/rate makes the opposite correction unresolvable")
-        XCTAssertEqual(controller.followTurnStopFence?.acknowledgementUptime ?? -1, 10.410, accuracy: 1e-12)
+        XCTAssertEqual(result, .arrived)
+        XCTAssertEqual(sends, 2)
         events.continuation.finish()
     }
 
     @MainActor
-    func testSecondAlignmentBurstShrinksFromActualResponseLatencyAndPartialCoast() async {
+    func testSecondAlignmentBurstUsesWholeResponseOnceAndKeepsTighterTarget() async {
         var uptime = 10.0
         var snapshot = sample(1, 9.99)
         let events = AsyncStream<NavigationPoseSample>.makeStream()
@@ -643,7 +653,7 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
                 targets.append(FollowMotionTaskScope.evidence!.context.targetYaw!)
                 uptime = authorization.sendEntryUptime + (budgets.count == 1 ? 0.080 : 0.100)
                 snapshot = self.sample(budgets.count == 1 ? 3 : 6, uptime - 0.02,
-                    yaw: budgets.count == 1 ? 0.17 : 0.5)
+                    yaw: budgets.count == 1 ? 0.30 : 0.5)
                 controller.ingestFollowTurnSource(snapshot)
             }, stopRover: {
                 stops += 1
@@ -663,16 +673,16 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         XCTAssertEqual(stops, 2)
         // Both endpoints are genuinely captured after the 10.390 stop ACK.
         uptime = 10.430
-        snapshot = sample(4, 10.42, yaw: 0.17)
+        snapshot = sample(4, 10.42, yaw: 0.30)
         controller.ingestFollowTurnSource(snapshot)
         uptime = 10.701
-        snapshot = sample(5, 10.65, yaw: 0.18)
+        snapshot = sample(5, 10.65, yaw: 0.31)
         controller.ingestFollowTurnSource(snapshot)
         for _ in 0..<1000 where budgets.count < 2 && !completed { await Task.yield() }
         XCTAssertEqual(budgets.count, 2, "A valid completed bracket must enable a corrective burst")
         XCTAssertEqual(budgets.first ?? -1, 0.080, accuracy: 1e-12)
-        // E=.27, effective R=.18/.08=2.25, A=.08+.01, partial C=.01.
-        XCTAssertEqual(budgets.dropFirst().first ?? -1, 0.0255555555555556, accuracy: 1e-12)
+        // Excess .14 / whole-response gain (.31/.08), with no duplicated A/C penalty.
+        XCTAssertEqual(budgets.dropFirst().first ?? -1, 0.0361290322580645, accuracy: 1e-12)
         XCTAssertEqual(targets, [0.5, 0.5], "Calibration must not rebase the frozen target")
         if budgets.count == 2 {
             for _ in 0..<1000 where stops < 3 { await Task.yield() }

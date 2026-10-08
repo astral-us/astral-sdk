@@ -77,11 +77,13 @@ public struct FollowPerceptionDiagnostics {
     public let projectionRejectedCount: Int?
     public let projectedPersonCount: Int?
     public let candidates: [FollowProjectionEvidence]
+    public internal(set) var personVerification: [PersonBodyVerifier.Decision]? = nil
 }
 
 extension FollowPerceptionDiagnostics {
     var transitionSignature: String {
-        let reasons = Set(candidates.compactMap { $0.rejection?.rawValue }).sorted().joined(separator: ",")
+        let reasons = Set(candidates.compactMap { $0.rejection?.rawValue } +
+            (personVerification ?? []).map(\.reason)).sorted().joined(separator: ",")
         return inferenceStatus.rawValue + "|" + (inferenceFailureReason?.rawValue ?? "none") + "|" + reasons
     }
 
@@ -92,6 +94,11 @@ extension FollowPerceptionDiagnostics {
             "pipeline_availability": .string(facts == nil ? "unknown_legacy_provider" : "available"),
             "projection_evaluations": facts.map { .array($0.candidates.map { .object($0.payload) }) } ?? .null
         ]
+        result["person_body_verification"] = facts?.personVerification.map { .array($0.map { decision in .object([
+            "raw_person_id": .number(Double(decision.rawPersonID)), "accepted": .bool(decision.accepted),
+            "reason": .string(decision.reason), "matching_bodies": .number(Double(decision.matchingBodies)),
+            "identity_claim": .string("none_body_geometry_only")]) }) } ?? .null
+        result["body_verified_person_count"] = facts?.personVerification.map { .number(Double($0.filter(\.accepted).count)) } ?? .null
         let counts: [(String, Int?)] = [
             ("raw_detector_count", facts?.rawDetectorCount), ("raw_person_count", facts?.rawPersonCount),
             ("projection_attempted_count", facts?.projectionAttemptedCount),

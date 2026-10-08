@@ -5,6 +5,16 @@ import XCTest
 
 @MainActor
 final class FollowMeCoordinatorTests: XCTestCase {
+    func testDisplayedTargetRequiresFreshMatchedFrameAndClearsOnStop() async {
+        let (coordinator, perception, _, clock) = productionSetup()
+        XCTAssertNil(coordinator.trackedPersonFrameID)
+        await acquireWaiting(coordinator, perception, clock)
+        XCTAssertEqual(coordinator.trackedPersonFrameID, .init(generation: 1, sequence: 3))
+        clock.advance(to: clock.now + 0.501)
+        XCTAssertNil(coordinator.trackedPersonFrameID, "A stale lock cannot be presented as current")
+        _ = await coordinator.stop()
+        XCTAssertNil(coordinator.trackedPersonFrameID)
+    }
     func testRecoveryRestorationRechecksDeadlineAtAtomicCommitWithoutTimerDelivery() async throws {
         // Reads after the matched association: preliminary eligibility (deadline/health),
         // follow expiry, restoration eligibility (deadline/health), final acceptance time.

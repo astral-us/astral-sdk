@@ -788,7 +788,9 @@ public final class NavigationController {
                         requestedBudget: budget, sendEntryUptime: receipt.send.sendEntryUptime,
                         sendResponseUptime: receipt.send.responseUptime, stopObligationUptime: obligation,
                         stopAcknowledgementUptime: fence.acknowledgementUptime, samples: captured.samples,
-                        traversalUnambiguous: captured.unambiguous)
+                         traversalUnambiguous: captured.unambiguous,
+                         planningEvaluation: self.turnPoseEvidence == nil ? nil : captured.planningEvaluation,
+                         stoppedEvaluation: self.turnPoseEvidence == nil ? nil : captured.stoppedEvaluation)
                 })
         }
         loop = task

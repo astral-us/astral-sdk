@@ -47,12 +47,15 @@ struct FollowTurnResponseBracket {
     private(set) var unambiguous = true
     private(set) var ingressRejection: String?
     private var invalidCollection = false
+    let planningEvaluation: FollowTurnBurstPlanner.Sample
+    private(set) var stoppedEvaluation: FollowTurnBurstPlanner.Sample?
     let generation: UInt64
 
     init(start: NavigationPoseSample, at uptime: Double, generation: UInt64,
          boundary: FollowTurnBurstPlanner.Sample?) {
         self.generation = generation
         let captured = Self.capture(start, at: uptime, generation: generation, healthy: true)
+        planningEvaluation = captured
         invalidCollection = !captured.healthy
         if let boundary, Self.sameSource(boundary, captured), boundary.healthy {
             samples = [boundary] // Exact immutable boundary shared by adjacent bursts.
@@ -62,6 +65,7 @@ struct FollowTurnResponseBracket {
     mutating func collect(_ source: NavigationPoseSample, at uptime: Double, healthy: Bool,
                           settled: Bool = false) {
         let captured = Self.capture(source, at: uptime, generation: generation, healthy: healthy)
+        if settled { stoppedEvaluation = captured }
         if !captured.healthy { invalidCollection = true }
         if let previous = samples.last, Self.sameSource(previous, captured) {
             if !captured.healthy { unambiguous = false }
@@ -85,7 +89,7 @@ struct FollowTurnResponseBracket {
 
     /// Replace only coalesced delivery evidence with complete ingress witnesses.
     /// Both control boundaries must match exactly; missing/evicted ranges stay
-    /// unlearnable. The stopped endpoint keeps its actual evaluation timestamp.
+    /// unlearnable. Control reads are separate facts, not ingress timestamps.
     func usingIngressEvidence(_ ingress: [FollowTurnBurstPlanner.Sample]?) -> Self {
         var result = self
         guard !invalidCollection else {
@@ -107,8 +111,6 @@ struct FollowTurnResponseBracket {
             result.unambiguous = false; result.ingressRejection = "ingress_range_or_boundary_mismatch"; return result
         }
         result.samples = ingress
-        result.samples[0] = first // Preserve a valid adjacent-burst boundary.
-        result.samples[result.samples.count - 1] = last // Actual post-stop evaluation.
         result.unambiguous = true
         return result
     }

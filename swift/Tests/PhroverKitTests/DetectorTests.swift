@@ -7,6 +7,55 @@ import simd
 @testable import PhroverKit
 
 final class DetectorTests: XCTestCase {
+    func testNativeBodyRequestDoesNotVerifyUniformEmptyImage() throws {
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, 640, 480, kCVPixelFormatType_32BGRA, nil, &buffer)
+        let image = try XCTUnwrap(buffer)
+        CVPixelBufferLockBaseAddress(image, [])
+        memset(CVPixelBufferGetBaseAddress(image), 0, CVPixelBufferGetDataSize(image))
+        CVPixelBufferUnlockBaseAddress(image, [])
+        let detector = Detector(supportedLabels: ["person"], detectionHandler: { _ in
+            [.init(label: "person", confidence: 1, boundingBox: CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8))]
+        }, bodyPoseHandler: Detector.humanBodies)
+        let snapshot = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 100, image: image,
+            cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 640, height: 480), depthMap: nil,
+            pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        let receipt = detector.evaluateForFollow(snapshot)
+        XCTAssertEqual(receipt.frame.detections.first?.confidence, 1, "Raw prediction remains visible for diagnosis")
+        let decision = try XCTUnwrap(receipt.personVerification?.first)
+        XCTAssertFalse(decision.accepted)
+        XCTAssertTrue(["body_verification_failed", "no_matching_body"].contains(decision.reason),
+            "Native unavailability or no body must both fail closed, never trust the raw score")
+    }
+    func testPreviewReusesExactFreshFollowImageAndReceiptWithoutFallbackOrDuplicateInference() {
+        var orientations: [CGImagePropertyOrientation] = []
+        let detector = Detector(supportedLabels: ["person"], visionHandler: { _, orientation in
+            orientations.append(orientation)
+            return [.init(label: "person", confidence: 1, boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6))]
+        })
+        func snapshot(_ sequence: UInt64, _ time: Double, generation: UInt64 = 1) -> ARFrameSnapshot {
+            .init(id: .init(generation: generation, sequence: sequence), timestamp: time, image: makeImage(),
+                cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+                imageResolution: CGSize(width: 8, height: 6), depthMap: nil, pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        }
+        let original = snapshot(1, 100)
+        _ = detector.evaluateForFollow(original)
+        let newer = snapshot(2, 100.1)
+        let preview = detector.followPreviewEvaluation(newer, at: 100.2)
+        XCTAssertEqual(orientations, [.right])
+        XCTAssertEqual(preview.snapshot.id, original.id)
+        XCTAssertEqual(preview.receipt.frame.frameID, original.id)
+        XCTAssertTrue(preview.snapshot.image === original.image)
+        XCTAssertFalse(preview.receipt.personVerification?.first?.accepted ?? true)
+        let refreshed = detector.followPreviewEvaluation(newer, at: 100.6)
+        XCTAssertEqual(orientations, [.right, .right])
+        XCTAssertEqual(refreshed.snapshot.id, newer.id)
+        let reset = snapshot(1, 100.61, generation: 2)
+        let generationChanged = detector.followPreviewEvaluation(reset, at: 100.62)
+        XCTAssertEqual(generationChanged.snapshot.id, reset.id)
+        XCTAssertEqual(orientations, [.right, .right, .right])
+    }
     func testFollowReceiptCapturesActualRightOrientationWithoutFallbackOnEmptyOrError() {
         let snapshot = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 100,
             image: makeImage(), cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,

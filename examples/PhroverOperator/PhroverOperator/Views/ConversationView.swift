@@ -45,7 +45,7 @@ struct ConversationView: View {
             }
 
             if !scripted {
-                LiveCameraDebugPanel(ar: ar, detector: detector)
+                LiveCameraDebugPanel(ar: ar, detector: detector, trackedFrame: model.trackedPersonFrameID)
                     .frame(maxWidth: 320)
             }
 
@@ -115,6 +115,7 @@ struct ConversationView: View {
                                                mayStartFollow: otherMotionActive, clock: followClock)
             model.configure(submit: { await router.submit($0) },
                             stop: { await router.stop() }, followState: { follow.state },
+                            targetFrame: { follow.trackedPersonFrameID },
                             readySignalClearance: { follow.readySignalClearance },
                             inhibit: { follow.inhibitMotion() },
                             submitFinalized: { text, receivedAt in await router.submit(text, finalizedTextReceivedAt: receivedAt) },
@@ -174,9 +175,13 @@ struct ConversationView: View {
 private struct LiveCameraDebugPanel: View {
     let ar: ARSessionManager
     let detector: Detector?
+    let trackedFrame: ARFrameID?
 
     @State private var previewImage: UIImage?
-    @State private var visibleObjects: [PerceivedObject] = []
+    @State private var predictions: [Detector.Detection] = []
+    @State private var personVerification: [PersonBodyVerifier.Decision]?
+    @State private var previewFrame: ARFrameID?
+    @State private var previewAge: TimeInterval?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -185,6 +190,27 @@ private struct LiveCameraDebugPanel: View {
                     Image(uiImage: previewImage)
                         .resizable()
                         .scaledToFit()
+                        .overlay {
+                            GeometryReader { geometry in
+                                ForEach(predictions.indices, id: \.self) { index in
+                                    let detection = predictions[index]
+                                    let box = detection.boundingBox.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+                                    let checked = PerceptionDebugSummary.verification(forDetectionAt: index,
+                                        in: predictions, decisions: personVerification)?.accepted ?? false
+                                    if !box.isNull, box.width > 0, box.height > 0 {
+                                        Rectangle().stroke(checked ? Color.green : Color.orange, lineWidth: 1)
+                                            .frame(width: box.width * geometry.size.width, height: box.height * geometry.size.height)
+                                            .overlay(alignment: .topLeading) {
+                                                Text("\(detection.label) (raw)")
+                                                    .font(.system(size: 8, design: .monospaced))
+                                                    .foregroundStyle(.black)
+                                                    .background(checked ? Color.green.opacity(0.8) : Color.orange.opacity(0.8))
+                                            }
+                                            .position(x: box.midX * geometry.size.width, y: (1 - box.midY) * geometry.size.height)
+                                    }
+                                }
+                            }
+                        }
                 } else {
                     ZStack {
                         Color.black.opacity(0.08)
@@ -211,8 +237,20 @@ private struct LiveCameraDebugPanel: View {
                 Text("Tracking: \(trackingLabel)")
                 Text(String(format: "Clearance: %.2f m", ar.forwardClearance))
                 Text("Detector: \(detectorStatus)")
-                Text("Visible: \(PerceptionDebugSummary.visibleObjects(visibleObjects))")
+                Text("Raw predictions: \(PerceptionDebugSummary.rawPredictions(predictions, personVerification: personVerification))")
                     .lineLimit(2)
+                Text(personVerification == nil || personVerification?.contains(where: \.verificationUnavailable) == true
+                     ? "Person check: unavailable — no verified candidate" :
+                    ((personVerification?.filter(\.accepted).count ?? 0) == 0 ? "Person check: none body-verified" :
+                        "Person check: \(personVerification?.filter(\.accepted).count ?? 0) body candidate(s)"))
+                if let trackedFrame {
+                    Text("Follow target: acquired • frame \(trackedFrame.generation):\(trackedFrame.sequence)")
+                } else {
+                    Text("Follow target: none")
+                }
+                if let previewFrame, let previewAge {
+                    Text("Frame: \(previewFrame.generation):\(previewFrame.sequence) • age \(String(format: "%.0f", previewAge * 1000)) ms")
+                }
             }
             .font(.system(.caption2, design: .monospaced))
             .foregroundStyle(.secondary)
@@ -246,24 +284,28 @@ private struct LiveCameraDebugPanel: View {
 
     @MainActor
     private func refresh() {
-        guard let buffer = ar.latestPixelBuffer else {
+        guard let snapshot = ar.latestSnapshot else {
             previewImage = nil
-            visibleObjects = []
+            predictions = []
+            personVerification = nil
+            previewFrame = nil
+            previewAge = nil
             return
         }
-
-        previewImage = Self.previewImage(from: buffer)
-
         guard let detector else {
-            visibleObjects = []
+            previewImage = Self.previewImage(from: snapshot.image)
+            predictions = []
+            personVerification = nil
             return
         }
-
-        visibleObjects = detector.detect(buffer).map {
-            PerceivedObject(label: $0.label,
-                            confidence: $0.confidence,
-                            normalizedPoint: CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY))
-        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let evaluation = detector.followPreviewEvaluation(snapshot, at: now)
+        previewImage = Self.previewImage(from: evaluation.snapshot.image)
+        predictions = evaluation.receipt.frame.detections
+        personVerification = evaluation.receipt.personVerification
+        previewFrame = evaluation.snapshot.id
+        let age = ProcessInfo.processInfo.systemUptime - evaluation.snapshot.timestamp
+        previewAge = age.isFinite && age >= 0 ? age : nil
     }
 
     private static func previewImage(from pixelBuffer: CVPixelBuffer) -> UIImage? {

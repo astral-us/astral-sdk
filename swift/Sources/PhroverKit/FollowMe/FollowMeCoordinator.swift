@@ -39,6 +39,15 @@ public final class FollowMeCoordinator {
     }
     public private(set) var perceptionIssue: FollowPerceptionIssue?
     public var isActive: Bool { state.isActive }
+    /// Display-only current lock provenance, not independent motion authority.
+    public var trackedPersonFrameID: ARFrameID? {
+        guard isActive, !stopBlocked, perceptionIssue == nil, recoveryEpisode == nil,
+              state != .pausing, state != .searching, state != .reacquiring,
+              let locked, let batch = latestBatch, locked.frameID == batch.frameID,
+              batch.trackingQuality == .normal else { return nil }
+        let age = clock.now - batch.timestamp
+        return age.isFinite && age >= 0 && age <= config.maximumObservationAge ? batch.frameID : nil
+    }
     public var readySignalClearance: Double { config.readySignalClearance }
 
     private let perception: any FollowMePerception

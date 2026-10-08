@@ -97,7 +97,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertNil(result.failure)
     }
 
-    func testOvershootTraceRetainsMeasuredAllowancesAndUnknownCoastThroughResolutionFailure() async throws {
+    func testOvershootTraceRetainsDiagnosticLatencyAndUnknownCoastThroughSmallerCorrection() async throws {
         let source = FollowRecoveryDiagnosticSourceFixture()
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "model", monotonic: { 500 }, utc: { Date() }, sink: sink.append)
@@ -106,21 +106,17 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             forwardClearance: { 2 }, plan: { _, _ in nil }, lastAckAt: { Date() },
             sendCommand: { _ in sends += 1; source.uptime += 0.100 },
             stopRover: { if sends > 0 { source.uptime += 0.020 } }, sleep: { duration in
-                if sends > 0 { source.pose = .init(position: .zero, yaw: 0.5) }
+                if sends > 0 { source.pose = .init(position: .zero, yaw: sends == 1 ? 0.5 : 0.3) }
                 await source.advance(duration)
             }, diagnosticEmitter: emitter, poseSample: { source.snapshot }, sourceNow: { source.uptime },
             sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
         source.controller = controller
         let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context:
             .init(sessionGeneration: 9, requestToken: 902, purpose: .followScan, phase: "scanning"))
-        XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient))
-        XCTAssertEqual(sends, 1)
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(sends, 2)
         let events = try records(sink)
-        XCTAssertEqual(result.failure?.turnDiagnosticFields["controller_phase"], .string("stopped_planning"))
-        XCTAssertEqual(result.failure?.turnDiagnosticFields["profile_maximum_host_budget_s"], .number(0.080))
-        XCTAssertEqual(result.failure?.turnDiagnosticFields["episode_id"], .null)
-        XCTAssertEqual(result.failure?.turnDiagnosticFields["stage_index"], .null)
-        XCTAssertEqual(result.failure?.turnDiagnosticFields["segment_index"], .null)
+        XCTAssertNil(result.failure)
         let planned = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.burst_plan" })
         XCTAssertEqual(planned["response_rate_confidence"] as? String, "provisional_reference")
         XCTAssertTrue(planned["maximum_send_duration_s"] is NSNull)
@@ -133,10 +129,13 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertTrue(measured["observed_post_ack_travel_rad"] is NSNull)
         XCTAssertEqual(try XCTUnwrap(measured["overshoot_ceiling_s"] as? Double), 0.02845231237766351, accuracy: 1e-12)
         XCTAssertEqual(measured["post_source_frame_id"] as? String, "4:12")
-        let failure = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.failure" })
-        XCTAssertEqual(failure["reason"] as? String, "rotation_resolution_insufficient")
-        XCTAssertEqual(failure["controller_phase"] as? String, "stopped_planning")
-        XCTAssertEqual(failure["stop_outcome"] as? String, "confirmed")
+        let plans = events.filter { $0["event"] as? String == "follow_scan.burst_plan" }
+        let correction = try XCTUnwrap(plans.dropFirst().first)
+        XCTAssertEqual(correction["allowance_policy"] as? String, "included_in_measured_response;diagnostic_only")
+        XCTAssertEqual(try XCTUnwrap(correction["selected_budget_s"] as? Double), 0.01245231237766351, accuracy: 1e-12)
+        XCTAssertEqual(correction["direction"] as? Int, -1)
+        XCTAssertEqual(correction["stop_outcome"] as? String, "confirmed")
+        XCTAssertFalse(events.contains { $0["event"] as? String == "follow_scan.failure" })
     }
 
     func testRuntimeBurstTraceCapturesLateAckAndOnlyActuallyEnteredWaits() async throws {

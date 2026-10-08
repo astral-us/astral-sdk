@@ -3,6 +3,33 @@ import XCTest
 
 @MainActor
 final class FollowDiagnosticEventTests: XCTestCase {
+    func testPlanTelemetryUsesEndToEndGainAndDoesNotSubtractDiagnosticLatency() throws {
+        let calibration = FollowTurnBurstPlanner.Calibration(operationID: 1, generation: 1, targetYaw: 0.5,
+            clockDomain: "ar_system_uptime")
+        func sample(_ id: UInt64, _ time: Double, _ yaw: Double) -> FollowTurnBurstPlanner.Sample {
+            .init(yaw: yaw, sequence: id, generation: 1, sourceTimestamp: time,
+                collectedUptime: time, clockDomain: "ar_system_uptime", healthy: true)
+        }
+        let response = FollowTurnBurstPlanner.Response(operationID: 1, generation: 1, targetYaw: 0.5,
+            clockDomain: "ar_system_uptime", requestedBudget: 0.080, sendEntryUptime: 10,
+            sendResponseUptime: 10.12, stopObligationUptime: 10.08, stopAcknowledgementUptime: 10.23,
+            samples: [sample(1, 9.99, 0), sample(2, 10.24, 0.1), sample(3, 10.55, 0.2)])
+        let profile = FollowTurnBurstPlanner.Profile(purpose: .scan)
+        let reduction = FollowTurnBurstPlanner.recording(response, in: calibration, profile: profile)
+        let trace = FollowTurnBurstDiagnosticTrace()
+        trace.reduction(response, reduction)
+        let actual = NavigationPoseSample(pose: .init(position: .zero, yaw: 0.3),
+            frameID: .init(generation: 1, sequence: 4), sourceTimestamp: 10.9, trackingQuality: .normal)
+        let decision = FollowTurnBurstPlanner.plan(.init(actualYaw: 0.3, profile: profile,
+            calibration: reduction.calibration, sendEntryUptime: 11))
+        trace.planning(reduction.calibration, sample: actual, profile: profile, decision: decision, uptime: 11)
+        XCTAssertEqual(trace.fields["allowance_policy"], .string("included_in_measured_response;diagnostic_only"))
+        XCTAssertEqual(trace.fields["budget_formula"], .string("min(maximum,E/R,overshootCeiling)"))
+        guard case .number(let budget) = trace.fields["candidate_budget_s"] else { return XCTFail() }
+        XCTAssertEqual(budget, 0.03113078094415877, accuracy: 1e-12)
+        guard case .number(let latency) = trace.fields["latency_allowance_s"] else { return XCTFail() }
+        XCTAssertEqual(latency, 0.27, accuracy: 1e-12, "Latency remains visible as telemetry, not another deduction")
+    }
     func testMeasuredHostLatencyWithoutYawCannotBeReportedAsObservedRateOrZeroCoast() throws {
         let profile = FollowTurnBurstPlanner.Profile(purpose: .alignment)
         let calibration = FollowTurnBurstPlanner.Calibration(operationID: 41, generation: 3, targetYaw: 0.3,

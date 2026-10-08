@@ -105,7 +105,13 @@ source/response evidence, calibration, and decision values. Its initial referenc
 is provisional `2π/3 rad/s`; positive host budgets have no 20 ms floor and cap at
 80 ms **from sender entry**, including queue/transport time. The planner uses
 inclusive 0.05 rad alignment / 7° scan tolerance. Unknown latency and post-ack
-travel remain optional, not measured zero. Calibration is local to one operation,
+travel remain optional, not measured zero. After a valid complete response, the
+planning gain is the operation maximum of sampled end-to-end angular travel per
+requested host budget (with the provisional reference as a floor). This already
+includes latency and sampled coast; send/stop durations and post-ack travel remain
+diagnostics, not additional deductions. Search and precise alignment retain their
+different tolerances. Missing measured response cannot authorize another probe.
+Calibration is local to one operation,
 target, generation, and explicitly shared source/collection clock domain. Rejected
 evidence never updates its maxima; the caller must remain stopped and resolve it.
 The exact settled sample can be shared between adjacent response brackets without

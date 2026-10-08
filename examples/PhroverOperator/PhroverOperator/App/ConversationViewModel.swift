@@ -11,6 +11,7 @@ final class ConversationViewModel {
     private var submit: (String) async -> OperatorSubmission
     private var stop: () async -> OperatorSubmission
     private var followState: () -> FollowMeState
+    private var targetFrame: () -> ARFrameID? = { nil }
     private var readySignalClearance: () -> Double
     private var inhibit: () -> Void
     private var submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)?
@@ -35,6 +36,7 @@ final class ConversationViewModel {
     func configure(submit: @escaping (String) async -> OperatorSubmission,
                    stop: @escaping () async -> OperatorSubmission,
                    followState: @escaping () -> FollowMeState,
+                   targetFrame: @escaping () -> ARFrameID? = { nil },
                    readySignalClearance: @escaping () -> Double = { FollowMeConfiguration().readySignalClearance },
                    inhibit: @escaping () -> Void = {},
                    submitFinalized: ((String, TimeInterval) async -> OperatorSubmission)? = nil,
@@ -42,6 +44,7 @@ final class ConversationViewModel {
         self.submit = submit
         self.stop = stop
         self.followState = followState
+        self.targetFrame = targetFrame
         self.readySignalClearance = readySignalClearance
         self.inhibit = inhibit
         self.submitFinalized = submitFinalized
@@ -54,6 +57,7 @@ final class ConversationViewModel {
         if case .failed("Motor stop could not be confirmed. Motion is blocked.") = followState() { return true }
         return errorMessage == "Rover stop could not be confirmed."
     }
+    var trackedPersonFrameID: ARFrameID? { targetFrame() }
     var status: String {
         switch followState() {
         case .idle: return ""

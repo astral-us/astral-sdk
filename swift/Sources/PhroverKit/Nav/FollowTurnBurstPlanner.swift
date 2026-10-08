@@ -18,14 +18,18 @@ public enum FollowTurnBurstPlanner {
         public let generation: UInt64
         public let targetYaw: Double
         public let clockDomain: String
+        /// Conservative end-to-end AR travel per second of requested host budget,
+        /// not instantaneous angular velocity or a physical speed guarantee.
         public let responseRate: Double
-        /// Nil allowances are unknown and omitted arithmetically, never measured zero.
+        /// Diagnostic host durations, already included in measured burst response.
+        /// They are not separate deductions from the next requested budget.
         public let maximumSendDuration: Double?
         public let maximumStopDuration: Double?
         /// Partial sampled travel after acknowledgement, not total physical coast.
         public let observedPostAckTravel: Double?
         public let overshootCeiling: Double?
         public let completedResponses: Int
+        public let measuredResponses: Int
         public let terminalResolutionFailure: Bool
         public let lastStopAcknowledgementUptime: Double?
         public let lastSourceSequence: UInt64?
@@ -42,6 +46,7 @@ public enum FollowTurnBurstPlanner {
             observedPostAckTravel = nil
             overshootCeiling = nil
             completedResponses = 0
+            measuredResponses = 0
             terminalResolutionFailure = false
             lastStopAcknowledgementUptime = nil
             lastSourceSequence = nil
@@ -49,7 +54,8 @@ public enum FollowTurnBurstPlanner {
             lastSourceSample = nil
         }
         fileprivate init(previous: Self, rate: Double, send: Double, stop: Double,
-                         travel: Double?, ceiling: Double? = nil, terminal: Bool = false, response: Response) {
+                          travel: Double?, ceiling: Double? = nil, terminal: Bool = false,
+                          measured: Bool, response: Response) {
             operationID = previous.operationID
             generation = previous.generation
             targetYaw = previous.targetYaw
@@ -60,6 +66,7 @@ public enum FollowTurnBurstPlanner {
             observedPostAckTravel = travel
             overshootCeiling = ceiling
             completedResponses = previous.completedResponses + 1
+            measuredResponses = previous.measuredResponses + (measured ? 1 : 0)
             terminalResolutionFailure = previous.terminalResolutionFailure || terminal
             lastStopAcknowledgementUptime = response.stopAcknowledgementUptime
             lastSourceSequence = response.samples.last?.sequence ?? previous.lastSourceSequence
@@ -102,7 +109,9 @@ public enum FollowTurnBurstPlanner {
         public let sourceTimestamp: Double?
         public let collectedUptime: Double
         public let clockDomain: String?
-        /// True only for normal tracking/health at collection, not at a later read.
+        /// Health at `collectedUptime`: ingress health for `Response.samples`,
+        /// or read-time health for the separate control-evaluation properties.
+        /// A later read never replaces an ingress witness's health or timestamp.
         public let healthy: Bool
         public let sourceIdentity: String?
         public let trackingState: String?
@@ -149,10 +158,17 @@ public enum FollowTurnBurstPlanner {
         public let samples: [Sample]
         /// Caller attests intervals are unambiguous; shortest deltas cannot prove missed full turns.
         public let traversalUnambiguous: Bool
+        /// Separate planning read. Its `collectedUptime` is evaluation time and
+        /// `healthy` is read-time health; it does not replace ingress facts.
+        public let planningEvaluation: Sample?
+        /// Separate stopped read with evaluation-time timestamp and health.
+        /// Ingress collection times remain unchanged in `samples`.
+        public let stoppedEvaluation: Sample?
         public init(operationID: UInt64, generation: UInt64, targetYaw: Double, clockDomain: String,
                     completion: Completion = .completed, requestedBudget: Double,
                     sendEntryUptime: Double, sendResponseUptime: Double, stopObligationUptime: Double,
-                    stopAcknowledgementUptime: Double, samples: [Sample], traversalUnambiguous: Bool = true) {
+                    stopAcknowledgementUptime: Double, samples: [Sample], traversalUnambiguous: Bool = true,
+                    planningEvaluation: Sample? = nil, stoppedEvaluation: Sample? = nil) {
             self.operationID = operationID
             self.generation = generation
             self.targetYaw = targetYaw
@@ -165,6 +181,8 @@ public enum FollowTurnBurstPlanner {
             self.stopAcknowledgementUptime = stopAcknowledgementUptime
             self.samples = samples
             self.traversalUnambiguous = traversalUnambiguous
+            self.planningEvaluation = planningEvaluation
+            self.stoppedEvaluation = stoppedEvaluation
         }
     }
     public struct Reduction: Sendable {
@@ -217,8 +235,30 @@ public enum FollowTurnBurstPlanner {
             }
             previous = sample
         }
+        var stoppedEvaluationTime: Double?
+        if response.planningEvaluation != nil || response.stoppedEvaluation != nil {
+            guard let planning = response.planningEvaluation, let stopped = response.stoppedEvaluation,
+                  let first = response.samples.first, let last = response.samples.last else {
+                return reject("missing_control_evaluation")
+            }
+            func validRead(_ read: Sample, of ingress: Sample) -> Bool {
+                read.healthy && read.yaw == ingress.yaw && read.sequence == ingress.sequence &&
+                    read.generation == ingress.generation && read.sourceTimestamp == ingress.sourceTimestamp &&
+                    read.clockDomain == ingress.clockDomain && read.collectedUptime.isFinite &&
+                    read.collectedUptime >= ingress.collectedUptime &&
+                    read.collectedUptime - ingress.sourceTimestamp! >= 0 &&
+                    read.collectedUptime - ingress.sourceTimestamp! <= 0.500
+            }
+            guard validRead(planning, of: first), validRead(stopped, of: last),
+                  planning.collectedUptime <= response.sendEntryUptime,
+                  stopped.collectedUptime >= response.stopAcknowledgementUptime + profile.settleWait,
+                  last.sourceTimestamp! > response.stopAcknowledgementUptime else {
+                return reject("invalid_control_evaluation")
+            }
+            stoppedEvaluationTime = stopped.collectedUptime
+        }
         let hasSettledEndpoint = response.samples.last.map {
-            $0.collectedUptime >= response.stopAcknowledgementUptime + profile.settleWait
+            (stoppedEvaluationTime ?? $0.collectedUptime) >= response.stopAcknowledgementUptime + profile.settleWait
                 && $0.sourceTimestamp! > response.stopAcknowledgementUptime
         } ?? false
         let hasResponseBracket = response.samples.count >= 2 && hasSettledEndpoint
@@ -243,7 +283,6 @@ public enum FollowTurnBurstPlanner {
             guard delta.isFinite, observedRate.isFinite else { return reject("nonfinite_response_rate") }
             net += delta
             sampledTravel += abs(delta)
-            if hasResponseBracket { rate = max(rate, observedRate) }
             if hasSettledEndpoint, before.sourceTimestamp! > response.stopAcknowledgementUptime {
                 postAckTravel += abs(delta)
                 postAckIntervals += 1
@@ -252,16 +291,18 @@ public enum FollowTurnBurstPlanner {
         if hasResponseBracket {
             let duration = response.samples.last!.sourceTimestamp! - response.samples.first!.sourceTimestamp!
             let sourceRate = abs(net) / duration
-            let budgetRate = abs(net) / response.requestedBudget
+            let budgetRate = sampledTravel / response.requestedBudget
             guard net.isFinite, sampledTravel.isFinite, sourceRate.isFinite, budgetRate.isFinite, postAckTravel.isFinite else {
                 return reject("nonfinite_response_rate")
             }
-            rate = max(rate, sourceRate, budgetRate)
+            rate = max(rate, budgetRate)
         }
         let travel = postAckIntervals > 0
             ? max(calibration.observedPostAckTravel ?? 0, postAckTravel) : calibration.observedPostAckTravel
         var ceiling = calibration.overshootCeiling
-        var terminal = false
+        // Even a previously calibrated operation cannot retry after losing the
+        // current response. Latency-only telemetry remains retainable evidence.
+        var terminal = !hasResponseBracket
         if hasResponseBracket {
             let preError = wrap(calibration.targetYaw - response.samples.first!.yaw)
             let postError = wrap(calibration.targetYaw - response.samples.last!.yaw)
@@ -278,7 +319,8 @@ public enum FollowTurnBurstPlanner {
         return .init(calibration: .init(previous: calibration, rate: rate,
             send: max(calibration.maximumSendDuration ?? 0, response.sendResponseUptime - response.sendEntryUptime),
             stop: max(calibration.maximumStopDuration ?? 0, response.stopAcknowledgementUptime - response.stopObligationUptime),
-            travel: travel, ceiling: ceiling, terminal: terminal, response: response), rejection: nil,
+            travel: travel, ceiling: ceiling, terminal: terminal, measured: hasResponseBracket,
+            response: response), rejection: nil,
             signedResponse: hasResponseBracket ? net : nil,
             sampledAbsoluteTravel: hasResponseBracket ? sampledTravel : nil)
     }
@@ -289,15 +331,14 @@ public enum FollowTurnBurstPlanner {
         let error = wrap(input.calibration.targetYaw - input.actualYaw)
         if abs(error) <= input.profile.tolerance { return .arrived }
         let calibration = input.calibration
-        if calibration.terminalResolutionFailure || (calibration.completedResponses == 0 && input.provisionalProbeIssued) {
+        if calibration.terminalResolutionFailure || (calibration.measuredResponses == 0 &&
+            (input.provisionalProbeIssued || calibration.completedResponses > 0)) {
             return .resolutionFailure(.rotationResolutionInsufficient)
         }
         let excess = abs(error) - input.profile.tolerance
-        // E/R - A - C/R deliberately double-counts some equivalent response latency.
-        // Initial-stop duration alone is not a completed nonzero response allowance.
-        let allowance = (calibration.maximumSendDuration ?? 0) + (calibration.maximumStopDuration ?? 0)
-        let candidate = excess / calibration.responseRate - allowance
-            - (calibration.observedPostAckTravel ?? 0) / calibration.responseRate
+        // The end-to-end response per requested budget already includes transport,
+        // stopping and sampled coast. Charging them again prevents useful turns.
+        let candidate = excess / calibration.responseRate
         let budget = min(input.profile.maximumHostBurstBudget, candidate, calibration.overshootCeiling ?? .infinity)
         let deadline = input.sendEntryUptime + budget
         guard budget.isFinite, budget > 0, deadline.isFinite, deadline > input.sendEntryUptime else {

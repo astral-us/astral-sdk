@@ -39,7 +39,8 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                     continuation.yield(.frame(Self.batch(from: snapshot, detections: receipt.frame.detections,
                                                         trackingReason: reason, inferenceDuration: duration,
                                                         inferenceStatus: receipt.status == .executed ? .executed : .failed,
-                                                        inferenceFailureReason: receipt.failureReason)))
+                                                        inferenceFailureReason: receipt.failureReason,
+                                                        personVerification: receipt.personVerification ?? [])))
                 }
             }
             let lifecycleTask = Task {
@@ -64,12 +65,16 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                              trackingReason: FollowTrackingReason? = nil,
                              inferenceDuration: TimeInterval? = nil,
                               inferenceStatus: FollowInferenceStatus = .executed,
-                              inferenceFailureReason: Detector.FailureReason? = nil) -> FollowFrameBatch {
+                               inferenceFailureReason: Detector.FailureReason? = nil,
+                               personVerification: [PersonBodyVerifier.Decision]? = nil) -> FollowFrameBatch {
         let rawPeople = detections.filter { $0.label.lowercased() == "person" }
         let status: FollowInferenceStatus = snapshot.trackingQuality == .normal ? inferenceStatus : .skippedTracking
         let evaluated = status != .skippedTracking && status != .failed
         let detectorCountsKnown = status == .executed
-        let candidates = evaluated ? rawPeople.enumerated().map { id, detection in
+        // This public projection helper preserves trusted legacy callers. Live
+        // production always supplies explicit body decisions (including none).
+        let verified = personVerification.map { Set($0.filter(\.accepted).map(\.rawPersonID)) }
+        let candidates = evaluated ? rawPeople.enumerated().filter { verified?.contains($0.offset) ?? true }.map { id, detection in
             FollowPersonProjection.evaluate(box: detection.boundingBox, detectorConfidence: detection.confidence,
                                             rawPersonID: id, in: snapshot)
         } : []
@@ -80,13 +85,14 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                                            confidence: candidate.detectorConfidence, boundingBox: candidate.box,
                                            position: position, pose: snapshot.pose, rawPersonID: candidate.rawPersonID)
         }
-        let diagnostics = FollowPerceptionDiagnostics(frameID: snapshot.id, timestamp: snapshot.timestamp,
+        var diagnostics = FollowPerceptionDiagnostics(frameID: snapshot.id, timestamp: snapshot.timestamp,
             inferenceStatus: status, inferenceFailureReason: inferenceFailureReason,
             rawDetectorCount: detectorCountsKnown ? detections.count : nil, rawPersonCount: detectorCountsKnown ? rawPeople.count : nil,
             projectionAttemptedCount: evaluated ? candidates.count : nil,
             projectionAcceptedCount: evaluated ? people.count : nil,
             projectionRejectedCount: evaluated ? candidates.count - people.count : nil,
             projectedPersonCount: evaluated ? people.count : nil, candidates: candidates)
+        diagnostics.personVerification = evaluated ? personVerification : nil
         return FollowFrameBatch(frameID: snapshot.id, timestamp: snapshot.timestamp,
                                 pose: snapshot.trackingQuality == .normal ? snapshot.pose : nil,
                                 depthAvailable: snapshot.depthMap != nil, people: people,
