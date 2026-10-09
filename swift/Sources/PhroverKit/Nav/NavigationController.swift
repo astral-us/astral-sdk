@@ -450,9 +450,18 @@ public final class NavigationController {
         let started = now()
         var progress = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.01)
         var sent = false
-        var previousStop: (uptime: Double, frame: ARFrameID?)?
+        var previousStop: (uptime: Double, frame: ARFrameID?, returnedElapsed: TimeInterval)?
+        var stopReserve = RoverConfig.readySignalStopReserve
+        var confirmingStopped = false
         var pulseIndex = 0
         let limits = (travel: 0.12, backward: 0.02, lateral: 0.02, heading: 0.10, duration: 5.0)
+        func timingFields(at time: Date) -> [String: FollowDiagnosticValue] {
+            ["ready_elapsed_s": .number(time.timeIntervalSince(started)),
+             "ready_confirmation_active": .bool(confirmingStopped),
+             "ready_final_confirmation_s": .number(RoverConfig.readySignalFinalConfirmation),
+             "ready_stop_reserve_s": .number(stopReserve),
+             "ready_last_stop_elapsed_s": previousStop.map { .number($0.returnedElapsed) } ?? .null]
+        }
         while !Task.isCancelled {
             let ack = await currentLastAck()
             guard !Task.isCancelled, operationGeneration == ownedGeneration,
@@ -460,9 +469,10 @@ public final class NavigationController {
             // Actor acknowledgement reads can suspend. Sample clock and safety only
             // after that read so neither fresh acknowledgements nor changed hazards
             // are evaluated against an older snapshot.
+            let sample = readFollowPose()
             let time = now()
             let sourceTime = sourceNow()
-            let sample = readFollowPose()
+            FollowMotionTaskScope.evidence?.readyDiagnosticFields = timingFields(at: time)
             guard followPoseRejection(sample, at: sourceTime, expectedGeneration: sourceGeneration) == nil,
                   let pose = sample.pose else { return .failed(.trackingLost) }
             let delta = pose.position - start.position
@@ -482,7 +492,6 @@ public final class NavigationController {
                     "ready_signed_lateral_m": .number(delta.x * direction.y - delta.y * direction.x),
                     "ready_total_distance_m": .number(travel), "ready_heading_change_rad": .number(abs(headingChange)),
                     "ready_signed_heading_change_rad": .number(headingChange),
-                    "ready_elapsed_s": .number(time.timeIntervalSince(started)),
                     "ready_watchdog_elapsed_s": checkpoint.elapsed.map { .number($0) } ?? .null,
                     "ready_progress_timeout_s": .number(progress.timeout), "ready_minimum_progress_m": .number(progress.minimumProgress),
                     "ready_maximum_duration_s": .number(limits.duration), "ready_maximum_travel_m": .number(limits.travel),
@@ -493,6 +502,7 @@ public final class NavigationController {
                     "ready_source_timestamp_s": sample.sourceTimestamp.map { .number($0) } ?? .null,
                     "ready_source_read_uptime_s": .number(sourceTime),
                     "ready_source_age_s": sample.sourceTimestamp.map { .number(sourceTime - $0) } ?? .null]
+                    .merging(timingFields(at: time)) { _, latest in latest }
                 let evidence = FollowMotionTaskScope.evidence
                 evidence?.readyDiagnosticFields = fields
                 evidence?.recordFailure(.stalled, cause: cause)
@@ -521,10 +531,25 @@ public final class NavigationController {
             case .stopTipping: return .failed(.tipping)
             }
             guard !Task.isCancelled else { return .cancelled }
-            // Waiting for post-stop evidence must not renew progress from a
-            // rejected capture, and late displacement cannot revive a deadline.
+            // Reserve the last pulse's stop/drain cost. Once that reserve is
+            // reached, only read fresh post-stop evidence; never resume pulsing.
+            // A stop that returned after the movement cutoff cannot be rescued.
             let existingCheckpoint = progress.diagnosticSnapshot(distanceToGoal: 0.10 - along, now: time)
-            if time.timeIntervalSince(started) >= limits.duration { return fail(.readyOverallTimeout) }
+            let elapsed = time.timeIntervalSince(started)
+            if let previousStop, previousStop.returnedElapsed >= limits.duration { return fail(.readyOverallTimeout) }
+            if !confirmingStopped, elapsed + RoverConfig.readySignalPulseBudget + stopReserve >= limits.duration {
+                guard sent, previousStop != nil else { return fail(.readyOverallTimeout) }
+                confirmingStopped = true
+                diagnosticEmitter?.emit(.init(event: "follow_ready.confirmation_started", context: .init(
+                    operationID: FollowMotionTaskScope.evidence?.context.controllerOperationID,
+                    purpose: "followReady", phase: "signalingReady", outcome: "stopped_observation"), payload: [
+                        "ready_elapsed_s": .number(elapsed), "ready_along_m": .number(along),
+                        "ready_stop_reserve_s": .number(stopReserve),
+                        "ready_movement_cutoff_s": .number(limits.duration),
+                        "ready_confirmation_cutoff_s": .number(limits.duration + RoverConfig.readySignalFinalConfirmation)]))
+            }
+            let completionCutoff = limits.duration + (confirmingStopped ? RoverConfig.readySignalFinalConfirmation : 0)
+            if elapsed >= completionCutoff { return fail(.readyOverallTimeout) }
             if (existingCheckpoint.elapsed ?? 0) >= progress.timeout { return fail(.readyProgressTimeout) }
             if let previousStop, sourceGeneration != nil {
                 guard let id = sample.frameID, let timestamp = sample.sourceTimestamp else { return .failed(.trackingLost) }
@@ -535,6 +560,10 @@ public final class NavigationController {
             }
             // A pre-send pose correction is not measured progress from this signal.
             if along >= 0.08 { return sent ? .arrived : fail(.readyPreSendPoseShift) }
+            if confirmingStopped {
+                await sleep(.milliseconds(20))
+                continue
+            }
             if progress.observe(
                 distanceToGoal: 0.10 - along, now: time, commanded: true) { return fail(.readyProgressTimeout) }
             let speed = RoverConfig.readySignalWheelMagnitude
@@ -552,7 +581,7 @@ public final class NavigationController {
             let checkpoint = progress.diagnosticSnapshot(distanceToGoal: 0.10 - along, now: time)
             let validUntil = min(sample.sourceTimestamp.map { ($0 + 0.5).nextUp } ?? .infinity,
                 sourceTime + RoverConfig.commsWatchdogTimeout - time.timeIntervalSince(ack),
-                sourceTime + limits.duration - time.timeIntervalSince(started),
+                sourceTime + limits.duration - elapsed - RoverConfig.readySignalPulseBudget - stopReserve,
                 sourceTime + max(0, progress.timeout - (checkpoint.elapsed ?? 0)))
             do {
                 let pulse = try await executeFollowTurnBurst(WheelCommand(left: speed, right: speed),
@@ -562,9 +591,13 @@ public final class NavigationController {
                       FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed, recoveryAuthorized else { return .cancelled }
                 if pulse.send.result.failure != nil { return .failed(.commandFailed) }
                 let pulseReturnUptime = sourceNow()
+                let pulseReturnedElapsed = now().timeIntervalSince(started)
                 let stoppedSample = readFollowPose()
                 let stoppedPoseReadUptime = sourceNow()
-                previousStop = (pulse.confirmedStopFence?.acknowledgementUptime ?? sourceNow(), stoppedSample.frameID)
+                previousStop = (pulse.confirmedStopFence?.acknowledgementUptime ?? pulseReturnUptime,
+                    stoppedSample.frameID, pulseReturnedElapsed)
+                stopReserve = max(stopReserve,
+                    pulseReturnUptime - pulse.send.sendEntryUptime - RoverConfig.readySignalPulseBudget)
                 diagnosticEmitter?.emit(.init(event: "follow_ready.pulse_stopped", context: .init(
                     operationID: FollowMotionTaskScope.evidence?.context.controllerOperationID,
                     purpose: "followReady", phase: "signalingReady", outcome: "stop_confirmed"), payload: [

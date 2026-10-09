@@ -4,6 +4,108 @@ import RoverNav
 
 @MainActor
 final class NavigationFollowReadySignalTests: XCTestCase {
+    func testNearEightCentimetersStopsPulsingAndConfirmsFreshArrivalAfterMovementCutoff() async throws {
+        try await exerciseFinalReadyConfirmation(fault: nil)
+    }
+
+    func testStoppedReadyConfirmationKeepsFixedDeadlineAndSafetyGates() async throws {
+        for fault in ["deadline", "late_confirmation_read", "never_arrives", "cached", "lateral", "travel", "heading", "tracking", "obstacle"] {
+            try await exerciseFinalReadyConfirmation(fault: fault)
+        }
+    }
+
+    func testTimelyStopIsNotRelabeledLateByItsPoseRead() async throws {
+        try await exerciseFinalReadyConfirmation(fault: "slow_stop_pose")
+    }
+
+    private func exerciseFinalReadyConfirmation(fault: String?) async throws {
+        var time = 100.0
+        var sourceTime = time
+        var sequence: UInt64 = 1
+        var position = Vec2.zero
+        var yaw = 0.0
+        var sends = 0
+        var stopped = true
+        var finalWindow = false
+        var sendsAtFinalWindow = 0
+        var finalObservationDelivered = false
+        var lastStopTime = time
+        var delayedPoseRead = false
+        let sink = FollowDiagnosticRecordingSink()
+        let controller = NavigationController(currentPose: { .init(position: position, yaw: yaw) },
+            forwardClearance: { fault == "obstacle" && finalObservationDelivered ? 0.2 : 2 },
+            plan: { _, goal in [goal] }, lastAckAt: { Date(timeIntervalSince1970: time) },
+            sendCommand: { _ in
+                XCTAssertFalse(finalWindow, "Once the final stop reserve is reached, no further pulse may start")
+                sends += 1
+                if finalWindow { throw URLError(.badURL) }
+                stopped = false
+                time += 0.03
+                position = Vec2(min(0.07973381900182698, Double(sends) * 0.003), 0)
+            }, stopRover: {
+                if !stopped { time += 0.03 }
+                stopped = true
+                lastStopTime = time
+            }, sleep: { duration in
+                let seconds = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+                time += max(0.001, seconds)
+                sequence += 1
+                sourceTime = time
+                if stopped, time >= 104.90, !finalWindow {
+                    finalWindow = true
+                    sendsAtFinalWindow = sends
+                    time = max(time, 104.94)
+                    sourceTime = time
+                    position = Vec2(0.07973381900182698, 0)
+                } else if finalWindow, time >= 105.10, !finalObservationDelivered {
+                    finalObservationDelivered = true
+                    time = fault == "deadline" ? 105.301 : 105.169281005859375
+                    sourceTime = time - 0.072033917036606
+                    position = Vec2(fault == "never_arrives" ? 0.07973381900182698 : 0.09351910367494558, 0)
+                    if fault == "lateral" { position.y = 0.03 }
+                    if fault == "travel" { position.x = 0.13 }
+                    if fault == "heading" { yaw = 0.12 }
+                }
+                if fault == "cached", finalWindow { sourceTime = lastStopTime }
+                await Task.yield()
+            }, now: { Date(timeIntervalSince1970: time) }, diagnosticEmitter: .init(
+                streamID: "ready-final-confirmation", monotonic: { time }, utc: { Date() }, sink: sink.append),
+            poseSample: {
+                if fault == "late_confirmation_read", finalObservationDelivered, !delayedPoseRead {
+                    delayedPoseRead = true
+                    time = 105.301
+                    sourceTime = 105.25
+                    sequence += 1
+                }
+                if fault == "slow_stop_pose", stopped, time >= 104.8, !delayedPoseRead {
+                    delayedPoseRead = true
+                    time = 105.01
+                    sourceTime = 104.98
+                    sequence += 1
+                }
+                return .init(pose: .init(position: position, yaw: yaw), frameID: .init(generation: 1, sequence: sequence),
+                    sourceTimestamp: sourceTime, trackingQuality: fault == "tracking" && finalObservationDelivered ? .limited : .normal)
+            }, sourceNow: { time })
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.ready, context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning"))
+        XCTAssertTrue(finalWindow)
+        switch fault {
+        case nil, "slow_stop_pose": XCTAssertEqual(result.result, .arrived)
+        case "tracking": XCTAssertEqual(result.result, .failed(.trackingLost))
+        case "obstacle": XCTAssertEqual(result.result, .failed(.obstacle))
+        default: XCTAssertEqual(result.result, .failed(.stalled), fault ?? "")
+        }
+        XCTAssertEqual(sends, sendsAtFinalWindow)
+        XCTAssertTrue(stopped)
+        XCTAssertGreaterThan(time, 105)
+        if fault == nil { XCTAssertLessThan(time, 105.3) }
+        XCTAssertLessThan(time, 105.33, "Confirmation must not renew its deadline")
+        XCTAssertEqual(sink.records.filter { $0.event == "follow_ready.confirmation_started" }.count, 1)
+        if let failure = result.failure {
+            XCTAssertEqual(failure.turnDiagnosticFields["ready_confirmation_active"], .bool(true), fault ?? "")
+        }
+    }
+
     func testReadyGeometryRejectionsReportTheActualGuardAndPoseInsteadOfProgressTimeout() async throws {
         for (point, heading, reason) in [
             (Vec2(0.13, 0), 0.0, "ready_travel_limit"),
@@ -108,7 +210,8 @@ final class NavigationFollowReadySignalTests: XCTestCase {
             }, sourceNow: { time })
         let result = await NavigationFollowMeMotion(navigation: controller).signalReady()
         XCTAssertEqual(result, .failed(.stalled), "Late measured displacement cannot turn an expired readiness move into success")
-        XCTAssertEqual(sends, repeated ? 3 : 1)
+        XCTAssertEqual(sends, repeated ? 2 : 1,
+            "Measured stop/drain overhead must reserve enough time instead of admitting a third late pulse")
     }
 
     func testReadyPulseCannotCompleteOrRepeatUsingAPreStopCapture() async throws {

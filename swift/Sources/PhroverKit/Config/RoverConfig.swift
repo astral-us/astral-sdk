@@ -34,6 +34,11 @@ public enum RoverConfig {
     static let readySignalWheelMagnitude = 0.25
     static let readySignalPulseBudget: TimeInterval = 0.040
     static let readySignalStoppedObservation: TimeInterval = 0.100
+    /// Minimum host-time allowance for draining a ready pulse and confirming stop.
+    /// Measured overhead can increase this estimate; it is not a motor-time guarantee.
+    static let readySignalStopReserve: TimeInterval = 0.100
+    /// Read-only confirmation after the five-second movement cutoff. Never permits a pulse.
+    static let readySignalFinalConfirmation: TimeInterval = 0.300
     /// Search turns pulse the motors instead of spinning continuously. The pause gives
     /// ARKit pose and Core ML detection a stable camera frame between heading changes.
     public static let scanTurnPulseDuration: TimeInterval = 0.08
