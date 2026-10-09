@@ -4,6 +4,131 @@ import CoreVideo
 @testable import PhroverKit
 
 final class RoverControlTests: XCTestCase {
+    @MainActor
+    func testReadyPulseExpiringInSenderQueueNeverEntersMotorHTTP() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = Array(repeating: .success((Data(), HTTPURLResponse(
+            url: URL(string: "http://192.168.4.1/js")!, statusCode: 200, httpVersion: nil, headerFields: nil)!)), count: 4)
+        let clock = BurstTestClock(10)
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        var receipt: RoverCommandDiagnosticResult?
+        let controller = NavigationController(currentPose: { .init(position: .zero, yaw: 0) },
+            forwardClearance: { 2 }, plan: { _, goal in [goal] }, lastAckAt: { await control.lastAckAt },
+            sendCommand: { _ in XCTFail("Real receipt sender must be used") },
+            stopRover: { _ = try await control.stopWithReceipt().get() },
+            sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { command in
+                clock.set(clock.now + 0.041)
+                let result = await control.sendNavigationWithReceipt(command)
+                receipt = result
+                return result
+            }, poseSample: {
+                .init(pose: .init(position: .zero, yaw: 0), frameID: .init(generation: 1, sequence: 1),
+                    sourceTimestamp: 9.99, trackingQuality: .normal)
+            }, sourceNow: { clock.now }, transportUptime: { clock.now })
+        let result = await NavigationFollowMeMotion(navigation: controller).perform(.ready, context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followReady, phase: "aligning"))
+        XCTAssertEqual(receipt?.receipt.attempts, 0)
+        XCTAssertEqual(receipt?.receipt.outcome, "expired")
+        XCTAssertEqual(result.result, .failed(.commandFailed))
+        XCTAssertNil(result.context.failureCause, "Ready expiry is not a rotation-resolution failure")
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        for request in StubURLProtocol.requests {
+            let json = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+                .queryItems?.first?.value)
+            let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            XCTAssertEqual(payload["T"] as? Int, 1)
+            XCTAssertEqual(payload["L"] as? Double, 0)
+            XCTAssertEqual(payload["R"] as? Double, 0)
+        }
+    }
+
+    func testStopClearsWaveRoverWheelOutputsEvenWhenUnknownOpcodesReturnHTTP200() async throws {
+        // Vendor WAVE_ROVER_V0.9: /js returns 200 after dispatch even for
+        // unhandled opcodes. Only T:1 with L/R updates the chassis outputs.
+        StubURLProtocol.reset()
+        StubURLProtocol.results = Array(repeating: .success((Data("{}".utf8), HTTPURLResponse(
+            url: URL(string: "http://192.168.4.1/js")!, statusCode: 200, httpVersion: nil, headerFields: nil)!)), count: 3)
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        try await control.sendNavigation(.init(left: -0.25, right: 0.25))
+        try await control.stop()
+        try await control.probeLink()
+
+        var left = 0.0
+        var right = 0.0
+        var wheelHistory: [[Double]] = []
+        for request in StubURLProtocol.requests {
+            let url = try XCTUnwrap(request.url)
+            let json = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "json" })?.value)
+            let command = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+            // Protocol fixture deliberately ignores unknown T values like firmware;
+            // an HTTP-success-only stub would miss the actual stop defect.
+            if command["T"] as? Int == 1,
+               let l = command["L"] as? Double, let r = command["R"] as? Double {
+                left = l; right = r
+            }
+            wheelHistory.append([left, right])
+        }
+        XCTAssertEqual(wheelHistory, [[0.25, -0.25], [0, 0], [0, 0]],
+            "Stop must clear both wheel outputs before observation/heartbeat; HTTP 200 alone cannot stop the base")
+    }
+
+    @MainActor
+    func testPartialSearchSweepCannotCompleteFromLaterUnsentTargetPose() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.results = Array(repeating: .success((Data(), HTTPURLResponse(
+            url: URL(string: "http://192.168.4.1/js")!, statusCode: 200, httpVersion: nil, headerFields: nil)!)), count: 8)
+        let clock = BurstTestClock(10)
+        let control = RoverControl(session: URLSession(configuration: .stubbed))
+        func sample(_ id: UInt64, _ yaw: Double) -> NavigationPoseSample {
+            .init(pose: .init(position: .zero, yaw: yaw), frameID: .init(generation: 1, sequence: id),
+                sourceTimestamp: clock.now - 0.001, trackingQuality: .normal)
+        }
+        var snapshot = sample(1, 0)
+        var sends = 0
+        var stops = 0
+        var denied: RoverCommandDiagnosticResult?
+        var controller: NavigationController!
+        controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { await control.lastAckAt }, sendCommand: { _ in XCTFail() },
+            stopRover: { _ = try await control.stopWithReceipt().get(); stops += 1 },
+            sleep: { try? await Task.sleep(for: $0) }, sendCommandReceipt: { command in
+                sends += 1
+                let entry = FollowTurnBurstTransportScope.authorization!.sendEntryUptime
+                if sends == 1 {
+                    let receipt = await control.sendNavigationWithReceipt(command)
+                    clock.set(entry + 0.081)
+                    snapshot = sample(3, 0.02)
+                    controller.ingestFollowTurnSource(snapshot)
+                    return receipt
+                }
+                clock.set(entry + 0.002)
+                snapshot = sample(5, 0.31)
+                controller.ingestFollowTurnSource(snapshot)
+                let receipt = await control.sendNavigationWithReceipt(command)
+                denied = receipt
+                return receipt
+            }, poseSample: { snapshot }, sourceNow: { clock.now }, sourceStopSnapshot: { snapshot }, transportUptime: { clock.now })
+        let task = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true)) }
+        for _ in 0..<2000 where stops < 1 { await Task.yield() }
+        clock.set(10.301); snapshot = sample(2, 0); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<4000 where stops < 2 { await Task.yield() }
+        XCTAssertEqual(stops, 2)
+        clock.set(clock.now + 0.301); snapshot = sample(4, 0.02); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<4000 where stops < 3 { await Task.yield() }
+        XCTAssertEqual(stops, 3)
+        XCTAssertEqual(denied?.receipt.attempts, 0)
+        XCTAssertEqual(denied?.receipt.outcome, "fenced")
+        clock.set(clock.now + 0.301); snapshot = sample(6, 0.3); controller.ingestFollowTurnSource(snapshot)
+        let result = await task.value
+        XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient),
+            "A later target pose cannot fill the unmeasured remainder of a partial sweep")
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(result.searchSweepTravel ?? -1, 0.02, accuracy: 1e-12)
+        XCTAssertEqual(StubURLProtocol.requestCount, 4, "One motor request and three confirmed stops")
+    }
+
     func testTargetFenceCannotRelabelEarlierExpiryOrOwnershipInhibition() {
         for earlier in ["expiry", "owner", "stale_snapshot"] {
             let fence = FollowTurnBurstFence()
@@ -380,7 +505,9 @@ final class RoverControlTests: XCTestCase {
         for request in StubURLProtocol.requests {
             let json = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "json" }?.value)
             let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
-            XCTAssertEqual(payload["T"] as? Int, 0, "Every actual HTTP command is a stop; no motion/retry")
+            XCTAssertEqual(payload["T"] as? Int, 1)
+            XCTAssertEqual(payload["L"] as? Double, 0, "Every actual HTTP command clears the wheels; no nonzero motion/retry")
+            XCTAssertEqual(payload["R"] as? Double, 0)
         }
         _ = await coordinator.stop()
     }
@@ -1180,8 +1307,9 @@ final class RoverControlTests: XCTestCase {
         let url = try XCTUnwrap(StubURLProtocol.lastRequest?.url)
         let json = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first?.value)
         let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
-        XCTAssertEqual(payload["T"] as? Int, 0)
-        XCTAssertNil(payload["L"])
+        XCTAssertEqual(payload["T"] as? Int, 1)
+        XCTAssertEqual(payload["L"] as? Double, 0)
+        XCTAssertEqual(payload["R"] as? Double, 0)
     }
 
     func testRetriesTransientCommandTimeoutBeforeFailingNavigationLink() async throws {

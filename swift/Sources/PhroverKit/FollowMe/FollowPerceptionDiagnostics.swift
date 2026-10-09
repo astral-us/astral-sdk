@@ -33,6 +33,8 @@ public struct FollowProjectionEvidence {
     public internal(set) var clippedRight: Bool?
     public internal(set) var clippedTop: Bool?
     public internal(set) var feet: CGPoint?
+    public internal(set) var depthAnchor: CGPoint?
+    public internal(set) var depthAnchorKind: String?
     public internal(set) var sensorPixel: CGPoint?
     public internal(set) var depthPixel: CGPoint?
     public internal(set) var depthCenter: CGPoint?
@@ -88,6 +90,11 @@ extension FollowPerceptionDiagnostics {
     }
 
     static func payload(_ facts: Self?) -> [String: FollowDiagnosticValue] {
+        func box(_ value: CGRect?) -> FollowDiagnosticValue {
+            guard let value else { return .null }
+            return .object(["x": .number(Double(value.origin.x)), "y": .number(Double(value.origin.y)),
+                "width": .number(Double(value.width)), "height": .number(Double(value.height))])
+        }
         var result: [String: FollowDiagnosticValue] = [
             "inference_status": .string(facts?.inferenceStatus.rawValue ?? "unknown"),
             "inference_failure_reason": facts?.inferenceFailureReason.map { .string($0.rawValue) } ?? .null,
@@ -97,6 +104,10 @@ extension FollowPerceptionDiagnostics {
         result["person_body_verification"] = facts?.personVerification.map { .array($0.map { decision in .object([
             "raw_person_id": .number(Double(decision.rawPersonID)), "accepted": .bool(decision.accepted),
             "reason": .string(decision.reason), "matching_bodies": .number(Double(decision.matchingBodies)),
+            "input_box": box(decision.inputBox), "normalized_box": box(decision.normalizedBox),
+            "box_issue": decision.boxIssue.map { .string($0) } ?? .null,
+            "verified_depth_anchor": decision.depthAnchor.map { .object([
+                "x": .number(Double($0.x)), "y": .number(Double($0.y))]) } ?? .null,
             "identity_claim": .string("none_body_geometry_only")]) }) } ?? .null
         result["body_verified_person_count"] = facts?.personVerification.map { .number(Double($0.filter(\.accepted).count)) } ?? .null
         let counts: [(String, Int?)] = [
@@ -137,6 +148,7 @@ extension FollowProjectionEvidence {
             "clipped_left": flag(clippedLeft), "clipped_right": flag(clippedRight),
             "clipped_bottom": flag(clippedBottom), "clipped_top": flag(clippedTop),
             "feet": point(feet), "sensor_pixel": point(sensorPixel), "depth_pixel": point(depthPixel),
+            "depth_anchor": point(depthAnchor), "depth_anchor_kind": depthAnchorKind.map { .string($0) } ?? .null,
             "depth_center": point(depthCenter), "requested_sample_count": .number(25),
             "valid_sample_count": number(validSampleCount), "invalid_depth_count": number(invalidDepthCount),
             "low_confidence_count": number(lowConfidenceCount),

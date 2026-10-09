@@ -22,6 +22,7 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
         // Never discard a safety event when a newer camera frame arrives. The upstream
         // AR snapshot stream already bounds frame production to its newest sample.
         return AsyncStream(bufferingPolicy: .unbounded) { continuation in
+            let consumer = detector.beginFollowConsumer()
             let frameTask = Task { [detector, ar] in
                 for await snapshot in frames {
                     guard !Task.isCancelled else { break }
@@ -54,9 +55,10 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                     }
                 }
             }
-            continuation.onTermination = { @Sendable _ in
+            continuation.onTermination = { @Sendable [detector] _ in
                 frameTask.cancel()
                 lifecycleTask.cancel()
+                detector.endFollowConsumer(consumer)
             }
         }
     }
@@ -75,16 +77,19 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
         // This public projection helper preserves trusted legacy callers. Live
         // production always supplies explicit body decisions (including none).
         let verified = personVerification.map { Set($0.filter(\.accepted).map(\.rawPersonID)) }
-        let candidates = evaluated ? rawPeople.enumerated().filter { verified?.contains($0.offset) ?? true }.map { id, detection in
-            FollowPersonProjection.evaluate(box: detection.boundingBox, detectorConfidence: detection.confidence,
-                                            rawPersonID: id, in: snapshot)
+        let candidates: [FollowProjectionEvidence] = evaluated ? rawPeople.enumerated().filter { verified?.contains($0.offset) ?? true }.map { id, detection in
+            let decision = personVerification?.first { $0.rawPersonID == id && $0.accepted }
+            return FollowPersonProjection.evaluate(box: decision?.normalizedBox ?? detection.boundingBox,
+                detectorConfidence: detection.confidence, rawPersonID: id, in: snapshot,
+                bodyVerified: decision != nil, verifiedDepthAnchor: decision?.depthAnchor)
         } : []
         let people: [FollowPersonObservation] = candidates.compactMap { candidate in
             guard let position = candidate.position, candidate.rejection == nil,
                   position.x.isFinite, position.y.isFinite else { return nil }
             return FollowPersonObservation(frameID: snapshot.id, timestamp: snapshot.timestamp,
                                            confidence: candidate.detectorConfidence, boundingBox: candidate.box,
-                                           position: position, pose: snapshot.pose, rawPersonID: candidate.rawPersonID)
+                                            position: position, pose: snapshot.pose, rawPersonID: candidate.rawPersonID,
+                                            bodyVerified: verified?.contains(candidate.rawPersonID) == true)
         }
         var diagnostics = FollowPerceptionDiagnostics(frameID: snapshot.id, timestamp: snapshot.timestamp,
             inferenceStatus: status, inferenceFailureReason: inferenceFailureReason,

@@ -31,7 +31,9 @@ enum FollowTurnOperationExecutor {
     static func execute(targetYaw: Double, generation: UInt64, operationID: UInt64,
                          profile: FollowTurnBurstPlanner.Profile,
                           runtime: FollowTurnRuntimeState,
-                         responseRateFloor: Double = 2 * .pi / 3,
+                          responseRateFloor: Double = 2 * .pi / 3,
+                         requestedSearchSweep: Double? = nil,
+                         searchSweepProgress: (Double, Double) -> Void = { _, _ in },
                         uptime: () -> Double, now: () -> Date, authorized: () -> Bool,
                         admit: (FollowTurnWaitingProgress) async -> FollowTurnSourceResult,
                           burst: (WheelCommand, Double, FollowTurnWaitingProgress, FollowTurnBurstPlanner.Sample?, NavigationPoseSample) async throws -> FollowTurnBurstExecutionReceipt,
@@ -46,6 +48,8 @@ enum FollowTurnOperationExecutor {
             set { runtime.progress = newValue }
         }
         var probeIssued = false
+        var sweptAngle = 0.0
+        var sampledTravel = 0.0
         while authorized(), !Task.isCancelled {
             let selection = await admit(progress)
             guard authorized(), !Task.isCancelled else { return .cancelled }
@@ -59,14 +63,23 @@ enum FollowTurnOperationExecutor {
             guard let pose = sample.pose else { return .failed(.trackingLost) }
             progress.distanceToGoal = abs(FollowReacquisitionPlanner.wrap(targetYaw - pose.yaw))
             let planningUptime = uptime()
-            let decision = FollowTurnBurstPlanner.plan(.init(actualYaw: pose.yaw, profile: profile,
-                calibration: calibration, sendEntryUptime: planningUptime, provisionalProbeIssued: probeIssued))
+            let input = FollowTurnBurstPlanner.Input(actualYaw: pose.yaw, profile: profile,
+                calibration: calibration, sendEntryUptime: planningUptime, provisionalProbeIssued: probeIssued)
+            let decision = requestedSearchSweep.map {
+                FollowTurnBurstPlanner.planSearchSweep(input, requestedAngle: $0, signedProgress: sweptAngle)
+            } ?? FollowTurnBurstPlanner.plan(input)
             diagnostic(calibration, sample, decision, planningUptime)
             switch decision {
-            case .arrived: return .arrived
+            case .arrived:
+                // A later pose alone cannot manufacture directed sweep evidence.
+                if requestedSearchSweep != nil && probeIssued { return .failed(.rotationResolutionInsufficient) }
+                return .arrived
             case .resolutionFailure(let reason): return .failed(reason)
             case .unavailable: return .failed(.trackingLost)
             case .burst(let direction, let budget):
+                if let sweep = requestedSearchSweep, direction != (sweep < 0 ? -1 : 1) {
+                    return .failed(.rotationResolutionInsufficient)
+                }
                 if progress.watchdog.observe(distanceToGoal: progress.distanceToGoal, now: now(), commanded: true) {
                     return .failed(.stalled)
                 }
@@ -102,6 +115,12 @@ enum FollowTurnOperationExecutor {
                         guard error.isFinite, error <= profile.tolerance else {
                             return .failed(.rotationResolutionInsufficient)
                         }
+                        // This branch has no entered command/response bracket.
+                        // A target pose can complete an exact heading, but cannot
+                        // supply the unmeasured remainder of a directed sweep.
+                        guard requestedSearchSweep == nil else {
+                            return .failed(.rotationResolutionInsufficient)
+                        }
                         diagnostic(calibration, settled, .arrived, uptime())
                         return .arrived
                     }
@@ -133,7 +152,27 @@ enum FollowTurnOperationExecutor {
                 guard let pose = settled.pose else { return .failed(.trackingLost) }
                 let error = abs(FollowReacquisitionPlanner.wrap(targetYaw - pose.yaw))
                 guard error.isFinite else { return .failed(.trackingLost) }
-                if error <= profile.tolerance {
+                if let sweep = requestedSearchSweep {
+                    guard let reduction, reduction.rejection == nil,
+                          let net = reduction.signedResponse, let travel = reduction.sampledAbsoluteTravel else {
+                        FollowMotionTaskScope.evidence?.recordFailure(.rotationResolutionInsufficient,
+                            cause: .calibrationEvidenceIncomplete)
+                        return .failed(.rotationResolutionInsufficient)
+                    }
+                    guard net * (sweep < 0 ? -1 : 1) >= 0 else {
+                        return .failed(.rotationResolutionInsufficient)
+                    }
+                    sweptAngle += net
+                    sampledTravel += travel
+                    guard sweptAngle.isFinite, sampledTravel.isFinite else { return .failed(.rotationResolutionInsufficient) }
+                    searchSweepProgress(sweptAngle, sampledTravel)
+                    // Search covers an arc and then looks from the confirmed stopped
+                    // pose. It does not reverse to recover an already swept heading.
+                    if sweptAngle * (sweep < 0 ? -1 : 1) >= abs(sweep) {
+                        diagnostic(reduction.calibration, settled, .arrived, uptime())
+                        return .arrived
+                    }
+                } else if error <= profile.tolerance {
                     diagnostic(reduction?.calibration ?? calibration, settled, .arrived, uptime())
                     return .arrived
                 }

@@ -22,14 +22,14 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(sends, 2)
         let all = try records(sink)
         let second = try XCTUnwrap(all.first { $0["event"] as? String == "follow_scan.send_begin" && $0["burst_index"] as? Int == 2 })
-        XCTAssertEqual(try XCTUnwrap(second["retained_response_rate_rad_s"] as? Double), 2.5, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(second["retained_response_rate_rad_s"] as? Double), 2.43902439024390, accuracy: 1e-12)
         XCTAssertEqual(second["requested_host_budget_s"] as? Double, 0.080)
         XCTAssertTrue(second["bracket_sample_count"] is NSNull)
         XCTAssertTrue(second["post_ack_sample_endpoints"] is NSNull)
         XCTAssertTrue(second["send_response_uptime_s"] is NSNull)
         XCTAssertTrue(second["sender_outcome"] is NSNull)
         let final = try XCTUnwrap(all.last { $0["event"] as? String == "follow_scan.burst_response" })
-        XCTAssertEqual(try XCTUnwrap(final["retained_response_rate_rad_s"] as? Double), 7.5, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(final["retained_response_rate_rad_s"] as? Double), 7.31707317073171, accuracy: 1e-12)
     }
 
     func testThreeDegreeProbeTraceUsesReferenceOnlyAndSubMillisecondExcessWithoutInventedFloor() async throws {
@@ -97,7 +97,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertNil(result.failure)
     }
 
-    func testOvershootTraceRetainsDiagnosticLatencyAndUnknownCoastThroughSmallerCorrection() async throws {
+    func testOvershootTraceReportsMeasuredResolutionBeforeIneffectiveCorrection() async throws {
         let source = FollowRecoveryDiagnosticSourceFixture()
         let sink = FollowDiagnosticRecordingSink()
         let emitter = FollowDiagnosticEmitter(streamID: "model", monotonic: { 500 }, utc: { Date() }, sink: sink.append)
@@ -113,16 +113,17 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         source.controller = controller
         let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(0.3), context:
             .init(sessionGeneration: 9, requestToken: 902, purpose: .followScan, phase: "scanning"))
-        XCTAssertEqual(result.result, .arrived)
-        XCTAssertEqual(sends, 2)
+        XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient))
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(sends, 1)
         let events = try records(sink)
-        XCTAssertNil(result.failure)
+        XCTAssertNotNil(result.failure)
         let planned = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.burst_plan" })
         XCTAssertEqual(planned["response_rate_confidence"] as? String, "provisional_reference")
         XCTAssertTrue(planned["maximum_send_duration_s"] is NSNull)
         let measured = try XCTUnwrap(events.first { $0["event"] as? String == "follow_scan.burst_response" })
         XCTAssertEqual(measured["bracket_valid"] as? Bool, true)
-        XCTAssertEqual(try XCTUnwrap(measured["retained_response_rate_rad_s"] as? Double), 6.25, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(measured["retained_response_rate_rad_s"] as? Double), 4.16666666666667, accuracy: 1e-12)
         XCTAssertEqual(try XCTUnwrap(measured["maximum_send_duration_s"] as? Double), 0.1, accuracy: 1e-12)
         XCTAssertEqual(try XCTUnwrap(measured["maximum_stop_duration_s"] as? Double), 0.04, accuracy: 1e-12)
         XCTAssertEqual(measured["post_ack_travel_confidence"] as? String, "unknown")
@@ -131,11 +132,12 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
         XCTAssertEqual(measured["post_source_frame_id"] as? String, "4:12")
         let plans = events.filter { $0["event"] as? String == "follow_scan.burst_plan" }
         let correction = try XCTUnwrap(plans.dropFirst().first)
-        XCTAssertEqual(correction["allowance_policy"] as? String, "included_in_measured_response;diagnostic_only")
-        XCTAssertEqual(try XCTUnwrap(correction["selected_budget_s"] as? Double), 0.01245231237766351, accuracy: 1e-12)
-        XCTAssertEqual(correction["direction"] as? Int, -1)
+        XCTAssertEqual(correction["allowance_policy"] as? String, "command_stop_window_overhead_once;coast_in_response")
+        XCTAssertTrue(correction["selected_budget_s"] is NSNull)
+        XCTAssertEqual(try XCTUnwrap(correction["candidate_budget_s"] as? Double), -0.021321531433504737, accuracy: 1e-12)
+        XCTAssertEqual(correction["planning_decision"] as? String, "rotation_resolution_insufficient")
         XCTAssertEqual(correction["stop_outcome"] as? String, "confirmed")
-        XCTAssertFalse(events.contains { $0["event"] as? String == "follow_scan.failure" })
+        XCTAssertTrue(events.contains { $0["event"] as? String == "follow_scan.failure" })
     }
 
     func testRuntimeBurstTraceCapturesLateAckAndOnlyActuallyEnteredWaits() async throws {
@@ -500,6 +502,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let source = FollowRecoveryDiagnosticSourceFixture()
             var stops = 0
             var sends = 0
+            let terminalStop = request.purpose == .followReady ? 3 : 2
             let controller = NavigationController(currentPose: { source.pose }, forwardClearance: { 2 }, plan: { _, goal in [goal] },
                 lastAckAt: { Date() }, sendCommand: { _ in
                     sends += 1
@@ -507,7 +510,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
                     source.capture(after: 0.001)
                 }, stopRover: {
                     stops += 1; await Task.yield()
-                    if stops >= 2 { source.generation = 5; source.capture(after: 0.001) }
+                    if stops >= terminalStop { source.generation = 5; source.capture(after: 0.001) }
                 }, sleep: source.advance, poseSample: { source.snapshot }, sourceNow: { source.uptime },
                 sourceEvents: { source.events.stream }, sourceStopSnapshot: { source.snapshot })
             source.controller = controller
@@ -516,7 +519,7 @@ final class NavigationFollowScanDiagnosticsTests: XCTestCase {
             let context = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 8, purpose: request.purpose, phase: "recovery")
             results.append(await NavigationFollowMeMotion(navigation: controller).performContextual(request, context: context, recovery: authorization).result)
             XCTAssertEqual(sends, 1)
-            XCTAssertEqual(stops, 2, "Generation fault must reach the actual terminal stop")
+            XCTAssertEqual(stops, terminalStop, "Generation fault must reach the actual terminal stop, after readiness pulse stopping")
         }
         XCTAssertEqual(results, [.failed(.trackingLost), .failed(.trackingLost)])
     }

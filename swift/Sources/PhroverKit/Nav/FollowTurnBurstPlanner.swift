@@ -8,21 +8,33 @@ public enum FollowTurnBurstPlanner {
     public struct Profile: Sendable, Equatable {
         public let maximumHostBurstBudget: Double = 0.080
         public let initialReferenceRate: Double = 2 * .pi / 3
-        public let settleWait: Double = 0.300
+        public let settleWait: Double
         public let fixedWheelMagnitude: Double = 0.25
         public let tolerance: Double
-        public init(purpose: Purpose) { tolerance = purpose == .alignment ? 0.05 : 7 * .pi / 180 }
+        public init(purpose: Purpose) { self.init(purpose: purpose, fastSearch: false) }
+        init(purpose: Purpose, fastSearch: Bool) {
+            tolerance = purpose == .alignment ? 0.05 : 7 * .pi / 180
+            settleWait = fastSearch ? 0.100 : 0.300
+        }
     }
     public struct Calibration: Sendable, Equatable {
+        public struct ObservedBurst: Sendable, Equatable {
+            public let budget: Double
+            public let signedTravel: Double
+            public let absoluteTravel: Double
+        }
         public let operationID: UInt64
         public let generation: UInt64
         public let targetYaw: Double
         public let clockDomain: String
-        /// Conservative end-to-end AR travel per second of requested host budget,
+        /// Conservative end-to-end AR travel per second of command/stop window,
         /// not instantaneous angular velocity or a physical speed guarantee.
         public let responseRate: Double
-        /// Diagnostic host durations, already included in measured burst response.
-        /// They are not separate deductions from the next requested budget.
+        /// Observed window beyond the requested budget. Kept separately from gain
+        /// so shrinking a request cannot amplify fixed transport/stop overhead.
+        public let responseOverhead: Double
+        public let lastObservedBurst: ObservedBurst?
+        /// Diagnostic durations; these overlap and must not be summed for planning.
         public let maximumSendDuration: Double?
         public let maximumStopDuration: Double?
         /// Partial sampled travel after acknowledgement, not total physical coast.
@@ -42,6 +54,8 @@ public enum FollowTurnBurstPlanner {
             self.targetYaw = targetYaw
             self.clockDomain = clockDomain
             responseRate = responseRateFloor.isFinite ? max(2 * .pi / 3, responseRateFloor) : .infinity
+            responseOverhead = 0
+            lastObservedBurst = nil
             maximumSendDuration = nil
             maximumStopDuration = nil
             observedPostAckTravel = nil
@@ -54,14 +68,16 @@ public enum FollowTurnBurstPlanner {
             lastSourceTimestamp = nil
             lastSourceSample = nil
         }
-        fileprivate init(previous: Self, rate: Double, send: Double, stop: Double,
+        fileprivate init(previous: Self, rate: Double, overhead: Double, send: Double, stop: Double,
                           travel: Double?, ceiling: Double? = nil, terminal: Bool = false,
-                          measured: Bool, response: Response) {
+                          measured: Bool, response: Response, observedBurst: ObservedBurst?) {
             operationID = previous.operationID
             generation = previous.generation
             targetYaw = previous.targetYaw
             clockDomain = previous.clockDomain
             responseRate = rate
+            responseOverhead = overhead
+            lastObservedBurst = observedBurst
             maximumSendDuration = send
             maximumStopDuration = stop
             observedPostAckTravel = travel
@@ -217,6 +233,7 @@ public enum FollowTurnBurstPlanner {
               response.stopObligationUptime >= response.sendEntryUptime,
               response.stopAcknowledgementUptime >= max(response.sendResponseUptime, response.stopObligationUptime),
               response.requestedBudget.isFinite, response.requestedBudget > 0,
+              response.sendEntryUptime + response.requestedBudget > response.sendEntryUptime,
               response.requestedBudget <= profile.maximumHostBurstBudget else { return reject("invalid_host_timing") }
         if let previousAck = calibration.lastStopAcknowledgementUptime,
            response.sendEntryUptime <= previousAck { return reject("replayed_response") }
@@ -273,6 +290,7 @@ public enum FollowTurnBurstPlanner {
             }
         }
         var rate = calibration.responseRate
+        var overhead = calibration.responseOverhead
         var net = 0.0
         var sampledTravel = 0.0
         var postAckTravel = 0.0
@@ -292,11 +310,16 @@ public enum FollowTurnBurstPlanner {
         if hasResponseBracket {
             let duration = response.samples.last!.sourceTimestamp! - response.samples.first!.sourceTimestamp!
             let sourceRate = abs(net) / duration
-            let budgetRate = sampledTravel / response.requestedBudget
-            guard net.isFinite, sampledTravel.isFinite, sourceRate.isFinite, budgetRate.isFinite, postAckTravel.isFinite else {
+            // Include pending request drain and stopping exactly once. The full
+            // sampled response includes coast; its time is not charged again.
+            let window = max(response.requestedBudget,
+                response.stopAcknowledgementUptime - response.sendEntryUptime)
+            let windowResponseRate = sampledTravel / window
+            guard net.isFinite, sampledTravel.isFinite, sourceRate.isFinite, windowResponseRate.isFinite, postAckTravel.isFinite else {
                 return reject("nonfinite_response_rate")
             }
-            rate = max(rate, budgetRate)
+            rate = max(rate, windowResponseRate)
+            overhead = max(overhead, window - response.requestedBudget)
         }
         let travel = postAckIntervals > 0
             ? max(calibration.observedPostAckTravel ?? 0, postAckTravel) : calibration.observedPostAckTravel
@@ -317,18 +340,17 @@ public enum FollowTurnBurstPlanner {
                 } else { terminal = true }
             }
         }
-        return .init(calibration: .init(previous: calibration, rate: rate,
+        return .init(calibration: .init(previous: calibration, rate: rate, overhead: overhead,
             send: max(calibration.maximumSendDuration ?? 0, response.sendResponseUptime - response.sendEntryUptime),
             stop: max(calibration.maximumStopDuration ?? 0, response.stopAcknowledgementUptime - response.stopObligationUptime),
             travel: travel, ceiling: ceiling, terminal: terminal, measured: hasResponseBracket,
-            response: response), rejection: nil,
+            response: response, observedBurst: hasResponseBracket
+                ? .init(budget: response.requestedBudget, signedTravel: net, absoluteTravel: sampledTravel) : nil), rejection: nil,
             signedResponse: hasResponseBracket ? net : nil,
             sampledAbsoluteTravel: hasResponseBracket ? sampledTravel : nil)
     }
     public static func plan(_ input: Input) -> Decision {
-        guard input.authorized, input.actualYaw.isFinite, input.calibration.targetYaw.isFinite,
-              input.sendEntryUptime.isFinite, input.sendEntryUptime >= 0,
-              (input.calibration.targetYaw - input.actualYaw).isFinite else { return .unavailable }
+        guard validInput(input) else { return .unavailable }
         let error = wrap(input.calibration.targetYaw - input.actualYaw)
         if abs(error) <= input.profile.tolerance { return .arrived }
         let calibration = input.calibration
@@ -337,15 +359,59 @@ public enum FollowTurnBurstPlanner {
             return .resolutionFailure(.rotationResolutionInsufficient)
         }
         let excess = abs(error) - input.profile.tolerance
-        // The end-to-end response per requested budget already includes transport,
-        // stopping and sampled coast. Charging them again prevents useful turns.
-        let candidate = excess / calibration.responseRate
-        let budget = min(input.profile.maximumHostBurstBudget, candidate, calibration.overshootCeiling ?? .infinity)
+        // Invert travel = gain * (requested budget + observed overhead).
+        // This inverse model is an estimate, not a physical minimum angle.
+        // A complete small response may justify repeating its proven host budget.
+        let candidate = excess / calibration.responseRate - calibration.responseOverhead
+        let observed = repeatableBudget(calibration, error: error, profile: input.profile)
+        let budget = min(input.profile.maximumHostBurstBudget, max(candidate, observed ?? -.infinity),
+            calibration.overshootCeiling ?? .infinity)
         let deadline = input.sendEntryUptime + budget
         guard budget.isFinite, budget > 0, deadline.isFinite, deadline > input.sendEntryUptime else {
             return .resolutionFailure(.rotationResolutionInsufficient)
         }
         return .burst(direction: error < 0 ? -1 : 1, budget: budget)
+    }
+
+    /// Host overhead is not a physical minimum angle. A previously successful
+    /// small pulse can be repeated if its entire sampled response fits the
+    /// remaining heading corridor. Never enlarge it or override an overshoot cap.
+    static func repeatableBudget(_ calibration: Calibration, error: Double, profile: Profile) -> Double? {
+        guard !calibration.terminalResolutionFailure, calibration.overshootCeiling == nil,
+              let observed = calibration.lastObservedBurst,
+              observed.signedTravel * error > 0,
+              observed.absoluteTravel > 0,
+              observed.absoluteTravel <= abs(error) + profile.tolerance else { return nil }
+        return observed.budget
+    }
+
+    /// Initial search covers an arc rather than converging on an exact heading.
+    /// HTTP overhead and precision-correction ceilings do not select its pulse.
+    /// The controller still requires a valid stopped response between pulses.
+    static func planSearchSweep(_ input: Input, requestedAngle: Double, signedProgress: Double) -> Decision {
+        guard validInput(input), requestedAngle.isFinite, requestedAngle != 0,
+              abs(requestedAngle) <= .pi, signedProgress.isFinite else { return .unavailable }
+        let direction = requestedAngle < 0 ? -1 : 1
+        if signedProgress * Double(direction) >= abs(requestedAngle) { return .arrived }
+        let calibration = input.calibration
+        let error = wrap(calibration.targetYaw - input.actualYaw)
+        guard !calibration.terminalResolutionFailure,
+              !input.provisionalProbeIssued || calibration.measuredResponses > 0,
+              Double(direction) * error > 0 || error == -.pi else {
+            return .resolutionFailure(.rotationResolutionInsufficient)
+        }
+        let budget = input.profile.maximumHostBurstBudget
+        let deadline = input.sendEntryUptime + budget
+        guard deadline.isFinite, deadline > input.sendEntryUptime else {
+            return .resolutionFailure(.rotationResolutionInsufficient)
+        }
+        return .burst(direction: direction, budget: budget)
+    }
+
+    private static func validInput(_ input: Input) -> Bool {
+        input.authorized && input.actualYaw.isFinite && input.calibration.targetYaw.isFinite &&
+            input.sendEntryUptime.isFinite && input.sendEntryUptime >= 0 &&
+            (input.calibration.targetYaw - input.actualYaw).isFinite
     }
     private static func wrap(_ angle: Double) -> Double {
         var value = angle.truncatingRemainder(dividingBy: 2 * .pi)

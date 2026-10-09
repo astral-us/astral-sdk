@@ -3,7 +3,7 @@ import XCTest
 
 @MainActor
 final class FollowDiagnosticEventTests: XCTestCase {
-    func testPlanTelemetryUsesEndToEndGainAndDoesNotSubtractDiagnosticLatency() throws {
+    func testPlanTelemetrySeparatesWindowOverheadFromOverlappingLatencyDiagnostics() throws {
         let calibration = FollowTurnBurstPlanner.Calibration(operationID: 1, generation: 1, targetYaw: 0.5,
             clockDomain: "ar_system_uptime")
         func sample(_ id: UInt64, _ time: Double, _ yaw: Double) -> FollowTurnBurstPlanner.Sample {
@@ -23,12 +23,18 @@ final class FollowDiagnosticEventTests: XCTestCase {
         let decision = FollowTurnBurstPlanner.plan(.init(actualYaw: 0.3, profile: profile,
             calibration: reduction.calibration, sendEntryUptime: 11))
         trace.planning(reduction.calibration, sample: actual, profile: profile, decision: decision, uptime: 11)
-        XCTAssertEqual(trace.fields["allowance_policy"], .string("included_in_measured_response;diagnostic_only"))
-        XCTAssertEqual(trace.fields["budget_formula"], .string("min(maximum,E/R,overshootCeiling)"))
+        XCTAssertEqual(trace.fields["allowance_policy"], .string("command_stop_window_overhead_once;coast_in_response"))
+        XCTAssertEqual(trace.fields["budget_formula"], .string("min(maximum,max(E/R-H,repeatableObservedBudget),overshootCeiling)"))
         guard case .number(let budget) = trace.fields["candidate_budget_s"] else { return XCTFail() }
-        XCTAssertEqual(budget, 0.03113078094415877, accuracy: 1e-12)
+        XCTAssertEqual(budget, -0.11284036747819653, accuracy: 1e-12)
+        XCTAssertEqual(decision, .burst(direction: 1, budget: 0.080))
+        XCTAssertEqual(trace.fields["budget_selection_reason"], .string("repeat_small_valid_response"))
+        guard case .number(let overhead) = trace.fields["retained_response_overhead_s"],
+              case .number(let window) = trace.fields["command_stop_window_s"] else { return XCTFail() }
+        XCTAssertEqual(overhead, 0.15, accuracy: 1e-12)
+        XCTAssertEqual(window, 0.23, accuracy: 1e-12)
         guard case .number(let latency) = trace.fields["latency_allowance_s"] else { return XCTFail() }
-        XCTAssertEqual(latency, 0.27, accuracy: 1e-12, "Latency remains visible as telemetry, not another deduction")
+        XCTAssertEqual(latency, 0.27, accuracy: 1e-12, "Overlapping send/stop durations are not the model overhead")
     }
     func testMeasuredHostLatencyWithoutYawCannotBeReportedAsObservedRateOrZeroCoast() throws {
         let profile = FollowTurnBurstPlanner.Profile(purpose: .alignment)

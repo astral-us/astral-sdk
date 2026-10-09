@@ -8,6 +8,59 @@ import simd
 
 final class DetectorTests: XCTestCase {
     @MainActor
+    func testPreviewAlreadyDispatchedButNotStartedYieldsToNewFollowConsumer() async {
+        let queue = DispatchQueue(label: "test.follow.preview-dispatch")
+        queue.suspend()
+        let calls = FollowInferenceCallCounter()
+        let detector = calls.makeDetector(inferenceQueue: queue)
+        let snapshot = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 100,
+            image: makeImage(), cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil, pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        let preview = Task { await detector.followPreviewEvaluationAsync(snapshot, at: 100) }
+        for _ in 0..<30 { await Task.yield() }
+        let ar = ARSessionManager()
+        let stream = ARFollowMePerceptionSource(ar: ar, detector: detector).events()
+        let consumer = Task { for await _ in stream {} }
+        queue.resume()
+        let result = await preview.value
+        XCTAssertNil(result)
+        XCTAssertEqual(calls.value, 0, "Dispatching a preview closure is not starting native inference")
+        consumer.cancel(); await consumer.value
+    }
+
+    @MainActor
+    func testActiveFollowConsumersKeepPreviewCacheMissesOffTheInferenceQueue() async {
+        let calls = FollowInferenceCallCounter()
+        let detector = calls.makeDetector()
+        let ar = ARSessionManager()
+        let source = ARFollowMePerceptionSource(ar: ar, detector: detector)
+        let firstStream = source.events()
+        let secondStream = source.events()
+        let first = Task { for await _ in firstStream {} }
+        let second = Task { for await _ in secondStream {} }
+        for _ in 0..<20 { await Task.yield() }
+        let snapshot = ARFrameSnapshot(id: .init(generation: 1, sequence: 1), timestamp: 100,
+            image: makeImage(), cameraTransform: matrix_identity_float4x4, cameraIntrinsics: matrix_identity_float3x3,
+            imageResolution: CGSize(width: 8, height: 6), depthMap: nil, pose: .init(position: .zero, yaw: 0), trackingQuality: .normal)
+        let unavailable = await detector.followPreviewEvaluationAsync(snapshot, at: 100)
+        XCTAssertNil(unavailable, "A preview cache miss cannot compete with an active follow consumer")
+        XCTAssertEqual(calls.value, 0)
+        let control = await detector.evaluateForFollowAsync(snapshot)
+        XCTAssertEqual(control?.frame.frameID, snapshot.id)
+        let cached = await detector.followPreviewEvaluationAsync(snapshot, at: 100.1)
+        XCTAssertEqual(cached?.snapshot.id, snapshot.id)
+        XCTAssertEqual(calls.value, 1, "Active control still infers; preview only reuses its exact fresh result")
+        first.cancel(); await first.value
+        let stillUnavailable = await detector.followPreviewEvaluationAsync(snapshot, at: 101)
+        XCTAssertNil(stillUnavailable)
+        XCTAssertEqual(calls.value, 1, "Ending one consumer must not release another's priority")
+        second.cancel(); await second.value
+        let preview = await detector.followPreviewEvaluationAsync(snapshot, at: 102)
+        XCTAssertNotNil(preview)
+        XCTAssertEqual(calls.value, 2, "Preview inference resumes after the last follow stream terminates")
+    }
+
+    @MainActor
     func testGenericImagePointProjectionDoesNotDependOnLocalInferenceCache() throws {
         let ar = ARSessionManager()
         var depth: CVPixelBuffer?

@@ -3,6 +3,428 @@ import RoverNav
 @testable import PhroverKit
 
 final class NavigationFollowTurnBurstTests: XCTestCase {
+    func testEarlySettleWindowStartsAtActualPostStopCapture() {
+        var gate = FollowTurnSourceGate()
+        gate.ingest(sample(1, 9.99))
+        let fence = gate.fence(at: 10, operationGeneration: 1)
+        gate.ingest(sample(2, 10.08))
+        gate.ingest(sample(3, 10.11))
+        XCTAssertNil(gate.consume(after: fence, at: 10.12, minimumSettle: 0.100),
+            "Pre-ACK history cannot turn 30 ms of post-stop captures into 100 ms of evidence")
+        gate.ingest(sample(4, 10.19))
+        XCTAssertNotNil(gate.consume(after: fence, at: 10.20, minimumSettle: 0.100))
+    }
+
+    func testEarlySettleBoundsTheWholePoseWindowNotOnlyDistanceFromAnchor() {
+        for yawMotion in [true, false] {
+            func observation(_ sequence: UInt64, _ timestamp: Double, _ displacement: Double) -> NavigationPoseSample {
+                .init(pose: .init(position: .init(yawMotion ? 0 : displacement, 0), yaw: yawMotion ? displacement : 0),
+                    frameID: .init(generation: 1, sequence: sequence), sourceTimestamp: timestamp, trackingQuality: .normal)
+            }
+            var gate = FollowTurnSourceGate()
+            gate.ingest(observation(1, 9.99, 0))
+            let fence = gate.fence(at: 10, operationGeneration: 1)
+            gate.ingest(observation(2, 10.01, 0))
+            gate.ingest(observation(3, 10.07, 0.009))
+            gate.ingest(observation(4, 10.12, -0.009))
+            XCTAssertNil(gate.consume(after: fence, at: 10.13, minimumSettle: 0.100),
+                "Opposite excursions are 0.018 apart even though each is within 0.01 of the anchor")
+            gate.ingest(observation(5, 10.18, -0.009))
+            gate.ingest(observation(6, 10.24, -0.009))
+            XCTAssertNotNil(gate.consume(after: fence, at: 10.25, minimumSettle: 0.100))
+        }
+    }
+
+    func testEarlySearchSettleRejectsDriftFrameGapsAndDuplicateEvidence() {
+        for scenario in ["moving", "gap", "duplicate"] {
+            var gate = FollowTurnSourceGate()
+            gate.ingest(sample(1, 10))
+            let fence = gate.fence(at: 10.01, operationGeneration: 1)
+            gate.ingest(sample(2, 10.03))
+            if scenario == "moving" {
+                gate.ingest(sample(3, 10.09, yaw: 0.02))
+                gate.ingest(sample(4, 10.15, yaw: 0.04))
+            } else if scenario == "gap" {
+                gate.ingest(sample(5, 10.15))
+            } else {
+                gate.ingest(sample(2, 10.03))
+            }
+            XCTAssertNil(gate.consume(after: fence, at: 10.16, minimumSettle: 0.100), scenario)
+            XCTAssertNotNil(gate.consume(after: fence, at: 10.32, minimumSettle: 0.100),
+                "Without stable evidence retain the existing 300 ms path: \(scenario)")
+        }
+    }
+
+    @MainActor
+    func testSearchSettlesEarlyOnlyAfterAdvancingStablePostStopPoses() async {
+        var uptime = 10.0
+        var snapshot = sample(1, 9.99)
+        var stops = 0
+        var completed = false
+        var controller: NavigationController!
+        controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in
+                uptime = FollowTurnBurstTransportScope.authorization!.deadline + 0.001
+                snapshot = self.sample(3, uptime - 0.001, yaw: 0.18)
+                controller.ingestFollowTurnSource(snapshot)
+            }, stopRover: { stops += 1; if stops > 1 { uptime += 0.03 } },
+            sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot }, sourceNow: { uptime }, sourceStopSnapshot: { snapshot })
+        let task = Task {
+            let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true))
+            completed = true
+            return result
+        }
+        for _ in 0..<1000 where stops == 0 { await Task.yield() }
+        uptime = 10.301; snapshot = sample(2, 10.3); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where stops < 2 { await Task.yield() }
+        let ack = uptime
+        for (sequence, offset) in [(UInt64(4), 0.01), (5, 0.07)] {
+            uptime = ack + offset; snapshot = sample(sequence, uptime, yaw: 0.18); controller.ingestFollowTurnSource(snapshot)
+            for _ in 0..<30 { await Task.yield() }
+            XCTAssertFalse(completed, "A single frame or less than 100 ms stability is insufficient")
+        }
+        uptime = ack + 0.12; snapshot = sample(6, uptime, yaw: 0.1805); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<2000 where !completed { await Task.yield() }
+        XCTAssertTrue(completed, "Observed stationary frames should release the redundant 300 ms wait")
+        if !completed {
+            uptime = ack + 0.301; snapshot = sample(7, uptime, yaw: 0.1805); controller.ingestFollowTurnSource(snapshot)
+        }
+        let result = await task.value
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+    }
+
+    @MainActor
+    func testRecoveryRepeatsSmallMeasuredResponseWithoutRebasingHeadingOrIncreasingBudget() async {
+        var uptime = 10.0
+        var snapshot = sample(1, 9.99)
+        let events = AsyncStream<NavigationPoseSample>.makeStream()
+        var budgets: [Double] = []
+        var targets: [Double] = []
+        var stops = 0
+        var completed = false
+        var controller: NavigationController!
+        controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { command in
+                XCTAssertEqual(command.left, -0.25)
+                let authority = FollowTurnBurstTransportScope.authorization!
+                budgets.append(authority.deadline - authority.sendEntryUptime)
+                targets.append(FollowMotionTaskScope.evidence!.targetYaw!)
+                guard budgets.count <= 2 else { throw URLError(.timedOut) }
+                uptime = authority.sendEntryUptime + 0.030076541681774
+                snapshot = self.sample(budgets.count == 1 ? 3 : 5, uptime - 0.001, yaw: budgets.count == 1 ? 0.01 : 0.05)
+                controller.ingestFollowTurnSource(snapshot)
+            }, stopRover: { stops += 1; if stops > 1 { uptime += 0.031320708303247 } },
+            sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot }, sourceNow: { uptime },
+            sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
+        let task = Task {
+            let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "reacquiring"))
+            completed = true
+            return result
+        }
+        for _ in 0..<1000 where stops == 0 { await Task.yield() }
+        uptime = 10.301; snapshot = sample(2, 10.3); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where stops < 2 { await Task.yield() }
+        uptime += 0.301; snapshot = sample(4, uptime - 0.001, yaw: 0.021135333568015113); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where stops < 3 && !completed { await Task.yield() }
+        XCTAssertEqual(budgets.count, 2, "Small valid progress is not a measured minimum-motion failure")
+        if budgets.count == 2 {
+            uptime += 0.301; snapshot = sample(6, uptime - 0.001, yaw: 0.06); controller.ingestFollowTurnSource(snapshot)
+        }
+        for _ in 0..<1000 where !completed { await Task.yield() }
+        if !completed { task.cancel() }
+        let result = await task.value
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(budgets.count, 2)
+        XCTAssertTrue(budgets.allSatisfy { abs($0 - 0.025) < 1e-12 })
+        XCTAssertTrue(targets.allSatisfy { abs($0 - .pi / 18) < 1e-12 })
+        events.continuation.finish()
+    }
+
+    @MainActor
+    func testHalfTurnSearchUsesExplicitRequestedDirectionAtPiSeam() async {
+        for direction in [1.0, -1.0] {
+            var uptime = 10.0
+            var snapshot = sample(1, 9.99)
+            var stops = 0
+            var sends = 0
+            let controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+                plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { command in
+                    sends += 1
+                    XCTAssertEqual(command.left, -direction * 0.25)
+                    XCTAssertEqual(command.right, direction * 0.25)
+                    // Only admission/direction is under test; end deterministically.
+                    throw URLError(.badURL)
+                }, stopRover: { stops += 1 }, sleep: { try? await Task.sleep(for: $0) },
+                poseSample: { snapshot }, sourceNow: { uptime }, sourceStopSnapshot: { snapshot })
+            let task = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(direction * .pi), context:
+                .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true)) }
+            for _ in 0..<1000 where stops == 0 { await Task.yield() }
+            uptime = 10.301; snapshot = sample(2, 10.3); controller.ingestFollowTurnSource(snapshot)
+            let result = await task.value
+            XCTAssertEqual(sends, 1, "The antipodal wrap must not reject a valid explicit sweep direction")
+            XCTAssertEqual(result.result, .failed(.commandFailed))
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+        }
+    }
+
+    @MainActor
+    func testInitialSearchNoProgressCannotResetOriginalWatchdogBetweenPulses() async {
+        var uptime = 10.0
+        var date = Date(timeIntervalSince1970: 1000)
+        var snapshot = sample(1, 9.99)
+        let events = AsyncStream<NavigationPoseSample>.makeStream()
+        var stops = 0
+        var sends = 0
+        var controller: NavigationController!
+        controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { date }, sendCommand: { _ in
+                sends += 1
+                let authority = FollowTurnBurstTransportScope.authorization!
+                uptime = authority.deadline + 0.001
+                snapshot = self.sample(3, uptime - 0.001, yaw: 0)
+                controller.ingestFollowTurnSource(snapshot)
+            }, stopRover: { stops += 1 }, sleep: { try? await Task.sleep(for: $0) }, now: { date },
+            poseSample: { snapshot }, sourceNow: { uptime }, sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
+        let task = Task { await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
+            .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true)) }
+        for _ in 0..<1000 where stops == 0 { await Task.yield() }
+        uptime = 10.301; snapshot = sample(2, uptime - 0.001); controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where stops < 2 { await Task.yield() }
+        XCTAssertEqual(stops, 2)
+        // Distinct, healthy, post-stop source, but the original progress window
+        // expired. Another search pulse must not renew it.
+        date = date.addingTimeInterval(2.501)
+        uptime += 0.301; snapshot = sample(4, uptime - 0.001); controller.ingestFollowTurnSource(snapshot)
+        let result = await task.value
+        XCTAssertEqual(result.result, .failed(.stalled))
+        XCTAssertEqual(sends, 1)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        events.continuation.finish()
+    }
+
+    @MainActor
+    func testInitialSearchContinuesAfterRecordedSmallResponseDespiteHTTPOverhead() async {
+        // Both 23:12 device attempts: about one degree of net motion, not a
+        // coarse turn. Command/stop wall time must not end a directed search.
+        for (sendTime, stopTime, firstYaw) in [
+            (0.08138474999577738, 0.0341829166864045, 0.017908923542101718),
+            (0.028802916669519618, 0.033509958331706, 0.018780268239300346),
+            // Already inside the old seven-degree heading tolerance, but the
+            // requested ten-degree sweep is not yet covered.
+            (0.028802916669519618, 0.033509958331706, 0.10)
+        ] {
+            var uptime = 10.0
+            var snapshot = sample(1, 9.99)
+            let events = AsyncStream<NavigationPoseSample>.makeStream()
+            var budgets: [Double] = []
+            var stops = 0
+            var completed = false
+            var deadline = 10.0
+            var controller: NavigationController!
+            controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+                plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { command in
+                    XCTAssertEqual(command.left, -0.25)
+                    let authority = FollowTurnBurstTransportScope.authorization!
+                    deadline = authority.deadline
+                    budgets.append(authority.deadline - authority.sendEntryUptime)
+                    guard budgets.count <= 2 else { throw URLError(.timedOut) }
+                    uptime = authority.sendEntryUptime + sendTime
+                    snapshot = self.sample(budgets.count == 1 ? 3 : 5, uptime - 0.001,
+                        yaw: budgets.count == 1 ? firstYaw : 0.10)
+                    controller.ingestFollowTurnSource(snapshot)
+                }, stopRover: {
+                    stops += 1
+                    if stops > 1 { uptime = max(uptime, deadline) + stopTime }
+                }, sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot }, sourceNow: { uptime },
+                sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
+            let task = Task {
+                let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18), context:
+                    .init(sessionGeneration: 1, requestToken: 1, purpose: .followScan, phase: "searching", isSearchSweep: true))
+                completed = true
+                return result
+            }
+            for _ in 0..<1000 where stops == 0 { await Task.yield() }
+            uptime = 10.301; snapshot = sample(2, uptime - 0.001); controller.ingestFollowTurnSource(snapshot)
+            for _ in 0..<1000 where budgets.isEmpty && !completed { await Task.yield() }
+            uptime = max(uptime, deadline)
+            for _ in 0..<1000 where stops < 2 { try? await Task.sleep(for: .milliseconds(1)) }
+            XCTAssertEqual(stops, 2)
+            uptime += 0.301; snapshot = sample(4, uptime - 0.001, yaw: firstYaw); controller.ingestFollowTurnSource(snapshot)
+            for _ in 0..<1000 where budgets.count < 2 && !completed { await Task.yield() }
+            uptime = max(uptime, deadline)
+            for _ in 0..<1000 where stops < 3 && !completed { try? await Task.sleep(for: .milliseconds(1)) }
+            XCTAssertEqual(budgets.count, 2, "A valid small response must allow another bounded search pulse")
+            if budgets.count == 2 {
+                uptime += 0.301; snapshot = sample(6, uptime - 0.001, yaw: 0.18); controller.ingestFollowTurnSource(snapshot)
+            }
+            for _ in 0..<1000 where !completed { await Task.yield() }
+            if !completed { task.cancel() }
+            let result = await task.value
+            XCTAssertEqual(result.result, .arrived)
+            XCTAssertEqual(result.stopOutcome, .confirmed)
+            XCTAssertEqual(result.searchSweepTravel ?? -1, 0.18, accuracy: 1e-12)
+            XCTAssertTrue(budgets.allSatisfy { abs($0 - 0.080) < 1e-12 })
+            events.continuation.finish()
+        }
+    }
+
+    @MainActor
+    func testRecordedInitialSearchOvershootCompletesSweepWithoutReverseCorrection() async {
+        let result = await recordedSearchSweep()
+        XCTAssertEqual(result.result, .arrived, "The requested search arc was swept; precise heading correction is unnecessary")
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertEqual(result.searchSweepTravel ?? -1, 0.483189002088996, accuracy: 1e-12)
+        XCTAssertEqual(result.searchSweepProgress ?? -1, 0.483189002088996, accuracy: 1e-12)
+    }
+
+    @MainActor
+    func testSearchSweepSupportsNegativeDirectionButRejectsWrongWayProgress() async {
+        let negative = await recordedSearchSweep(direction: -1)
+        XCTAssertEqual(negative.result, .arrived)
+        XCTAssertEqual(negative.stopOutcome, .confirmed)
+        let wrongWay = await recordedSearchSweep(wrongWay: true)
+        XCTAssertEqual(wrongWay.result, .failed(.rotationResolutionInsufficient))
+        XCTAssertEqual(wrongWay.stopOutcome, .confirmed)
+        XCTAssertNil(wrongWay.searchSweepTravel)
+    }
+
+    @MainActor
+    func testSearchSweepCannotCompleteWithMissingBracketOrFailedStop() async {
+        let missing = await recordedSearchSweep(missingBracket: true)
+        XCTAssertEqual(missing.result, .failed(.rotationResolutionInsufficient))
+        XCTAssertEqual(missing.context.failureCause, .calibrationEvidenceIncomplete)
+        XCTAssertNil(missing.searchSweepTravel)
+        let failedStop = await recordedSearchSweep(failStop: true)
+        XCTAssertNotEqual(failedStop.result, .arrived)
+        XCTAssertEqual(failedStop.stopOutcome, .failed)
+        XCTAssertNil(failedStop.searchSweepTravel)
+    }
+
+    @MainActor
+    private func recordedSearchSweep(direction: Double = 1, wrongWay: Bool = false,
+                                     missingBracket: Bool = false, failStop: Bool = false) async -> FollowMotionResult {
+        // Oct 8 22:16:41 UTC: 10 degrees requested, 27.68 degrees swept,
+        // valid AR bracket, HTTP 200 and confirmed stop. Search must keep looking.
+        var uptime = 10.0
+        var snapshot = sample(1, 9.99)
+        let events = AsyncStream<NavigationPoseSample>.makeStream()
+        var budgets: [Double] = []
+        var stops = 0
+        var completed = false
+        let sign = wrongWay ? -direction : direction
+        var deadline = 10.0
+        let missingArchive: ((ARFrameID, ARFrameID) -> [FollowTurnBurstPlanner.Sample]?)? = missingBracket ? { _, _ in nil } : nil
+        var controller: NavigationController!
+        controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { command in
+                XCTAssertEqual(command.left, -direction * 0.25, "A sweep never sends a reverse correction")
+                let authorization = FollowTurnBurstTransportScope.authorization!
+                deadline = authorization.deadline
+                budgets.append(authorization.deadline - authorization.sendEntryUptime)
+                guard budgets.count == 1 || (wrongWay && budgets.count == 2) else { throw URLError(.timedOut) }
+                uptime = authorization.sendEntryUptime + 0.0522037916816771
+                snapshot = self.sample(budgets.count == 1 ? 3 : 5, uptime - 0.01,
+                    yaw: (budgets.count == 1 ? sign : direction) * 0.1)
+                controller.ingestFollowTurnSource(snapshot)
+            }, stopRover: {
+                stops += 1
+                if stops > 1 { uptime = max(uptime, deadline) + 0.03533458334277384 }
+                if failStop && stops > 1 { throw URLError(.timedOut) }
+            }, sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot },
+            sourceNow: { uptime }, sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot }, turnPoseEvidence: missingArchive)
+        let task = Task {
+            let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(direction * .pi / 18),
+                context: .init(sessionGeneration: 1, requestToken: 2, purpose: .followScan, phase: "searching",
+                    scanResponseSeed: .init(sourceGeneration: 1, responseRate: 3.9459105709998488), isSearchSweep: true))
+            completed = true
+            return result
+        }
+        for _ in 0..<1000 where stops == 0 { await Task.yield() }
+        uptime = 10.300
+        snapshot = sample(2, 10.2)
+        controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where budgets.isEmpty && !completed { await Task.yield() }
+        uptime = max(uptime, deadline)
+        for _ in 0..<1000 where stops < 2 { try? await Task.sleep(for: .milliseconds(1)) }
+        XCTAssertGreaterThanOrEqual(stops, 2)
+        uptime += 0.310
+        snapshot = sample(4, uptime - 0.01, yaw: sign * 0.483189002088996)
+        controller.ingestFollowTurnSource(snapshot)
+        if wrongWay {
+            for _ in 0..<1000 where stops < 3 && !completed { await Task.yield() }
+            if budgets.count == 2 {
+                uptime += 0.310
+                snapshot = sample(6, uptime - 0.01, yaw: direction * 0.483189002088996)
+                controller.ingestFollowTurnSource(snapshot)
+            }
+        }
+        for _ in 0..<1000 where !completed { await Task.yield() }
+        if !completed { task.cancel() }
+        let result = await task.value
+        XCTAssertEqual(budgets.count, 1)
+        XCTAssertEqual(budgets.first ?? -1, 0.080, accuracy: 1e-12)
+        events.continuation.finish()
+        return result
+    }
+
+    @MainActor
+    func testRecordedSearchOverrunStopsBeforeSubmillisecondCorrection() async {
+        // Oct 8 20:34:47 UTC: a 4.755 ms request took 28.712 ms to return,
+        // then 33.759 ms to stop, with 0.502688 rad of observed response.
+        var uptime = 10.0
+        var snapshot = sample(1, 9.99)
+        let events = AsyncStream<NavigationPoseSample>.makeStream()
+        var budgets: [Double] = []
+        var stops = 0
+        var completed = false
+        var controller: NavigationController!
+        controller = NavigationController(currentPose: { snapshot.pose }, forwardClearance: { .infinity },
+            plan: { _, _ in nil }, lastAckAt: { Date() }, sendCommand: { _ in
+                let authorization = FollowTurnBurstTransportScope.authorization!
+                budgets.append(authorization.deadline - authorization.sendEntryUptime)
+                // Bound the old behavior: any attempted correction fails this replay.
+                guard budgets.count == 1 else { throw URLError(.timedOut) }
+                uptime = authorization.sendEntryUptime + 0.028712
+                snapshot = self.sample(3, uptime - 0.01, yaw: 0.1)
+                controller.ingestFollowTurnSource(snapshot)
+            }, stopRover: {
+                stops += 1
+                if stops > 1 { uptime += 0.033759375 }
+            }, sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot },
+            sourceNow: { uptime }, sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
+        let task = Task {
+            let result = await NavigationFollowMeMotion(navigation: controller).perform(.scan(.pi / 18),
+                context: .init(sessionGeneration: 1, requestToken: 2, purpose: .followScan, phase: "searching",
+                    scanResponseSeed: .init(sourceGeneration: 1, responseRate: 11.012353425931373)))
+            completed = true
+            return result
+        }
+        for _ in 0..<1000 where stops == 0 { await Task.yield() }
+        uptime = 10.300
+        snapshot = sample(2, 10.2)
+        controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where stops < 2 { await Task.yield() }
+        XCTAssertEqual(stops, 2)
+        uptime += 0.301
+        snapshot = sample(4, uptime - 0.01, yaw: 0.5026881913644705)
+        controller.ingestFollowTurnSource(snapshot)
+        for _ in 0..<1000 where !completed { await Task.yield() }
+        if !completed { task.cancel() }
+        let result = await task.value
+        XCTAssertEqual(budgets.count, 1, "Measured transport/stop overhead must rule out an ineffective tiny correction")
+        XCTAssertEqual(budgets.first ?? -1, 0.004754649213903299, accuracy: 1e-12)
+        XCTAssertEqual(result.result, .failed(.rotationResolutionInsufficient))
+        XCTAssertEqual(result.stopOutcome, .confirmed)
+        XCTAssertNotEqual(result.context.failureCause, .burstPreSendExpired,
+            "Resolve while stopped, before transport scheduling fails")
+        events.continuation.finish()
+    }
+
     @MainActor
     func testHeldPreSendAdmissionAckCannotDelayWatchdogCompletion() async {
         await checkHeldPreSendAdmissionAck(scenario: "watchdog")
@@ -606,10 +1028,10 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
                 budgets.append(authorization.deadline - authorization.sendEntryUptime)
                 XCTAssertEqual(stops, sends, "Each command follows confirmed stopping")
                 XCTAssertEqual(command.left, sends == 1 ? -0.25 : 0.25)
-                uptime = sends == 1 ? 10.400 : 10.811
+                uptime = authorization.deadline
                 snapshot = self.sample(sends == 1 ? 3 : 5, uptime - 0.01, yaw: sends == 1 ? 0.25 : 0.1)
                 controller.ingestFollowTurnSource(snapshot)
-            }, stopRover: { stops += 1; if stops > 1 { uptime += 0.01 } },
+            }, stopRover: { stops += 1; if stops > 1 { uptime += 0.001 } },
             sleep: { try? await Task.sleep(for: $0) }, poseSample: { snapshot }, sourceNow: { uptime },
             sourceEvents: { events.stream }, sourceStopSnapshot: { snapshot })
         let task = Task { await NavigationFollowMeMotion(navigation: controller).alignTowardPerson(by: 0.1) }
@@ -681,8 +1103,8 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         for _ in 0..<1000 where budgets.count < 2 && !completed { await Task.yield() }
         XCTAssertEqual(budgets.count, 2, "A valid completed bracket must enable a corrective burst")
         XCTAssertEqual(budgets.first ?? -1, 0.080, accuracy: 1e-12)
-        // Excess .14 / whole-response gain (.31/.08), with no duplicated A/C penalty.
-        XCTAssertEqual(budgets.dropFirst().first ?? -1, 0.0361290322580645, accuracy: 1e-12)
+        // .31 rad across a .09 s command/stop window, with .01 s overhead.
+        XCTAssertEqual(budgets.dropFirst().first ?? -1, 0.0306451612903226, accuracy: 1e-12)
         XCTAssertEqual(targets, [0.5, 0.5], "Calibration must not rebase the frozen target")
         if budgets.count == 2 {
             for _ in 0..<1000 where stops < 3 { await Task.yield() }
@@ -1085,6 +1507,11 @@ final class NavigationFollowTurnBurstTests: XCTestCase {
         XCTAssertFalse(exactPi.observe(sample(2, 10.01, yaw: -2.9), at: 10.01))
         XCTAssertTrue(exactPi.observe(sample(3, 10.02, yaw: 3.0), at: 10.02),
             "Exact pi selects the negative directed target, then unwraps across -pi")
+        var positivePi = try XCTUnwrap(FollowTurnBurstObservation(targetYaw: .pi, tolerance: 0,
+            start: sample(1, 10), uptime: 10, preferPositiveHalfTurn: true))
+        XCTAssertFalse(positivePi.observe(sample(2, 10.01, yaw: 1.6), at: 10.01))
+        XCTAssertTrue(positivePi.observe(sample(3, 10.02, yaw: -3.0), at: 10.02),
+            "An explicitly positive half-turn must stop on its directed source crossing")
     }
     @MainActor
     func testAdvancingToleranceSourceWhileSendPendingMarksObligationWithoutConcurrentStop() async {

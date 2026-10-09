@@ -69,6 +69,8 @@ struct FollowMotionFailureResolution {
         sources.insert(delivery.source.rawValue)
     }
     var diagnosticReason: String {
+        if primaryReason == .stalled, context.purpose == .followReady,
+           let cause = context.failureCause, cause.readyDescription != nil { return cause.rawValue }
         if primaryReason == .stalled, context.purpose == .followScan { return "no_yaw_progress" }
         switch primaryReason {
         case .noPose: return "no_pose"
@@ -103,7 +105,12 @@ struct FollowMotionFailureResolution {
         case .obstacle: return "Obstacle detected. Motion stopped."
         case .commsLost: return "Rover communication lost. Motion stopped."
         case .tipping: return "Rover tipping detected. Motion stopped."
-        case .stalled: return "Navigation stopped: insufficient measured progress."
+        case .stalled:
+            if context.purpose == .followReady, let description = context.failureCause?.readyDescription {
+                let stop = stopOutcome == .confirmed ? "Stop confirmed. Restart following to try again." : "Confirming motor stop…"
+                return "Ready signal stopped: \(description). \(stop)"
+            }
+            return "Navigation stopped: insufficient measured progress."
         case .rotationResolutionInsufficient:
             let turn = context.purpose == .followScan ? "Search rotation" : (context.purpose == .followAlignment ? "Person alignment" : "Turn")
             let stop = stopOutcome == .confirmed ? "Stop confirmed. Restart following to try again." : "Confirming motor stop…"

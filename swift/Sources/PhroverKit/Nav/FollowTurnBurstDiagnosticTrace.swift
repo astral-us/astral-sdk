@@ -10,6 +10,19 @@ final class FollowTurnBurstDiagnosticTrace {
     private var sourceReasons: Set<String> = []
     private var sourceFenceID: UUID?
     private var hasObservedRate = false
+    private var searchSweepAngle: Double?
+    private var sweptAngle = 0.0
+
+    func completionPolicy(searchSweep: Double?) {
+        searchSweepAngle = searchSweep
+        fields["completion_policy"] = .string(searchSweep != nil ? "directed_search_sweep" : "exact_heading")
+    }
+
+    func searchSweepProgress(signed: Double, travel: Double) {
+        sweptAngle = signed
+        fields["search_sweep_signed_progress_rad"] = .number(signed)
+        fields["search_sweep_sampled_travel_rad"] = .number(travel)
+    }
 
     func evidenceDelivery(ingress: Bool, rejection: String?) {
         fields["calibration_evidence_delivery"] = .string(ingress ? "bounded_AR_ingress_archive" : "control_stream_compatibility")
@@ -24,11 +37,18 @@ final class FollowTurnBurstDiagnosticTrace {
         retain(calibration)
         fields["planning_uptime_s"] = .number(uptime)
         fields["controller_phase"] = .string("stopped_planning")
-        fields["budget_formula"] = .string("min(maximum,E/R,overshootCeiling)")
+        fields["budget_formula"] = .string(searchSweepAngle == nil
+            ? "min(maximum,max(E/R-H,repeatableObservedBudget),overshootCeiling)" : "maximum_host_burst_budget")
         fields["budget_units"] = .string("angles_rad;rates_rad/s;durations_s;wheels_m/s")
-        fields["allowance_policy"] = .string("included_in_measured_response;diagnostic_only")
-        fields["response_model"] = .string("operation_max_sampled_travel_per_requested_budget")
+        fields["allowance_policy"] = .string(searchSweepAngle == nil
+            ? "command_stop_window_overhead_once;coast_in_response" : "diagnostic_only_for_initial_search")
+        fields["response_model"] = .string("sampled_travel_per_command_stop_window_with_overhead")
         fields["tolerance_rad"] = .number(profile.tolerance)
+        fields["source_stop_tolerance_rad"] = .number(searchSweepAngle == nil ? profile.tolerance : 0)
+        fields["search_required_progress_rad"] = Self.number(searchSweepAngle.map { abs($0) })
+        fields["search_remaining_progress_rad"] = Self.number(searchSweepAngle.map {
+            max(0, abs($0) - sweptAngle * ($0 < 0 ? -1 : 1))
+        })
         fields["excess_rad"] = Self.number(excess)
         fields["signed_error_rad"] = Self.number(error)
         fields["signed_error_rad_display"] = error.map { .string(RotationDiagnosticMeasurement.angleDisplay($0)) } ?? .null
@@ -41,19 +61,32 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["minimum_host_budget_s"] = .null
         fields["budget_floor_policy"] = .string("no_hard_floor")
         fields["reference_rate_provenance"] = .string("provisional_120deg_per_s_not_certified")
-        fields["candidate_budget_s"] = Self.number(excess.map { $0 / calibration.responseRate })
+        fields["candidate_budget_s"] = searchSweepAngle == nil
+            ? Self.number(excess.map { $0 / calibration.responseRate - calibration.responseOverhead })
+            : .number(profile.maximumHostBurstBudget)
+        let observedBudget = error.flatMap { FollowTurnBurstPlanner.repeatableBudget(calibration, error: $0, profile: profile) }
+        fields["repeatable_observed_budget_s"] = Self.number(observedBudget)
         fields["planning_source"] = .object(Self.source(sample, uptime: uptime))
+        fields["budget_selection_reason"] = .null
         switch decision {
         case .burst(let direction, let budget):
             burstIndex += 1
             fields["selected_budget_s"] = .number(budget)
             fields["direction"] = .number(Double(direction))
             fields["planning_decision"] = .string("burst")
-        case .arrived: fields["planning_decision"] = .string("arrived"); fields["selected_budget_s"] = .null
+            fields["budget_selection_reason"] = .string(searchSweepAngle != nil ? "bounded_search_pulse" :
+                (observedBudget == budget && budget > (excess.map { $0 / calibration.responseRate - calibration.responseOverhead } ?? .infinity)
+                    ? "repeat_small_valid_response" : "precision_model"))
+        case .arrived:
+            fields["planning_decision"] = .string("arrived")
+            fields["selected_budget_s"] = .null
+            fields["completion_reason"] = .string(searchSweepAngle == nil
+                ? "heading_within_tolerance" : "requested_search_arc_covered")
         case .resolutionFailure: fields["planning_decision"] = .string("rotation_resolution_insufficient"); fields["selected_budget_s"] = .null
         case .unavailable: fields["planning_decision"] = .string("unavailable"); fields["selected_budget_s"] = .null
         }
         fields["burst_index"] = .number(Double(burstIndex))
+        fields["heading_within_tolerance"] = error.map { .bool(abs($0) <= profile.tolerance) } ?? .null
     }
 
     func reduction(_ response: FollowTurnBurstPlanner.Response, _ reduction: FollowTurnBurstPlanner.Reduction) {
@@ -111,6 +144,9 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["response_measurement_provenance"] = .string("captured_ar_visual_inertial_not_physical_peak")
         fields["net_source_rate_rad_s"] = Self.number(reduction.signedResponse.flatMap { net in dt.flatMap { $0 > 0 ? abs(net) / $0 : nil } })
         fields["effective_budget_response_rate_rad_s"] = Self.number(reduction.sampledAbsoluteTravel.map { $0 / response.requestedBudget })
+        let window = max(response.requestedBudget, response.stopAcknowledgementUptime - response.sendEntryUptime)
+        fields["command_stop_window_s"] = reduction.signedResponse == nil ? .null : Self.number(window)
+        fields["effective_window_response_rate_rad_s"] = Self.number(reduction.sampledAbsoluteTravel.map { $0 / window })
         fields["post_ack_sample_endpoints"] = .array(response.samples.filter {
             ($0.sourceTimestamp ?? -.infinity) > response.stopAcknowledgementUptime
         }.prefix(128).map { sample in .object([
@@ -133,6 +169,9 @@ final class FollowTurnBurstDiagnosticTrace {
     private func retain(_ calibration: FollowTurnBurstPlanner.Calibration) {
         fields["reference_rate_rad_s"] = .number(2 * .pi / 3)
         fields["retained_response_rate_rad_s"] = .number(calibration.responseRate)
+        fields["retained_response_overhead_s"] = .number(calibration.responseOverhead)
+        fields["modeled_zero_budget_travel_rad"] = calibration.responseRate.isFinite
+            ? .number(calibration.responseRate * calibration.responseOverhead) : .null
         fields["response_rate_confidence"] = .string(hasObservedRate ? "observed_effective_not_physical_bound" :
             (calibration.responseRate > 2 * .pi / 3 ? "inherited_search_response_floor" : "provisional_reference"))
         fields["maximum_send_duration_s"] = Self.number(calibration.maximumSendDuration)
@@ -163,7 +202,7 @@ final class FollowTurnBurstDiagnosticTrace {
     }
 
     func sourceGate(fence: FollowTurnStopFence, sample: NavigationPoseSample?, uptime: Double,
-                    reason: String?, evidence: FollowMotionOperationEvidence, latch: Bool) {
+                    reason: String?, evidence: FollowMotionOperationEvidence, latch: Bool, minimumSettle: Double = 0.300) {
         if sourceFenceID != fence.identity { sourceReasons.removeAll(); sourceFenceID = fence.identity }
         let reason = reason ?? "accepted"
         fields["controller_phase"] = .string(reason == "accepted" ? "stopped_source_accepted" : "stopped_source_wait")
@@ -175,9 +214,10 @@ final class FollowTurnBurstDiagnosticTrace {
         fields["source_gate_highest_timestamp_s"] = Self.number(fence.highestSourceTimestamp)
         fields["source_gate_expected_generation"] = fence.sourceGeneration.map { .number(Double($0)) } ?? .null
         fields["source_gate_strict_post_ack"] = .bool(true)
-        fields["settle_requested_s"] = .number(0.300)
+        fields["settle_requested_s"] = .number(minimumSettle)
+        fields["settle_policy"] = .string(minimumSettle < 0.300 ? "observed_stability_100ms_else_300ms" : "fixed_300ms")
         fields["ack_to_source_evaluation_s"] = .number(uptime - fence.acknowledgementUptime)
-        fields["post_settle_source_wait_elapsed_s"] = .number(max(0, uptime - fence.acknowledgementUptime - 0.300))
+        fields["post_settle_source_wait_elapsed_s"] = .number(max(0, uptime - fence.acknowledgementUptime - minimumSettle))
         fields["source_freshness_limit_s"] = .number(0.500)
         fields["continuous_outage_limit_s"] = .number(2)
         fields["recovery_episode_limit_s"] = .number(10)
@@ -188,7 +228,7 @@ final class FollowTurnBurstDiagnosticTrace {
             evidence: evidence, latch: latch, outcome: reason == "accepted" ? "accepted" : "waiting_or_rejected", reason: reason)
     }
 
-    func prepareSender(budget: Double, uptime: Double) {
+    func prepareSender(budget: Double, uptime: Double, settleWait: Double = 0.300) {
         obligationRecorded = false
         for key in ["stop_obligation_uptime_s", "stop_trigger_reason", "stop_admission_uptime_s",
                     "stop_obligation_observed_uptime_s",
@@ -196,7 +236,8 @@ final class FollowTurnBurstDiagnosticTrace {
                     "response_burst_index", "bracket_sample_count", "bracket_valid", "bracket_complete_for_rate",
                     "bracket_rejection_reason", "bracket_response_confidence", "response_signed_net_rad",
                     "response_sampled_absolute_travel_rad", "net_source_rate_rad_s", "net_source_interval_s",
-                    "maximum_consecutive_source_rate_rad_s", "effective_budget_response_rate_rad_s",
+                     "maximum_consecutive_source_rate_rad_s", "effective_budget_response_rate_rad_s",
+                     "command_stop_window_s", "effective_window_response_rate_rad_s",
                     "post_ack_sample_endpoints", "send_response_uptime_s", "send_entry_to_response_s",
                     "remaining_budget_at_response_s", "ack_overrun_s", "sender_outcome", "sender_failure_reason", "target_inhibition_reason",
                     "transport_attempt_entries", "transport_entry_uptime_s", "transport_entry_availability",
@@ -208,6 +249,7 @@ final class FollowTurnBurstDiagnosticTrace {
             fields[key] = .null
         }
         fields["controller_phase"] = .string("send_preparation")
+        fields["profile_settle_s"] = .number(settleWait)
         fields.merge([
             "burst_clock": .string("ar_system_uptime"),
             "requested_host_budget_s": .number(budget),

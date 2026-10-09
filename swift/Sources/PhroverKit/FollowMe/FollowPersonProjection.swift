@@ -10,7 +10,8 @@ public enum FollowPersonProjection {
     }
 
     public static func evaluate(box: CGRect, detectorConfidence: Float, rawPersonID: Int,
-                                in snapshot: ARFrameSnapshot) -> FollowProjectionEvidence {
+                                in snapshot: ARFrameSnapshot, bodyVerified: Bool = false,
+                                verifiedDepthAnchor: CGPoint? = nil) -> FollowProjectionEvidence {
         var facts = FollowProjectionEvidence(rawPersonID: rawPersonID, box: box,
             detectorConfidence: detectorConfidence, snapshot: snapshot)
         func reject(_ reason: FollowProjectionRejection) -> FollowProjectionEvidence {
@@ -36,7 +37,10 @@ public enum FollowPersonProjection {
         facts.clippedTop = box.maxY >= 1
         let feet = CGPoint(x: box.midX, y: box.minY)
         facts.feet = feet
-        guard box.minX > 0, box.minY > 0, box.maxX < 1, box.maxY < 1 else { return reject(.clippedBox) }
+        let visible = bodyVerified
+            ? box.minX >= 0 && box.minY > 0 && box.maxX <= 1 && box.maxY <= 1
+            : box.minX > 0 && box.minY > 0 && box.maxX < 1 && box.maxY < 1
+        guard visible else { return reject(.clippedBox) }
         guard let map = snapshot.depthMap else { return reject(.depthUnavailable) }
         guard CVPixelBufferGetPixelFormatType(map) == kCVPixelFormatType_DepthFloat32,
               !CVPixelBufferIsPlanar(map), CVPixelBufferGetWidth(map) > 0, CVPixelBufferGetHeight(map) > 0,
@@ -44,8 +48,13 @@ public enum FollowPersonProjection {
               CVPixelBufferGetBytesPerRow(map) % MemoryLayout<Float>.alignment == 0 else { return reject(.invalidDepthLayout) }
         guard snapshot.imageResolution.width.isFinite, snapshot.imageResolution.height.isFinite,
               snapshot.imageResolution.width > 0, snapshot.imageResolution.height > 0 else { return reject(.invalidCalibration) }
-        let sensor = CGPoint(x: (1 - feet.y) * snapshot.imageResolution.width,
-                             y: (1 - feet.x) * snapshot.imageResolution.height)
+        let anchor = bodyVerified ? (verifiedDepthAnchor ?? feet) : feet
+        guard anchor.x.isFinite, anchor.y.isFinite, anchor.x > 0, anchor.x < 1, anchor.y > 0, anchor.y < 1,
+              box.insetBy(dx: -0.02, dy: -0.02).contains(anchor) else { return reject(.invalidCalibration) }
+        facts.depthAnchor = anchor
+        facts.depthAnchorKind = bodyVerified && verifiedDepthAnchor != nil ? "verified_torso" : "box_feet"
+        let sensor = CGPoint(x: (1 - anchor.y) * snapshot.imageResolution.width,
+                             y: (1 - anchor.x) * snapshot.imageResolution.height)
         let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)
         facts.sensorPixel = sensor
         let depthPixel = CGPoint(x: sensor.x / snapshot.imageResolution.width * CGFloat(width),

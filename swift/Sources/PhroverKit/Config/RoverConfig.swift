@@ -13,8 +13,11 @@ public enum RoverConfig {
 
     /// WAVE ROVER JSON command "T" opcodes we use (see Waveshare sub-controller command set).
     public enum Opcode {
-        public static let speedControl = 1     // {"T":1,"L":<m/s>,"R":<m/s>}
-        public static let emergencyStop = 0    // {"T":0} — stop all motors
+        public static let speedControl = 1     // L/R open-loop wheel commands; both zero stops the chassis
+        /// Retained for source compatibility only; stock WAVE ROVER does not
+        /// implement T:0 as a chassis stop.
+        @available(*, deprecated, message: "Use RoverControl.stop(); WAVE ROVER requires T:1 with L:0 and R:0")
+        public static let emergencyStop = 0
         public static let feedbackFlowOn = 131 // continuous chassis+IMU feedback
         public static let imuQuery = 126       // one-shot IMU read
     }
@@ -26,6 +29,11 @@ public enum RoverConfig {
     /// The autonomous rotate loop may compute a smaller speed from yaw error, but values
     /// below this can make interpreted voice turns appear to do nothing.
     public static let minimumRotateWheelSpeed = 0.25
+    /// Open-loop WAVE ROVER output for the short readiness translation. This
+    /// is not metres/second; 0.05 (10% PWM) stalled on the device.
+    static let readySignalWheelMagnitude = 0.25
+    static let readySignalPulseBudget: TimeInterval = 0.040
+    static let readySignalStoppedObservation: TimeInterval = 0.100
     /// Search turns pulse the motors instead of spinning continuously. The pause gives
     /// ARKit pose and Core ML detection a stable camera frame between heading changes.
     public static let scanTurnPulseDuration: TimeInterval = 0.08

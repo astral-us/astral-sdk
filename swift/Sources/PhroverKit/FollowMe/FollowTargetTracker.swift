@@ -145,7 +145,10 @@ public struct FollowTargetTracker {
         evidence.metrics["finite_geometry"] = .bool(finite)
         evidence.metrics["finite_geometry_availability"] = .string("available")
         guard finite else { evidence.rejection = "invalid_geometry"; return false }
-        guard box.minX > 0, box.minY > 0, box.maxX < 1, box.maxY < 1 else {
+        let visible = observation.bodyVerified
+            ? box.minX >= 0 && box.minY > 0 && box.maxX <= 1 && box.maxY <= 1
+            : box.minX > 0 && box.minY > 0 && box.maxX < 1 && box.maxY < 1
+        guard visible else {
             evidence.rejection = "clipped_box"; return false
         }
         evidence.eligible = true

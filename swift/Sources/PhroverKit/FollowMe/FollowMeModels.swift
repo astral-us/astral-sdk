@@ -12,9 +12,12 @@ public struct FollowPersonObservation {
     public let pose: Pose2D
     /// Canonical-person index within this frame's raw detections; nil for older providers.
     public let rawPersonID: Int?
+    /// Same-frame independent torso evidence. Allows visible side/top image
+    /// edges; feet and depth-neighborhood validity remain mandatory.
+    public let bodyVerified: Bool
 
     public init(frameID: ARFrameID, timestamp: TimeInterval, confidence: Float,
-                boundingBox: CGRect, position: Vec2, pose: Pose2D, rawPersonID: Int? = nil) {
+                boundingBox: CGRect, position: Vec2, pose: Pose2D, rawPersonID: Int? = nil, bodyVerified: Bool = false) {
         self.frameID = frameID
         self.timestamp = timestamp
         self.confidence = confidence
@@ -22,6 +25,7 @@ public struct FollowPersonObservation {
         self.position = position
         self.pose = pose
         self.rawPersonID = rawPersonID
+        self.bodyVerified = bodyVerified
     }
 }
 
@@ -46,13 +50,18 @@ public struct FollowMeConfiguration {
     public var scanIncrement: Double = .pi / 18
     /// Stationary observation after each completed search step. The next step
     /// requires a healthy processed capture taken after this interval.
-    public var scanObservationSeconds: TimeInterval = 1
+    public var scanObservationSeconds: TimeInterval = 0.1
     public var maximumScanRotation: Double = 2 * .pi
+    public var maximumScanAttempts: Int = 72
+    public var maximumScanInterruptions: Int = 8
     public var minimumGoalChange: Double = 0.30
     public var maximumGoalUpdatesPerSecond: Double = 3
     public var perceptionRecoverySeconds: TimeInterval = 2
     public var startupReadinessSeconds: TimeInterval = 5
     public var stationaryPauseSeconds: TimeInterval = 5
+    /// Bounded stopped grace for a previously body-verified acquisition whose
+    /// next raw person fails verification. Never permits motion on stale evidence.
+    public var acquisitionVerificationGraceSeconds: TimeInterval = 0.5
     public var departureRangeIncrease: Double = 0.30
     /// Matches NavigationController's continuous rotation tolerance (radians).
     public var alignmentAngularTolerance: Double = 0.05

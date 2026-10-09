@@ -11,11 +11,33 @@ struct FollowScanResponseSeed: Sendable, Equatable {
     let responseRate: Double
 }
 
-/// Internal subtype of the existing public rotation-resolution failure.
-enum FollowTurnFailureCause: String, Sendable {
+/// Internal cause carried with the existing public navigation failure category.
+enum FollowMotionFailureCause: String, Sendable {
     case burstPreSendExpired = "burst_pre_send_expired"
     case calibrationEvidenceIncomplete = "calibration_evidence_incomplete"
     case poseSourceStale = "pose_source_stale"
+    case readyTravelLimit = "ready_travel_limit"
+    case readyBackwardMotion = "ready_backward_motion"
+    case readyLateralDeviation = "ready_lateral_deviation"
+    case readyHeadingDeviation = "ready_heading_deviation"
+    case readyProgressTimeout = "ready_progress_timeout"
+    case readyOverallTimeout = "ready_overall_timeout"
+    case readyPreSendPoseShift = "ready_pre_send_pose_shift"
+    case readyInvalidGeometry = "ready_invalid_geometry"
+
+    var readyDescription: String? {
+        switch self {
+        case .readyTravelLimit: return "measured movement exceeded 12 cm"
+        case .readyBackwardMotion: return "measured backward movement exceeded 2 cm"
+        case .readyLateralDeviation: return "measured sideways drift exceeded 2 cm"
+        case .readyHeadingDeviation: return "measured heading change exceeded 0.10 rad"
+        case .readyProgressTimeout: return "insufficient forward progress within 2.5 seconds"
+        case .readyOverallTimeout: return "the five-second movement limit expired"
+        case .readyPreSendPoseShift: return "pose changed before the first motor command"
+        case .readyInvalidGeometry: return "invalid measured pose geometry"
+        default: return nil
+        }
+    }
 }
 
 struct FollowMotionRequestContext: Sendable, Equatable {
@@ -26,8 +48,13 @@ struct FollowMotionRequestContext: Sendable, Equatable {
     let scanUsed: Double?
     let scanRemaining: Double?
     let scanResponseSeed: FollowScanResponseSeed?
+    /// Initial person search is a directed sweep, not an absolute heading task.
+    /// Recovery and alignment leave this false.
+    let isSearchSweep: Bool
     init(sessionGeneration: UInt64, requestToken: UInt64, purpose: FollowMotionPurpose, phase: String,
-          scanUsed: Double? = nil, scanRemaining: Double? = nil, scanResponseSeed: FollowScanResponseSeed? = nil) {
+          scanUsed: Double? = nil, scanRemaining: Double? = nil, scanResponseSeed: FollowScanResponseSeed? = nil,
+          isSearchSweep: Bool = false) {
+        self.isSearchSweep = isSearchSweep
         self.scanResponseSeed = scanResponseSeed
         self.sessionGeneration = sessionGeneration
         self.requestToken = requestToken
@@ -55,10 +82,10 @@ struct FollowMotionOperationContext: Sendable, Equatable {
     let profile: FollowScanRotationProfile?
     let requestedRotation: Double?
     let targetYaw: Double?
-    let failureCause: FollowTurnFailureCause?
+    let failureCause: FollowMotionFailureCause?
     init(request: FollowMotionRequestContext?, controllerOperationID: UInt64?, purpose: FollowMotionPurpose?,
          profile: FollowScanRotationProfile?, requestedRotation: Double? = nil, targetYaw: Double? = nil,
-         failureCause: FollowTurnFailureCause? = nil) {
+          failureCause: FollowMotionFailureCause? = nil) {
         self.request = request
         self.controllerOperationID = controllerOperationID
         self.purpose = purpose
@@ -95,6 +122,10 @@ struct FollowMotionFailureDelivery: Sendable {
 }
 
 struct FollowMotionResult: Sendable {
+    /// Validated sampled travel for an explicitly requested initial search sweep.
+    /// Generation and operation attribution travel with measuredScanResponse/context.
+    let searchSweepTravel: Double?
+    let searchSweepProgress: Double?
     let measuredScanResponse: FollowScanResponseSeed?
     let turnStopFence: FollowTurnStopFence?
     var outcome: FollowMotionOutcome {
@@ -114,7 +145,10 @@ struct FollowMotionResult: Sendable {
          stopOutcome: FollowMotionStopOutcome = .unknown, commandReceipt: RoverCommandDiagnosticReceipt? = nil,
          stopReceipt: RoverCommandDiagnosticReceipt? = nil, deferred: FollowReadyDeferral? = nil,
           recovery: FollowRecoverySegmentEvidence? = nil, turnStopFence: FollowTurnStopFence? = nil,
-          measuredScanResponse: FollowScanResponseSeed? = nil) {
+           measuredScanResponse: FollowScanResponseSeed? = nil, searchSweepTravel: Double? = nil,
+           searchSweepProgress: Double? = nil) {
+        self.searchSweepTravel = searchSweepTravel
+        self.searchSweepProgress = searchSweepProgress
         self.measuredScanResponse = measuredScanResponse
         self.turnStopFence = turnStopFence
         self.recovery = recovery
@@ -132,6 +166,9 @@ struct FollowMotionResult: Sendable {
 /// Facts are captured synchronously by NavigationController and frozen for delivery.
 @MainActor
 final class FollowMotionOperationEvidence {
+    var readyDiagnosticFields: [String: FollowDiagnosticValue] = [:]
+    var searchSweepTravel: Double?
+    var searchSweepProgress: Double?
     var measuredScanResponse: FollowScanResponseSeed?
     let recoveryEpisodeID: UUID?
     let recoveryDeadline: Double?
@@ -152,7 +189,7 @@ final class FollowMotionOperationEvidence {
     var ownedGeneration: UInt?
     var callerCancellationStop: Task<Bool?, Never>?
     private(set) var primaryFailure: NavigationFailure?
-    private var failureCause: FollowTurnFailureCause?
+    private var failureCause: FollowMotionFailureCause?
     private(set) var stopOutcome: FollowMotionStopOutcome = .unknown
     private(set) var commandReceipt: RoverCommandDiagnosticReceipt?
     private(set) var stopReceipt: RoverCommandDiagnosticReceipt?
@@ -172,7 +209,7 @@ final class FollowMotionOperationEvidence {
             requestedRotation: recovery?.requestedDelta ?? initialContext.requestedRotation, targetYaw: targetYaw,
             failureCause: failureCause)
     }
-    func recordFailure(_ reason: NavigationFailure, cause: FollowTurnFailureCause? = nil) {
+    func recordFailure(_ reason: NavigationFailure, cause: FollowMotionFailureCause? = nil) {
         if primaryFailure == nil || primaryFailure == .commandFailed {
             primaryFailure = reason
             failureCause = cause
@@ -190,18 +227,19 @@ final class FollowMotionOperationEvidence {
         guard let primaryFailure else { return nil }
         return .init(context: context, reason: primaryFailure, stopOutcome: stopOutcome,
             source: source, stale: fenced, commandReceipt: commandReceipt, stopReceipt: stopReceipt,
-            turnDiagnosticFields: burstTrace.map { trace in trace.fields.merging([
+             turnDiagnosticFields: (burstTrace.map { trace in trace.fields.merging([
                 "episode_id": recoveryEpisodeID.map { .string($0.uuidString) } ?? .null,
                 "stage_index": recoveryStageIndex.map { .number(Double($0)) } ?? .null,
                 "segment_index": recoverySegmentIndex.map { .number(Double($0)) } ?? .null,
                 "stage_segment_availability": .string(recoveryStageIndex == nil ? "not_supplied" : "captured_coordinator_cursor")
-            ]) { _, value in value } } ?? [:])
+            ]) { _, value in value } } ?? [:]).merging(readyDiagnosticFields) { _, value in value })
     }
     func result(_ result: NavigationResult) -> FollowMotionResult {
         .init(result: result, context: context, failure: failure(source: .result),
             stopOutcome: stopOutcome, commandReceipt: commandReceipt, stopReceipt: stopReceipt,
             deferred: primaryFailure == nil && stopOutcome != .failed ? FollowReadyAdmissionScope.current?.deferred : nil,
-            recovery: recovery, turnStopFence: turnStopFence, measuredScanResponse: measuredScanResponse)
+            recovery: recovery, turnStopFence: turnStopFence, measuredScanResponse: measuredScanResponse,
+            searchSweepTravel: searchSweepTravel, searchSweepProgress: searchSweepProgress)
     }
 }
 

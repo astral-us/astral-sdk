@@ -2,8 +2,24 @@ import XCTest
 @testable import PhroverKit
 
 final class FollowMotionFailureResolutionTests: XCTestCase {
+    func testReadyGuardCauseAndMeasurementsSurviveGenericDeliveryAndStopFailureWins() {
+        let request = FollowMotionRequestContext(sessionGeneration: 1, requestToken: 4, purpose: .followReady, phase: "aligning")
+        let context = FollowMotionOperationContext(request: request, controllerOperationID: 7, purpose: .followReady,
+            profile: nil, failureCause: .readyLateralDeviation)
+        let generic = FollowMotionOperationContext(request: request, controllerOperationID: 7, purpose: .followReady, profile: nil)
+        var result = FollowMotionFailureResolution(.init(context: context, reason: .stalled,
+            stopOutcome: .pending, source: .stream, turnDiagnosticFields: ["ready_lateral_m": .number(0.03)]))
+        result.consume(.init(context: generic, reason: .stalled, stopOutcome: .confirmed, source: .result))
+        XCTAssertEqual(result.diagnosticReason, "ready_lateral_deviation")
+        XCTAssertEqual(result.turnDiagnosticFields["ready_lateral_m"], .number(0.03))
+        XCTAssertEqual(result.message, "Ready signal stopped: measured sideways drift exceeded 2 cm. Stop confirmed. Restart following to try again.")
+        result.consume(.init(context: generic, reason: .commandFailed, stopOutcome: .failed, source: .confirmation))
+        XCTAssertEqual(result.message, "Motor stop could not be confirmed. Motion is blocked.")
+        XCTAssertEqual(result.diagnosticReason, "ready_lateral_deviation")
+    }
+
     func testEvidenceAndStaleSourceCausesSurviveBothOrdersAndFailedStop() {
-        for (cause, reason) in [(FollowTurnFailureCause.calibrationEvidenceIncomplete, NavigationFailure.rotationResolutionInsufficient),
+        for (cause, reason) in [(FollowMotionFailureCause.calibrationEvidenceIncomplete, NavigationFailure.rotationResolutionInsufficient),
                                 (.poseSourceStale, .trackingLost)] {
             let base = delivery(.stream).context
             let context = FollowMotionOperationContext(request: base.request, controllerOperationID: base.controllerOperationID,

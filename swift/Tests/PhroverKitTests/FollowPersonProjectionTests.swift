@@ -6,6 +6,73 @@ import RoverNav
 
 @MainActor
 final class FollowPersonProjectionTests: XCTestCase {
+    func testVerifiedTorsoDepthRemainsGroundedWhenWalkingFeetPatchMixesSurfaces() throws {
+        let map = try buffer(value: 3)
+        patch(map, values: (0..<25).map { $0.isMultiple(of: 2) ? 1 : 5 })
+        let snapshot = try snapshot(map)
+        let detection = Detector.Detection(label: "person", confidence: 0.99,
+            boundingBox: CGRect(x: 0.2, y: 0.2, width: 0.6, height: 0.6))
+        func joint(_ x: Double, _ y: Double) -> PersonBodyVerifier.Joint {
+            .init(location: .init(x: x, y: y), confidence: 0.9)
+        }
+        let body = PersonBodyVerifier.Body(leftShoulder: joint(0.4, 0.7), rightShoulder: joint(0.6, 0.7),
+            leftHip: joint(0.43, 0.4), rightHip: joint(0.57, 0.4))
+        let verification = PersonBodyVerifier.verify(box: detection.boundingBox, rawPersonID: 0, bodies: [body])
+        XCTAssertTrue(verification.accepted)
+        XCTAssertTrue(ARFollowMePerceptionSource.batch(from: snapshot, detections: [detection]).people.isEmpty,
+            "The mixed feet patch must remain rejected for unverified legacy input")
+        let batch = ARFollowMePerceptionSource.batch(from: snapshot, detections: [detection], personVerification: [verification])
+        let person = try XCTUnwrap(batch.people.first, "A coherent independently verified torso patch avoids the moving leg/floor boundary")
+        XCTAssertEqual(person.position.x, -0.3, accuracy: 1e-5)
+        XCTAssertEqual(person.position.y, -3, accuracy: 1e-5)
+        XCTAssertNotNil(FollowTargetTracker(configuration: .init()).selectInitial(batch.people, now: 12))
+        XCTAssertEqual(batch.perceptionDiagnostics?.candidates.first?.depthAnchorKind, "verified_torso")
+        let invalidTorso = try buffer(value: 3)
+        CVPixelBufferLockBaseAddress(invalidTorso, [])
+        let base = CVPixelBufferGetBaseAddress(invalidTorso)!.assumingMemoryBound(to: Float.self)
+        for row in 8...12 { for col in 7...11 {
+            base[row * CVPixelBufferGetBytesPerRow(invalidTorso) / 4 + col] = (row + col).isMultiple(of: 2) ? 1 : 5
+        } }
+        CVPixelBufferUnlockBaseAddress(invalidTorso, [])
+        let rejected = ARFollowMePerceptionSource.batch(from: try self.snapshot(invalidTorso), detections: [detection],
+            personVerification: [verification])
+        XCTAssertTrue(rejected.people.isEmpty, "Torso sampling must still reject inconsistent depth rather than falling back to background")
+        XCTAssertEqual(rejected.perceptionDiagnostics?.candidates.first?.rejection, .inconsistentDepth)
+    }
+
+    func testVerifiedTorsoKeepsTrackAcrossTinyImageEdgeOverrun() throws {
+        func joint(_ x: Double, _ y: Double) -> PersonBodyVerifier.Joint {
+            .init(location: .init(x: x, y: y), confidence: 0.9)
+        }
+        let torso = PersonBodyVerifier.Body(leftShoulder: joint(0.80, 0.85), rightShoulder: joint(0.94, 0.85),
+            leftHip: joint(0.81, 0.50), rightHip: joint(0.92, 0.50))
+        let tracker = FollowTargetTracker(configuration: .init())
+        var previous: FollowPersonObservation?
+        for (sequence, right) in [(UInt64(7), 0.9995), (8, 1.0005), (9, 1.0)] {
+            let box = CGRect(x: 0.75, y: 0.24, width: right - 0.75, height: 0.75)
+            let verification = PersonBodyVerifier.verify(box: box, rawPersonID: 0, bodies: [torso])
+            let batch = ARFollowMePerceptionSource.batch(from: try snapshot(buffer(), sequence: sequence), detections: [
+                .init(label: "person", confidence: 0.99, boundingBox: box)], personVerification: [verification])
+            let person = try XCTUnwrap(batch.people.first, "Independent torso evidence and valid feet depth must survive tiny edge jitter")
+            if let previous {
+                guard case .matched = tracker.continueTrackEvaluated(batch.people, previous: previous,
+                    predictedPosition: previous.position, now: 12, frameID: batch.frameID).decision else {
+                    return XCTFail("Normalization must survive the tracker gate too")
+                }
+            } else { XCTAssertNotNil(tracker.selectInitial(batch.people, now: 12)) }
+            previous = person
+        }
+        for bad in [CGRect(x: 0.75, y: 0.24, width: 0.28, height: 0.75),
+                    CGRect(x: 0.75, y: -0.0005, width: 0.2505, height: 0.99)] {
+            let decision = PersonBodyVerifier.verify(box: bad, rawPersonID: 0, bodies: [torso])
+            let batch = ARFollowMePerceptionSource.batch(from: try snapshot(buffer()), detections: [
+                .init(label: "person", confidence: 1, boundingBox: bad)], personVerification: [decision])
+            XCTAssertTrue(batch.people.isEmpty, "Material clipping or missing feet must not become a grounded target")
+        }
+        XCTAssertFalse(PersonBodyVerifier.verify(box: CGRect(x: 0.75, y: 0.24, width: 0.2505, height: 0.75),
+            rawPersonID: 0, bodies: []).accepted)
+    }
+
     let box = CGRect(x: 0.4, y: 0.2, width: 0.2, height: 0.6)
 
     func buffer(width: Int = 20, height: Int = 20, format: OSType = kCVPixelFormatType_DepthFloat32,

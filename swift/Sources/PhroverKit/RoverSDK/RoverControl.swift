@@ -9,7 +9,8 @@ public enum RoverCommandLinkReadiness: Equatable, Sendable {
 /// Low-level driver for the WAVE ROVER ESP32 over WiFi HTTP.
 ///
 /// Speaks the Waveshare JSON command protocol: commands are sent as
-/// `GET /js?json={"T":1,"L":<left>,"R":<right>}`. Left/right are wheel linear velocities (m/s).
+/// `GET /js?json={"T":1,"L":<left>,"R":<right>}`. WAVE ROVER maps these
+/// values to open-loop PWM; encoder-equipped bases may interpret them as m/s.
 public actor RoverControl {
     private let baseURL: URL
     private let session: URLSession
@@ -51,7 +52,11 @@ public actor RoverControl {
     }
 
     func stopWithReceipt() async -> RoverCommandDiagnosticResult {
-        await sendJSONDiagnostic(["T": RoverConfig.Opcode.emergencyStop])
+        // WAVE ROVER's chassis dispatcher implements T:1, not T:0. Its HTTP
+        // endpoint also returns 200 for unhandled opcodes, so T:0 can appear
+        // acknowledged while leaving the previous wheel outputs running.
+        // Bypass burst authorization: stopping must work after its expiry/fence.
+        await sendJSONDiagnostic(["T": RoverConfig.Opcode.speedControl, "L": 0.0, "R": 0.0])
     }
 
     /// Stream a differential-drive command. The single source of motion for autonomy.
@@ -70,7 +75,8 @@ public actor RoverControl {
         _ = try await sendNavigationWithReceipt(cmd).get()
     }
 
-    /// Hard stop. Safe to call repeatedly; used by e-stop and the watchdog.
+    /// Command both wheel outputs to zero. Safe to repeat; used by e-stop and
+    /// the watchdog. The receipt confirms HTTP acceptance, not physical rest.
     public func stop() async throws {
         _ = try await stopWithReceipt().get()
     }

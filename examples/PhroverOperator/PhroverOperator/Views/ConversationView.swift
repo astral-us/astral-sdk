@@ -39,61 +39,63 @@ struct ConversationView: View {
     @State private var detector: Detector?
 
     var body: some View {
-        VStack(spacing: 18) {
-            if !statusLabel.isEmpty {
-                Text(statusLabel).font(.headline)
-            }
-
-            if !scripted {
-                LiveCameraDebugPanel(ar: ar, detector: detector, trackedFrame: model.trackedPersonFrameID)
-                    .frame(maxWidth: 320)
-            }
-
-            if !model.status.isEmpty {
-                Text(model.status).accessibilityIdentifier("talk_follow_status")
-            }
-            if let errorMessage = model.errorMessage {
-                Text(errorMessage).foregroundStyle(.red)
-            }
-            if model.showsStopFollowing {
-                Button("Stop Following", role: .destructive) {
-                    Task { await model.stopFollowing() }
-                }
-                .accessibilityIdentifier("talk_stop_following")
-            }
-
-            Text(speechIn.partialTranscript)
-                .foregroundStyle(.secondary)
-                .frame(minHeight: 40)
-                .multilineTextAlignment(.center)
-
-            VStack(spacing: 16) {
-                if agent != nil {
-                    Text(phaseStatusLabel)
-                        .font(.subheadline)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 12)
-                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        ScrollView {
+            VStack(spacing: 18) {
+                if !statusLabel.isEmpty {
+                    Text(statusLabel).font(.headline)
                 }
 
-                Image(systemName: "mic.circle.fill")
-                    .font(.system(size: 72))
-                    .foregroundStyle(speechIn.state == .listening ? .red : .accentColor)
-                    .accessibilityIdentifier("talk_microphone")
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { _ in startListening() }
-                            .onEnded { _ in speechIn.finish() }
-                    )
-            }
-            .offset(y: -36)
-            .padding(.bottom, 40)
+                if !scripted {
+                    LiveCameraDebugPanel(ar: ar, detector: detector, trackedFrame: model.trackedPersonFrameID)
+                        .frame(maxWidth: 320)
+                }
 
-            Spacer()
+                if !model.status.isEmpty {
+                    Text(model.status)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("talk_follow_status")
+                }
+                if let errorMessage = model.errorMessage {
+                    Text(errorMessage).foregroundStyle(.red)
+                }
+                if model.showsStopFollowing {
+                    Button("Stop Following", role: .destructive) {
+                        Task { await model.stopFollowing() }
+                    }
+                    .accessibilityIdentifier("talk_stop_following")
+                }
+
+                Text(speechIn.partialTranscript)
+                    .foregroundStyle(.secondary)
+                    .frame(minHeight: 40)
+                    .multilineTextAlignment(.center)
+
+                VStack(spacing: 16) {
+                    if agent != nil && model.status.isEmpty && model.errorMessage == nil {
+                        Text(phaseStatusLabel)
+                            .font(.subheadline)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 12)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    }
+
+                    Image(systemName: "mic.circle.fill")
+                        .font(.system(size: 72))
+                        .foregroundStyle(speechIn.state == .listening ? .red : .accentColor)
+                        .accessibilityIdentifier("talk_microphone")
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { _ in startListening() }
+                                .onEnded { _ in speechIn.finish() }
+                        )
+                }
+                .padding(.bottom, 24)
+            }
+            .padding(.horizontal)
+            .padding(.top, 44)
+            .padding(.bottom, 12)
         }
-        .padding(.horizontal)
-        .padding(.top, 44)
-        .padding(.bottom, 12)
         .task {
             guard !scripted else { return }
             let detector = await Detector()

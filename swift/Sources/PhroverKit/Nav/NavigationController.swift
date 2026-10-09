@@ -450,6 +450,9 @@ public final class NavigationController {
         let started = now()
         var progress = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.01)
         var sent = false
+        var previousStop: (uptime: Double, frame: ARFrameID?)?
+        var pulseIndex = 0
+        let limits = (travel: 0.12, backward: 0.02, lateral: 0.02, heading: 0.10, duration: 5.0)
         while !Task.isCancelled {
             let ack = await currentLastAck()
             guard !Task.isCancelled, operationGeneration == ownedGeneration,
@@ -465,8 +468,45 @@ public final class NavigationController {
             let delta = pose.position - start.position
             let along = delta.x * direction.x + delta.y * direction.y
             let lateral = abs(delta.x * direction.y - delta.y * direction.x)
-            guard delta.distance(to: .zero) <= 0.12, along >= -0.02,
-                  lateral <= 0.02, abs(normalizeAngle(pose.yaw - start.yaw)) <= 0.10 else { return .failed(.stalled) }
+            let travel = delta.distance(to: .zero)
+            let headingChange = normalizeAngle(pose.yaw - start.yaw)
+            func poseFields(_ value: Pose2D) -> FollowDiagnosticValue {
+                .object(["world_x": .number(value.position.x), "world_z": .number(value.position.y), "yaw_rad": .number(value.yaw)])
+            }
+            func fail(_ cause: FollowMotionFailureCause) -> NavigationResult {
+                let checkpoint = progress.diagnosticSnapshot(distanceToGoal: 0.10 - along, now: time)
+                let fields: [String: FollowDiagnosticValue] = [
+                    "ready_failure_cause": .string(cause.rawValue), "ready_pulse_index": .number(Double(pulseIndex)),
+                    "ready_start_pose": poseFields(start), "ready_current_pose": poseFields(pose),
+                    "ready_along_m": .number(along), "ready_lateral_m": .number(lateral),
+                    "ready_signed_lateral_m": .number(delta.x * direction.y - delta.y * direction.x),
+                    "ready_total_distance_m": .number(travel), "ready_heading_change_rad": .number(abs(headingChange)),
+                    "ready_signed_heading_change_rad": .number(headingChange),
+                    "ready_elapsed_s": .number(time.timeIntervalSince(started)),
+                    "ready_watchdog_elapsed_s": checkpoint.elapsed.map { .number($0) } ?? .null,
+                    "ready_progress_timeout_s": .number(progress.timeout), "ready_minimum_progress_m": .number(progress.minimumProgress),
+                    "ready_maximum_duration_s": .number(limits.duration), "ready_maximum_travel_m": .number(limits.travel),
+                    "ready_maximum_backward_m": .number(limits.backward), "ready_maximum_lateral_m": .number(limits.lateral),
+                    "ready_maximum_heading_change_rad": .number(limits.heading),
+                    "ready_command_invoked": .bool(sent),
+                    "ready_source_frame_id": sample.frameID.map { .string("\($0.generation):\($0.sequence)") } ?? .null,
+                    "ready_source_timestamp_s": sample.sourceTimestamp.map { .number($0) } ?? .null,
+                    "ready_source_read_uptime_s": .number(sourceTime),
+                    "ready_source_age_s": sample.sourceTimestamp.map { .number(sourceTime - $0) } ?? .null]
+                let evidence = FollowMotionTaskScope.evidence
+                evidence?.readyDiagnosticFields = fields
+                evidence?.recordFailure(.stalled, cause: cause)
+                diagnosticEmitter?.emit(.init(event: "follow_ready.failure", context: .init(
+                    sessionGeneration: evidence?.context.request?.sessionGeneration,
+                    operationID: evidence?.context.controllerOperationID, purpose: "followReady",
+                    phase: "signalingReady", outcome: "failed", reason: cause.rawValue), payload: fields))
+                return .failed(.stalled)
+            }
+            guard travel.isFinite, along.isFinite, lateral.isFinite, headingChange.isFinite else { return fail(.readyInvalidGeometry) }
+            guard travel <= limits.travel else { return fail(.readyTravelLimit) }
+            guard along >= -limits.backward else { return fail(.readyBackwardMotion) }
+            guard lateral <= limits.lateral else { return fail(.readyLateralDeviation) }
+            guard abs(headingChange) <= limits.heading else { return fail(.readyHeadingDeviation) }
             let clearance = currentForwardClearance()
             guard clearance.isFinite else { return .failed(.obstacle) }
             guard let ack, time.timeIntervalSince(ack) >= 0,
@@ -481,11 +521,23 @@ public final class NavigationController {
             case .stopTipping: return .failed(.tipping)
             }
             guard !Task.isCancelled else { return .cancelled }
+            // Waiting for post-stop evidence must not renew progress from a
+            // rejected capture, and late displacement cannot revive a deadline.
+            let existingCheckpoint = progress.diagnosticSnapshot(distanceToGoal: 0.10 - along, now: time)
+            if time.timeIntervalSince(started) >= limits.duration { return fail(.readyOverallTimeout) }
+            if (existingCheckpoint.elapsed ?? 0) >= progress.timeout { return fail(.readyProgressTimeout) }
+            if let previousStop, sourceGeneration != nil {
+                guard let id = sample.frameID, let timestamp = sample.sourceTimestamp else { return .failed(.trackingLost) }
+                if timestamp <= previousStop.uptime || id.sequence <= (previousStop.frame?.sequence ?? 0) {
+                    await sleep(.milliseconds(20))
+                    continue
+                }
+            }
             // A pre-send pose correction is not measured progress from this signal.
-            if along >= 0.08 { return sent ? .arrived : .failed(.stalled) }
-            if time.timeIntervalSince(started) >= 5 || progress.observe(
-                distanceToGoal: 0.10 - along, now: time, commanded: true) { return .failed(.stalled) }
-            let speed = min(0.05, (0.10 - along) * 0.8)
+            if along >= 0.08 { return sent ? .arrived : fail(.readyPreSendPoseShift) }
+            if progress.observe(
+                distanceToGoal: 0.10 - along, now: time, commanded: true) { return fail(.readyProgressTimeout) }
+            let speed = RoverConfig.readySignalWheelMagnitude
             if !sent, let admission = FollowReadyAdmissionScope.current,
                !admission.admit(boundary: .controllerFirstSend, sample: sample, readUptime: sourceTime) { return .cancelled }
             if FollowRecoveryScope.authorization != nil {
@@ -494,9 +546,42 @@ public final class NavigationController {
                 if followPoseRejection(sample, at: sourceNow()) != nil { return .failed(.trackingLost) }
             }
             sent = true
-            do { try await sendCommand(WheelCommand(left: speed, right: speed)) }
-            catch { return Task.isCancelled ? .cancelled : .failed(.commandFailed) }
-            await sleep(.seconds(RoverConfig.commandInterval))
+            pulseIndex += 1
+            // Bound the stronger open-loop output by host budget, not a guessed
+            // physical velocity. The shared sender drains before serialized stop.
+            let checkpoint = progress.diagnosticSnapshot(distanceToGoal: 0.10 - along, now: time)
+            let validUntil = min(sample.sourceTimestamp.map { ($0 + 0.5).nextUp } ?? .infinity,
+                sourceTime + RoverConfig.commsWatchdogTimeout - time.timeIntervalSince(ack),
+                sourceTime + limits.duration - time.timeIntervalSince(started),
+                sourceTime + max(0, progress.timeout - (checkpoint.elapsed ?? 0)))
+            do {
+                let pulse = try await executeFollowTurnBurst(WheelCommand(left: speed, right: speed),
+                    requestedBudget: RoverConfig.readySignalPulseBudget, purpose: .followReady,
+                    sendValidUntil: validUntil)
+                guard operationGeneration == ownedGeneration, !Task.isCancelled,
+                      FollowMotionTaskScope.evidence?.fenced != true, !stopUnconfirmed, recoveryAuthorized else { return .cancelled }
+                if pulse.send.result.failure != nil { return .failed(.commandFailed) }
+                let pulseReturnUptime = sourceNow()
+                let stoppedSample = readFollowPose()
+                let stoppedPoseReadUptime = sourceNow()
+                previousStop = (pulse.confirmedStopFence?.acknowledgementUptime ?? sourceNow(), stoppedSample.frameID)
+                diagnosticEmitter?.emit(.init(event: "follow_ready.pulse_stopped", context: .init(
+                    operationID: FollowMotionTaskScope.evidence?.context.controllerOperationID,
+                    purpose: "followReady", phase: "signalingReady", outcome: "stop_confirmed"), payload: [
+                        "along_before_m": .number(along), "target_distance_m": .number(0.10),
+                        "ready_pulse_index": .number(Double(pulseIndex)), "ready_start_pose": poseFields(start),
+                        "ready_pose_at_stop_return": stoppedSample.pose.map(poseFields) ?? .null,
+                        "ready_stop_return_source_timestamp_s": stoppedSample.sourceTimestamp.map { .number($0) } ?? .null,
+                        "ready_stop_ack_uptime_s": pulse.confirmedStopFence.map { .number($0.acknowledgementUptime) } ?? .null,
+                        "ready_pulse_return_uptime_s": .number(pulseReturnUptime),
+                        "ready_stop_return_pose_read_uptime_s": .number(stoppedPoseReadUptime),
+                        "ready_stop_return_frame_id": stoppedSample.frameID.map { .string("\($0.generation):\($0.sequence)") } ?? .null,
+                        "wheel_magnitude": .number(speed), "requested_host_budget_s": .number(RoverConfig.readySignalPulseBudget),
+                        "send_host_duration_s": .number(pulse.send.responseUptime - pulse.send.sendEntryUptime),
+                        "sender_outcome": .string(pulse.send.result.receipt.outcome),
+                        "physical_motor_duration_confidence": .string("unknown")]))
+            } catch { return Task.isCancelled || operationGeneration != ownedGeneration ? .cancelled : .failed(.commandFailed) }
+            await sleep(.seconds(RoverConfig.readySignalStoppedObservation))
         }
         return .cancelled
     }
@@ -664,12 +749,16 @@ public final class NavigationController {
             target = FollowReacquisitionPlanner.wrap(yaw + angle)
         }
         evidence?.targetYaw = target
-        let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan)
+        let searchSweep = purpose == .followScan && evidence?.context.request?.isSearchSweep == true &&
+            FollowRecoveryScope.heading == nil && FollowRecoveryScope.authorization == nil &&
+            angle.isFinite && angle != 0 && abs(angle) <= .pi ? angle : nil
+        let profile = FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan,
+            fastSearch: searchSweep != nil)
         state = .driving
         publishSafetyState(.moving)
         let task = Task { @MainActor in
             let runtime = FollowTurnRuntimeState(targetYaw: target, initial: initial,
-                tolerance: profile.tolerance, date: self.now())
+                tolerance: searchSweep == nil ? profile.tolerance : 0, date: self.now(), settleWait: profile.settleWait)
             defer {
                 if runtime.failure == .trackingLost, runtime.sourceRejection == "stale_source" {
                     evidence?.recordFailure(.trackingLost, cause: .poseSourceStale)
@@ -715,6 +804,12 @@ public final class NavigationController {
                 operationID: evidence?.context.controllerOperationID ?? UInt64(owner), profile: profile, runtime: runtime,
                 responseRateFloor: purpose == .followScan && evidence?.context.request?.scanResponseSeed?.sourceGeneration == initial.frameID!.generation
                     ? evidence!.context.request!.scanResponseSeed!.responseRate : 2 * .pi / 3,
+                requestedSearchSweep: searchSweep,
+                searchSweepProgress: { signed, travel in
+                    evidence?.searchSweepTravel = travel
+                    evidence?.searchSweepProgress = signed
+                    evidence?.burstTrace?.searchSweepProgress(signed: signed, travel: travel)
+                },
                 uptime: self.sourceNow, now: self.now,
                 authorized: { self.operationGeneration == owner && evidence?.fenced != true && self.recoveryAuthorized && !self.stopUnconfirmed },
                 admit: { progress in
@@ -764,6 +859,7 @@ public final class NavigationController {
                     await self.awaitFollowTurnSource(after: fence, progress: progress, runtime: runtime)
                 },
                 diagnostic: { calibration, sample, decision, uptime in
+                    evidence?.burstTrace?.completionPolicy(searchSweep: searchSweep)
                     evidence?.burstTrace?.planning(calibration, sample: sample, profile: profile, decision: decision, uptime: uptime)
                     if let evidence { evidence.scanTrace?.emit("burst_plan", evidence: evidence, latch: self.stopUnconfirmed) }
                 },
@@ -1127,7 +1223,7 @@ public final class NavigationController {
     func executeFollowTurnBurst(_ command: WheelCommand, requestedBudget: Double,
                                 purpose: FollowMotionPurpose,
                                 runtime: FollowTurnRuntimeState? = nil,
-                                plannedYaw: Double? = nil) async throws -> FollowTurnBurstExecutionReceipt {
+                                plannedYaw: Double? = nil, sendValidUntil: Double? = nil) async throws -> FollowTurnBurstExecutionReceipt {
         let owner = operationGeneration
         let evidence = FollowMotionTaskScope.evidence
         var ownedSubscription: UUID?
@@ -1142,8 +1238,8 @@ public final class NavigationController {
             }
             if let start = followTurnSourceGate.latest {
                 observation = .init(targetYaw: target,
-                    tolerance: FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
-                    start: start, uptime: sourceNow())
+                    tolerance: runtime?.tolerance ?? FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
+                    start: start, uptime: sourceNow(), preferPositiveHalfTurn: command.right > command.left)
             }
         }
         defer {
@@ -1169,7 +1265,7 @@ public final class NavigationController {
         var execution = try await FollowTurnBurstExecutor.execute(command: command, budget: requestedBudget,
             send: {
                 let receipt = await self.sendFollowTurnBurst($0, requestedBudget: $1, purpose: purpose,
-                    runtime: runtime, plannedYaw: plannedYaw)
+                    runtime: runtime, plannedYaw: plannedYaw, sendValidUntil: sendValidUntil)
                 completedSend = receipt
                 return receipt
             },
@@ -1229,7 +1325,7 @@ public final class NavigationController {
             stop: {
                 guard self.operationGeneration == owner else { throw CancellationError() }
                 runtime?.expire(at: self.now())
-                if completedSend?.definitePreSendExpiry == true, runtime?.failure == nil,
+                if purpose != .followReady, completedSend?.definitePreSendExpiry == true, runtime?.failure == nil,
                    !Task.isCancelled, evidence?.fenced != true, self.recoveryAuthorized,
                    !self.stopUnconfirmed, let evidence {
                     evidence.recordFailure(.rotationResolutionInsufficient, cause: .burstPreSendExpired)
@@ -1282,7 +1378,7 @@ public final class NavigationController {
     func sendFollowTurnBurst(_ command: WheelCommand, requestedBudget: Double,
                               purpose: FollowMotionPurpose,
                               runtime: FollowTurnRuntimeState? = nil,
-                              plannedYaw: Double? = nil) async -> FollowTurnBurstSendReceipt {
+                              plannedYaw: Double? = nil, sendValidUntil: Double? = nil) async -> FollowTurnBurstSendReceipt {
         let owner = operationGeneration
         let evidence = FollowMotionTaskScope.evidence
         let requireFreshAckForSend = runtime?.progress.hasSentCommand ?? false
@@ -1308,7 +1404,7 @@ public final class NavigationController {
         }
         let fence = FollowTurnBurstFence()
         let arming = FollowTurnBurstArming()
-        evidence?.burstTrace?.prepareSender(budget: requestedBudget, uptime: entry)
+        evidence?.burstTrace?.prepareSender(budget: requestedBudget, uptime: entry, settleWait: runtime?.settleWait ?? 0.300)
         let drain = FollowTurnBurstDrain()
         let transportCapture = FollowTurnTransportCapture()
         // The shared follow executor supplies the frozen target through captured
@@ -1323,8 +1419,8 @@ public final class NavigationController {
             }
             if let start = followTurnSourceGate.latest {
                 observation = .init(targetYaw: target,
-                    tolerance: FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
-                    start: start, uptime: entry)
+                    tolerance: runtime?.tolerance ?? FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
+                    start: start, uptime: entry, preferPositiveHalfTurn: command.right > command.left)
             }
         }
         // Production supplies the actual planning source captured BEFORE any
@@ -1342,7 +1438,7 @@ public final class NavigationController {
                 requireFreshAck: requireFreshAckForSend) { return false }
             let time = self.sourceNow()
             let date = self.now()
-            var expiry = Double.infinity
+            var expiry = sendValidUntil ?? .infinity
             if let runtime {
                 guard let timestamp = self.followTurnSourceGate.latest?.sourceTimestamp else { return false }
                 expiry = min(expiry, (timestamp + 0.500).nextUp)
@@ -1393,7 +1489,7 @@ public final class NavigationController {
             preparedFence: fence, uptime: transportUptime,
             didEnterAttempt: { transportCapture.record($0) },
             transportCapture: transportCapture)
-        let selected = purpose == .followAlignment || purpose == .followScan ? authorization : nil
+        let selected = purpose == .followAlignment || purpose == .followScan || purpose == .followReady ? authorization : nil
         let monitor = Task { @MainActor in
             guard let epoch = await arming.wait(), !Task.isCancelled else { return }
             let deadline = epoch.deadline
@@ -1513,8 +1609,8 @@ public final class NavigationController {
                 }
                 if let target = evidence?.targetYaw, let start = followTurnSourceGate.latest {
                     observation = .init(targetYaw: target,
-                        tolerance: FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
-                        start: start, uptime: sourceNow())
+                        tolerance: runtime?.tolerance ?? FollowTurnBurstPlanner.Profile(purpose: purpose == .followAlignment ? .alignment : .scan).tolerance,
+                        start: start, uptime: sourceNow(), preferPositiveHalfTurn: command.right > command.left)
                 }
                 runtime?.progress.hasSentCommand = true
                 evidence?.recordStop(.pending)
@@ -1663,13 +1759,14 @@ public final class NavigationController {
                                progress: FollowTurnWaitingProgress,
                                runtime: FollowTurnRuntimeState? = nil) async -> FollowTurnSourceResult {
         let evidence = FollowMotionTaskScope.evidence
+        let minimumSettle = runtime?.settleWait ?? 0.300
         var enteredSettle = false
         var evaluated: NavigationPoseSample?
         defer {
             if let evidence, evaluated == nil {
                 evidence.burstTrace?.sourceGate(fence: fence, sample: followTurnSourceGate.latest, uptime: sourceNow(),
-                    reason: followTurnSourceGate.diagnosticRejection(after: fence, at: sourceNow()) ?? "authority_or_runtime_failure",
-                    evidence: evidence, latch: stopUnconfirmed)
+                    reason: followTurnSourceGate.diagnosticRejection(after: fence, at: sourceNow(), minimumSettle: minimumSettle) ?? "authority_or_runtime_failure",
+                    evidence: evidence, latch: stopUnconfirmed, minimumSettle: minimumSettle)
             }
             if enteredSettle, let evidence {
                 if let evaluated, let runtime {
@@ -1758,28 +1855,30 @@ public final class NavigationController {
             case .stopTipping: return .failed(.tipping)
             case .stopObstacle: return .failed(.obstacle)
             }
-            if let selected = followTurnSourceGate.consume(after: fence, at: sourceNow()) {
+            if let selected = followTurnSourceGate.consume(after: fence, at: sourceNow(), minimumSettle: minimumSettle) {
                 evaluated = selected
                 if let evidence { evidence.burstTrace?.sourceGate(fence: fence, sample: selected, uptime: sourceNow(),
-                    reason: nil, evidence: evidence, latch: stopUnconfirmed) }
+                    reason: nil, evidence: evidence, latch: stopUnconfirmed, minimumSettle: minimumSettle) }
                 return .sample(selected)
             }
             var deadline = (newest.sourceTimestamp! + 0.500).nextUp
-            if sourceNow() < fence.acknowledgementUptime + 0.300 { deadline = min(deadline, fence.acknowledgementUptime + 0.300) }
+            let settleDeadline = fence.acknowledgementUptime +
+                (sourceNow() < fence.acknowledgementUptime + minimumSettle ? minimumSettle : 0.300)
+            if sourceNow() < settleDeadline { deadline = min(deadline, settleDeadline) }
             if let remaining = (runtime?.progress ?? progress).remaining(at: now()) {
                 deadline = min(deadline, sourceNow() + remaining)
             }
             if let authorization = FollowRecoveryScope.authorization {
                 deadline = min(deadline, sourceNow() + max(0, authorization.deadline - authorization.now()))
             }
-            if !enteredSettle, sourceNow() < fence.acknowledgementUptime + 0.300, let evidence {
-                evidence.scanTrace?.beginWait("settle", duration: fence.acknowledgementUptime + 0.300 - sourceNow(),
+            if !enteredSettle, sourceNow() < settleDeadline, let evidence {
+                evidence.scanTrace?.beginWait("settle", duration: settleDeadline - sourceNow(),
                     evidence: evidence, latch: stopUnconfirmed)
                 enteredSettle = true
             }
             if let evidence { evidence.burstTrace?.sourceGate(fence: fence, sample: newest, uptime: sourceNow(),
-                reason: followTurnSourceGate.diagnosticRejection(after: fence, at: sourceNow()),
-                evidence: evidence, latch: stopUnconfirmed) }
+                reason: followTurnSourceGate.diagnosticRejection(after: fence, at: sourceNow(), minimumSettle: minimumSettle),
+                evidence: evidence, latch: stopUnconfirmed, minimumSettle: minimumSettle) }
             await waitForFollowTurnSource(until: deadline)
         }
     }

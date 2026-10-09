@@ -60,7 +60,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         await drain()
         XCTAssertEqual(fixture.coordinator.state, .signalingReady,
             "A same-time capture cannot establish the fixed departure baseline")
-        fixture.clock.advance(to: 1.24)
+        fixture.clock.advance(to: fixture.clock.now + 0.301)
         fixture.send(6, range: 1.6)
         await drain()
         XCTAssertEqual(fixture.coordinator.state, .waitingForMovement)
@@ -238,11 +238,12 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
                 XCTAssertEqual(fixture.commands, 1)
                 await fixture.fresh(7, range: 1.6)
                 XCTAssertEqual(fixture.coordinator.state, .waitingForMovement)
+                let acceptedFrame = fixture.frameIDs[7]
                 fixture.send(8, range: 1.6, peopleAvailable: false)
                 await drain()
                 let episodes = fixture.records.filter { $0["event"] as? String == "follow_recovery.started" }
                 XCTAssertEqual(episodes.count, 2)
-                XCTAssertEqual(episodes.last?["anchor_frame_id"] as? String, "1:8")
+                XCTAssertEqual(episodes.last?["anchor_frame_id"] as? String, acceptedFrame.map { "1:\($0)" })
                 XCTAssertEqual(fixture.commands, 1)
             }
             _ = await fixture.coordinator.stop()
@@ -625,7 +626,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         fixture.feedback.release()
         await drain()
         XCTAssertEqual(fixture.commands, 0)
-        XCTAssertEqual(fixture.coordinator.state, .failed("Navigation stopped: insufficient measured progress."))
+        XCTAssertEqual(fixture.coordinator.state, .failed("Ready signal stopped: pose changed before the first motor command. Stop confirmed. Restart following to try again."))
         XCTAssertEqual(fixture.states.last?["ready_signal_attempted"], "false")
         XCTAssertEqual(fixture.states.last?["ready_admission_pending"], "false")
         fixture.send(3, range: 1.6)
@@ -842,7 +843,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         await drain()
         XCTAssertGreaterThan(fixture.commands, 0)
         XCTAssertLessThan(fixture.commands, 55)
-        XCTAssertEqual(fixture.coordinator.state, .failed("Navigation stopped: insufficient measured progress."))
+        XCTAssertEqual(fixture.coordinator.state, .failed("Ready signal stopped: insufficient forward progress within 2.5 seconds. Stop confirmed. Restart following to try again."))
         XCTAssertEqual(fixture.states.last?["ready_signal_attempted"], "true")
         let commands = fixture.commands
         fixture.stall = false
@@ -984,7 +985,8 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
         fixture.feedback.release()
         await drain()
         XCTAssertEqual(fixture.commands, 1)
-        XCTAssertEqual(fixture.coordinator.state, .signalingReady)
+        XCTAssertEqual(fixture.records.filter { $0["event"] as? String == "follow_ready.admission_authorized" }.count, 1,
+            "Admission at 500 ms is valid; elapsed pulse time may subsequently age that detector frame")
         _ = await fixture.coordinator.stop()
     }
 
@@ -1197,7 +1199,7 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             forwardClearance: { [self] in clearance }, plan: { [self] _, goal in ready = true; plans += 1; return [goal] },
             lastAckAt: { [self] in await acknowledgement() }, sendCommand: { [self] command in try await sendCommand(command) },
             stopRover: { [self] in try await stopRover() },
-            sleep: { [self] _ in await tick() }, now: { [self] in controllerTime },
+            sleep: { [self] duration in await tick(duration) }, now: { [self] in controllerTime },
             poseSample: { [self] in
                 return enriched ? storedControllerSample : .legacy(storedControllerSample.pose)
             }, sourceNow: { [self] in clock.now },
@@ -1343,15 +1345,29 @@ final class FollowReadyAdmissionIntegrationTests: XCTestCase {
             if stops == holdStopNumber { await stopFeedback.suspend() }
             if failStop { throw URLError(.cannotConnectToHost) }
         }
-        func tick() async {
+        func tick(_ duration: Duration) async {
             if turning { yaw = 0 } else {
                 if FollowMotionTaskScope.evidence?.context.purpose == .followReady {
-                    controllerTime = controllerTime.addingTimeInterval(0.1)
-                    if commands > 0, !stall {
-                        position = Vec2(0.1, 0)
+                    let elapsed = max(0.001, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
+                    controllerTime = controllerTime.addingTimeInterval(elapsed)
+                    clock.advance(to: clock.now + elapsed, wakeSleepers: !stall)
+                    if commands > 0 {
+                        if !stall { position = Vec2(0.1, 0) }
                         sourceSequence += 1
                         ingestedControllerTimestamp = clock.now
                         storeControllerCapture()
+                        if stall {
+                            // A stalled chassis still produces fresh camera and
+                            // detector frames. Only measured translation is zero.
+                            let id = ARFrameID(generation: controllerGeneration, sequence: sourceSequence)
+                            let person = FollowPersonObservation(frameID: id, timestamp: clock.now, confidence: 0.99,
+                                boundingBox: CGRect(x: 0.3, y: 0.2, width: 0.4, height: 0.6), position: Vec2(1.6, 0),
+                                pose: .init(position: position, yaw: yaw))
+                            perception.send(.frame(.init(frameID: id, timestamp: clock.now,
+                                pose: person.pose, depthAvailable: true, people: [person], trackingQuality: .normal)))
+                            for _ in 0..<10 { await Task.yield() }
+                            clock.advance(to: clock.now)
+                        }
                     }
                 }
             }

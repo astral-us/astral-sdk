@@ -12,7 +12,8 @@ struct FollowTurnBurstObservation {
     private var previous: NavigationPoseSample
     private(set) var triggerReason: String?
 
-    init?(targetYaw: Double, tolerance: Double, start: NavigationPoseSample, uptime: Double) {
+    init?(targetYaw: Double, tolerance: Double, start: NavigationPoseSample, uptime: Double,
+          preferPositiveHalfTurn: Bool = false) {
         guard targetYaw.isFinite, tolerance.isFinite, tolerance >= 0,
               start.rejection(at: uptime, requireEnriched: true) == nil,
               let generation = start.frameID?.generation else { return nil }
@@ -20,7 +21,9 @@ struct FollowTurnBurstObservation {
         self.tolerance = tolerance
         self.generation = generation
         let error = FollowReacquisitionPlanner.wrap(targetYaw - start.pose!.yaw)
-        direction = error < 0 ? -1 : 1
+        // A sweep has an explicit command direction even at the antipodal
+        // representation seam, where the wrapped heading alone is ambiguous.
+        direction = error == -.pi && preferPositiveHalfTurn ? 1 : (error < 0 ? -1 : 1)
         distance = abs(error)
         previous = start
     }

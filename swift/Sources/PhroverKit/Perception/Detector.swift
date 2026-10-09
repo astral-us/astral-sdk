@@ -17,13 +17,18 @@ public final class Detector: @unchecked Sendable {
     private let inferenceLock = NSRecursiveLock()
     private let cacheLock = NSLock()
     private let jobLock = NSLock()
-    private let worker = DispatchQueue(label: "us.astral.follow-inference", qos: .userInitiated)
+    private let worker: DispatchQueue
+    private static func inferenceWorker() -> DispatchQueue {
+        DispatchQueue(label: "us.astral.follow-inference", qos: .userInitiated)
+    }
     private var workerRunning = false
     private var pendingJob: InferenceJob?
+    private var followConsumers: Set<UUID> = []
     private struct InferenceJob: Sendable {
         let snapshot: ARFrameSnapshot
         let cancellation: InferenceCancellation
         let continuation: CheckedContinuation<EvaluationReceipt?, Never>
+        let previewOnly: Bool
     }
     private final class InferenceCancellation: @unchecked Sendable {
         private let lock = NSLock()
@@ -82,6 +87,7 @@ public final class Detector: @unchecked Sendable {
     /// Loads Xcode's compiled `.mlmodelc` when available, with source model fallback for
     /// package contexts that still ship `.mlpackage`/`.mlmodel` resources.
     public init(modelName: String = "RoverYOLO") async {
+        worker = Self.inferenceWorker()
         detectionHandler = nil
         bodyPoseHandler = Self.humanBodies
         guard let modelURL = Self.modelResourceURL(modelName: modelName) else {
@@ -120,7 +126,9 @@ public final class Detector: @unchecked Sendable {
     }
 
     init(supportedLabels: Set<String>, detectionHandler: @escaping (CVPixelBuffer) throws -> [Detection],
-         bodyPoseHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])? = nil) {
+         bodyPoseHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])? = nil,
+         inferenceQueue: DispatchQueue? = nil) {
+        worker = inferenceQueue ?? Self.inferenceWorker()
         request = nil
         self.detectionHandler = detectionHandler
         self.bodyPoseHandler = bodyPoseHandler
@@ -130,6 +138,7 @@ public final class Detector: @unchecked Sendable {
     /// Exercises the same orientation selection as the production Vision request.
     init(supportedLabels: Set<String>, visionHandler: @escaping (CVPixelBuffer, CGImagePropertyOrientation) throws -> [Detection],
          bodyPoseHandler: ((CVPixelBuffer, CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body])? = nil) {
+        worker = Self.inferenceWorker()
         request = nil
         detectionHandler = nil
         self.visionHandler = visionHandler
@@ -225,17 +234,37 @@ public final class Detector: @unchecked Sendable {
     }
 
     @MainActor public func evaluateForFollowAsync(_ snapshot: ARFrameSnapshot) async -> EvaluationReceipt? {
+        await evaluateAsync(snapshot, previewOnly: false)
+    }
+
+    func beginFollowConsumer() -> UUID {
+        let token = UUID()
+        let dropped: InferenceJob? = jobLock.withLock {
+            followConsumers.insert(token)
+            guard pendingJob?.previewOnly == true else { return nil }
+            let old = pendingJob; pendingJob = nil; return old
+        }
+        dropped?.continuation.resume(returning: nil)
+        return token
+    }
+
+    func endFollowConsumer(_ token: UUID) { _ = jobLock.withLock { followConsumers.remove(token) } }
+
+    @MainActor private func evaluateAsync(_ snapshot: ARFrameSnapshot, previewOnly: Bool) async -> EvaluationReceipt? {
         let cancellation = InferenceCancellation()
         return await withTaskCancellationHandler {
             guard !Task.isCancelled else { return nil }
             return await withCheckedContinuation { continuation in
-                let job = InferenceJob(snapshot: snapshot, cancellation: cancellation, continuation: continuation)
+                let job = InferenceJob(snapshot: snapshot, cancellation: cancellation, continuation: continuation, previewOnly: previewOnly)
                 var superseded: InferenceJob?
+                var skipped = false
                 let start = jobLock.withLock {
+                    if previewOnly && !followConsumers.isEmpty { skipped = true; return false }
                     if workerRunning { superseded = pendingJob; pendingJob = job; return false }
                     workerRunning = true
                     return true
                 }
+                if skipped { continuation.resume(returning: nil); return }
                 superseded?.continuation.resume(returning: nil)
                 if start { worker.async { self.run(job) } }
             }
@@ -243,7 +272,12 @@ public final class Detector: @unchecked Sendable {
     }
 
     private func run(_ job: InferenceJob) {
-        let receipt = job.cancellation.cancelled ? nil : evaluateForFollow(job.snapshot)
+        // A preview may already be on the dispatch queue when follow begins.
+        // Arbitrate at native execution, after any synchronous inference drains.
+        inferenceLock.lock()
+        let permitted = jobLock.withLock { !job.previewOnly || followConsumers.isEmpty }
+        let receipt = !permitted || job.cancellation.cancelled ? nil : evaluateForFollow(job.snapshot)
+        inferenceLock.unlock()
         job.continuation.resume(returning: job.cancellation.cancelled ? nil : receipt)
         let next: InferenceJob? = jobLock.withLock {
             guard let next = pendingJob else { workerRunning = false; return nil }
@@ -260,7 +294,7 @@ public final class Detector: @unchecked Sendable {
            uptime - cached.snapshot.timestamp >= 0, uptime - cached.snapshot.timestamp <= 0.5 {
             return cached
         }
-        guard let receipt = await evaluateForFollowAsync(snapshot), !Task.isCancelled else { return nil }
+        guard let receipt = await evaluateAsync(snapshot, previewOnly: true), !Task.isCancelled else { return nil }
         return .init(snapshot: snapshot, receipt: receipt)
     }
 
@@ -277,15 +311,17 @@ public final class Detector: @unchecked Sendable {
         return .init(snapshot: snapshot, receipt: receipt)
     }
 
-    private enum BodyVerificationError: Error { case noCPUDevice }
+    private enum BodyVerificationError: Error { case noSupportedDevice }
     static func humanBodies(_ image: CVPixelBuffer, _ orientation: CGImagePropertyOrientation) throws -> [PersonBodyVerifier.Body] {
         let request = VNDetectHumanBodyPoseRequest()
-        // Preserve the detector's existing no-GPU background-wind-down policy.
+        // Prefer supported Neural Engine work while preserving the detector's
+        // no-GPU background-wind-down policy; CPU remains the fallback.
         for (stage, devices) in try request.supportedComputeStageDevices {
-            guard let cpu = devices.first(where: { if case .cpu = $0 { return true }; return false }) else {
-                throw BodyVerificationError.noCPUDevice
+            guard let device = devices.first(where: { if case .neuralEngine = $0 { return true }; return false }) ??
+                    devices.first(where: { if case .cpu = $0 { return true }; return false }) else {
+                throw BodyVerificationError.noSupportedDevice
             }
-            request.setComputeDevice(cpu, for: stage)
+            request.setComputeDevice(device, for: stage)
         }
         try VNImageRequestHandler(cvPixelBuffer: image, orientation: orientation).perform([request])
         return try (request.results ?? []).map { observation in
