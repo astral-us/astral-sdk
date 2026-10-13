@@ -149,3 +149,33 @@ final class ContextualFollowMotionFake: FollowMeContextualMotion {
     }
     func stopAndConfirm() async throws { try await legacy.stopAndConfirm() }
 }
+
+/// A contextual motion whose follow drive can be steered in flight, like the real controller.
+/// `navigate` suspends while the drive is "running"; `updateFollowGoal` is accepted only then.
+@MainActor
+final class LiveGoalFollowMotionFake: FollowMeContextualMotion {
+    let legacy = FollowMotionFake()
+    var sourceUptime: TimeInterval? { legacy.sourceUptime }
+    private(set) var liveGoals: [Vec2] = []
+    /// When false the fake refuses live updates, like a controller that is not driving.
+    var acceptsLiveGoals = true
+
+    init() { legacy.suspendNavigation = true }
+
+    func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
+        await legacy.performContextual(request, context: context)
+    }
+    func updateFollowGoal(_ goal: Vec2) -> Bool {
+        guard acceptsLiveGoals, !legacy.goals.isEmpty else { return false }
+        liveGoals.append(goal)
+        return true
+    }
+    func safetyStates() -> AsyncStream<NavigationSafetyState> { legacy.safetyStates() }
+    func rotateForScan(by angle: Double) async -> NavigationResult { await legacy.rotateForScan(by: angle) }
+    func alignTowardPerson(by angle: Double) async -> NavigationResult { await legacy.alignTowardPerson(by: angle) }
+    func signalReady() async -> NavigationResult { await legacy.signalReady() }
+    func navigate(to goal: Vec2, stoppingAtForwardClearance clearance: Double) async -> NavigationResult {
+        await legacy.navigate(to: goal, stoppingAtForwardClearance: clearance)
+    }
+    func stopAndConfirm() async throws { try await legacy.stopAndConfirm() }
+}

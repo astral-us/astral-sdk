@@ -69,6 +69,9 @@ public final class NavigationController {
     private static let obstacleArrivalDistance = 0.65
 
     private var loop: Task<NavigationResult, Never>?
+    /// Latest goal for the running follow drive; `drive` adopts it on its next tick so a
+    /// moving person does not need a stop-and-relaunch per goal. Nil outside a follow drive.
+    private var liveFollowGoal: Vec2?
     private var stopConfirmation: Task<Void, Error>?
     private var stopUnconfirmed = false
     private var operationGeneration: UInt = 0 {
@@ -403,6 +406,20 @@ public final class NavigationController {
         return result
     }
 
+    /// Move the running follow drive's goal without stopping. Returns false, changing nothing,
+    /// when no follow drive owns the controller, it has been fenced or cancelled, or the new
+    /// goal cannot be planned; the caller then falls back to a stop-and-relaunch.
+    func updateFollowGoal(_ newGoal: Vec2) -> Bool {
+        guard state == .driving, liveFollowGoal != nil, !stopUnconfirmed,
+              let evidence = activeFollowEvidence, !evidence.fenced,
+              evidence.context.purpose == .followGoal,
+              evidence.ownedGeneration == operationGeneration,
+              !(loop?.isCancelled ?? true), let start = currentPose()?.position else { return false }
+        guard planAndStore(from: start, to: newGoal, policy: activePolicy) == nil else { return false }
+        liveFollowGoal = newGoal
+        return true
+    }
+
     /// A bounded, pose-controlled 10 cm ready signal, independent of pursuit's 20 cm tolerance.
     public func navigateForFollowReadySignal() async -> NavigationResult {
         guard !stopUnconfirmed else { return .failed(.commandFailed) }
@@ -651,6 +668,7 @@ public final class NavigationController {
             "target_stop_clearance": stoppingAtForwardClearance.map(Self.formatMeters) ?? "none"
         ])
         state = .driving
+        liveFollowGoal = isFollowGoal ? goal : nil
         publishSafetyState(.moving)
         let task = Task {
             await drive(to: goal, stoppingAtForwardClearance: stoppingAtForwardClearance,
@@ -1943,8 +1961,9 @@ public final class NavigationController {
         return sample.rejection(at: time, expectedGeneration: expectedGeneration)
     }
 
-    private func drive(to goal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?,
+    private func drive(to initialGoal: Vec2, stoppingAtForwardClearance targetStopDistance: Double?,
                        isFollowGoal: Bool) async -> NavigationResult {
+        var goal = initialGoal
         var hasSentCommand = false
         var consecutiveCommandFailures = 0
         var progressWatchdog = DriveProgressWatchdog(timeout: 2.5, minimumProgress: 0.05)
@@ -1955,6 +1974,12 @@ public final class NavigationController {
                 let result = NavigationResult.failed(.trackingLost)
                 finish(result)
                 return result
+            }
+            if isFollowGoal, let live = liveFollowGoal, live != goal {
+                // The goal moved with the person. Distance-to-goal no longer measures this
+                // drive's progress across the change, so restart the stall window.
+                goal = live
+                progressWatchdog.reset()
             }
             let distanceToGoal = pose.position.distance(to: goal)
             let targetApproachDecision = targetStopDistance.map {
@@ -2352,6 +2377,7 @@ public final class NavigationController {
 
     private func finish(_ result: NavigationResult) {
         activePolicy = nil
+        liveFollowGoal = nil
         switch result {
         case .arrived:
             state = .arrived

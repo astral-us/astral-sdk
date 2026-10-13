@@ -42,8 +42,12 @@ public struct FollowTargetTracker {
         continueTrackEvaluated(people, previous: previous, predictedPosition: predictedPosition, now: now).decision
     }
 
+    /// `worldGate` overrides the fixed world-distance gate (a coasting track's gate widens with
+    /// its uncertainty); `requireScreenAssociation: false` drops the box-overlap test, which only
+    /// means something against a box from the previous frame, not one seen seconds ago.
     func continueTrackEvaluated(_ people: [FollowPersonObservation], previous: FollowPersonObservation,
-                                predictedPosition: Vec2, now: TimeInterval, frameID: ARFrameID? = nil)
+                                predictedPosition: Vec2, now: TimeInterval, frameID: ARFrameID? = nil,
+                                worldGate: Double? = nil, requireScreenAssociation: Bool = true)
         -> (decision: FollowTrackMatch, evaluation: FollowAssociationEvaluation) {
         evaluateMatches(people, now: now, mode: "continuity") { candidate, evidence in
             guard candidate.frameID.generation == previous.frameID.generation else {
@@ -54,9 +58,10 @@ public struct FollowTargetTracker {
             }
             let distance = candidate.position.distance(to: predictedPosition)
             evidence.record("world_distance_m", distance)
-            guard distance <= configuration.maximumWorldDistance else {
+            guard distance <= (worldGate ?? configuration.maximumWorldDistance) else {
                 evidence.rejection = "world_distance_exceeded"; return false
             }
+            if !requireScreenAssociation { return true }
             let iou = boxIoU(candidate.boundingBox, previous.boundingBox)
             evidence.record("box_iou", Double(iou))
             if iou >= configuration.minimumBoxIoU { return true }

@@ -50,4 +50,6 @@ public final class NavigationFollowMeMotion: FollowMeContextualMotion, FollowMeA
     func inhibitScanContinuation(origin: FollowMotionStopOrigin) {
         navigation.inhibitFollowScanContinuation(origin: origin)
     }
+
+    func updateFollowGoal(_ goal: Vec2) -> Bool { navigation.updateFollowGoal(goal) }
 }

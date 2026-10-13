@@ -139,6 +139,28 @@ public enum FollowPersonProjection {
         return facts
     }
 
+    /// Nav-plane azimuth (`atan2(dy, dx)`) of the camera ray through the centre of `box`, or nil
+    /// when the box or calibration is unusable. Needs no depth, so it stays valid when the depth
+    /// under a partly hidden person would read the occluder.
+    public static func centerBearing(box: CGRect, in snapshot: ARFrameSnapshot) -> Double? {
+        let visible = box.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard !visible.isNull, visible.width > 0, visible.height > 0,
+              snapshot.imageResolution.width.isFinite, snapshot.imageResolution.width > 0,
+              snapshot.imageResolution.height.isFinite, snapshot.imageResolution.height > 0 else { return nil }
+        let k = snapshot.cameraIntrinsics
+        guard (0..<3).allSatisfy({ column in (0..<3).allSatisfy { k[column][$0].isFinite } }),
+              k[0][0] > 0, k[1][1] > 0,
+              (0..<4).allSatisfy({ column in (0..<4).allSatisfy { snapshot.cameraTransform[column][$0].isFinite } })
+        else { return nil }
+        let sensor = CGPoint(x: (1 - visible.midY) * snapshot.imageResolution.width,
+                             y: (1 - visible.midX) * snapshot.imageResolution.height)
+        let direction = SIMD4<Float>(Float((sensor.x - Double(k[2][0])) / Double(k[0][0])),
+                                     Float(-(sensor.y - Double(k[2][1])) / Double(k[1][1])), -1, 0)
+        let world = snapshot.cameraTransform * direction
+        guard world.x.isFinite, world.z.isFinite, world.x != 0 || world.z != 0 else { return nil }
+        return atan2(Double(world.z), Double(world.x))
+    }
+
     private static func median(_ sorted: [Float]) -> Double {
         let middle = sorted.count / 2
         return sorted.count.isMultiple(of: 2)

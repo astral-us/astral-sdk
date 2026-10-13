@@ -129,6 +129,13 @@ public final class FollowMeCoordinator {
     private var scanResponseSeed: FollowScanResponseSeed?
     private var lastGoal: Vec2?
     private var lastGoalTime: TimeInterval?
+    /// Constant-velocity track of the locked person (`config.coastSeconds > 0`). Seeded on the
+    /// first steady-following frame and dropped whenever the lock is dropped.
+    private var track: TargetKalmanFilter?
+    /// Capture time of the last full position measurement / of the last measurement of any kind.
+    private var lastPositionAt: TimeInterval?
+    private var lastMeasurementAt: TimeInterval?
+    private var coasting = false
     private var latestFrame: ARFrameID?
     private var latestBatch: FollowFrameBatch?
     private var commandReceivedAt: TimeInterval?
@@ -182,6 +189,7 @@ public final class FollowMeCoordinator {
         activeRequest = nil
         let token = generation
         locked = nil
+        resetTrack()
         alignmentConfirmedAfter = nil
         departureBaseline = nil
         readySignalAttempted = false
@@ -718,17 +726,25 @@ public final class FollowMeCoordinator {
             }
         case .following, .holdingDistance:
             guard let locked else { return }
+            seedTrackIfNeeded(from: locked)
+            let gate = trackGate(at: batch.timestamp, now: now)
             let evaluated = tracker.continueTrackEvaluated(batch.people, previous: locked,
-                predictedPosition: locked.position, now: now, frameID: batch.frameID)
+                predictedPosition: predictedPosition(at: batch.timestamp) ?? locked.position,
+                now: now, frameID: batch.frameID, worldGate: gate.world,
+                requireScreenAssociation: gate.screen)
             currentAssociation = (token, batch.frameID, evaluated.decision, evaluated.evaluation)
             associationAvailable = true
             emitAssociation(evaluated.evaluation, batch: batch, now: now)
             switch evaluated.decision {
             case .matched(let selected):
                 self.locked = selected
+                noteMeasurement(selected)
                 adoptMemory(selected, batch: batch, association: .continued)
-                await follow(selected, rover: batch.pose!.position, generation: token)
-            case .lost, .ambiguous: await loseTarget(generation: token)
+                await follow(selected, rover: batch.pose!.position, generation: token,
+                             lead: trackVelocity(at: batch.timestamp))
+            case .lost, .ambiguous:
+                if await coast(batch, generation: token, now: now) { return }
+                await loseTarget(generation: token)
             }
         case .reacquiring:
             guard let episode = recoveryEpisode, now < episode.deadline, let point = episode.anchor?.position else { return }
@@ -791,7 +807,7 @@ public final class FollowMeCoordinator {
     }
 
     private func follow(_ selected: FollowPersonObservation, rover: Vec2, generation token: UInt64,
-                        confirmedStop: UUID? = nil) async {
+                        confirmedStop: UUID? = nil, lead: Vec2? = nil) async {
         guard generation == token else { return }
         if let confirmedStop {
             let stoppedRecovery = state == .reacquiring && recoveryStopBoundary != nil
@@ -814,11 +830,23 @@ public final class FollowMeCoordinator {
             lastGoal = nil
             return
         }
-        guard let goal = tracker.standOffGoal(rover: rover, person: selected.position) else { return }
+        let aim = leadPoint(selected.position, velocity: lead)
+        guard let goal = tracker.standOffGoal(rover: rover, person: aim) else { return }
         if recoveryEpisode == nil { state = .following }
+        let minimumChange = config.continuousGoals ? config.continuousMinimumGoalChange : config.minimumGoalChange
+        let maximumRate = config.continuousGoals ? config.continuousMaximumGoalUpdatesPerSecond
+            : config.maximumGoalUpdatesPerSecond
         if let lastGoal, let lastGoalTime {
-            guard goal.distance(to: lastGoal) >= config.minimumGoalChange,
-                  clock.now - lastGoalTime >= 1 / config.maximumGoalUpdatesPerSecond else { return }
+            guard goal.distance(to: lastGoal) >= minimumChange,
+                  clock.now - lastGoalTime >= 1 / maximumRate else { return }
+        }
+        if config.continuousGoals, confirmedStop == nil, recoveryEpisode == nil, !scanning,
+           activeRequest?.purpose == .followGoal,
+           (motion as? any FollowMeContextualMotion)?.updateFollowGoal(goal) == true {
+            // The follow drive is still running: steer it, don't stop it.
+            lastGoal = goal
+            lastGoalTime = clock.now
+            return
         }
         if confirmedStop == nil {
             guard await confirmStop(generation: token), generation == token else { return }
@@ -839,6 +867,112 @@ public final class FollowMeCoordinator {
         launchMovement(generation: token, purpose: .followGoal) { [motion] context in
             await motion.performContextual(.following(goal, self.config.minimumHoldDistance), context: context)
         }
+    }
+
+    // MARK: Track, coasting and tolerant continuation
+
+    private func resetTrack() {
+        track = nil
+        lastPositionAt = nil
+        lastMeasurementAt = nil
+        coasting = false
+    }
+
+    private func seedTrackIfNeeded(from person: FollowPersonObservation) {
+        guard config.coastSeconds > 0, track == nil else { return }
+        track = TargetKalmanFilter(position: person.position, at: person.timestamp)
+        lastPositionAt = person.timestamp
+        lastMeasurementAt = person.timestamp
+        coasting = false
+    }
+
+    private func predictedPosition(at time: TimeInterval) -> Vec2? {
+        track?.estimate(at: time).position
+    }
+
+    private func trackVelocity(at time: TimeInterval) -> Vec2? {
+        guard config.continuousGoals, let track else { return nil }
+        return track.estimate(at: time).velocity
+    }
+
+    /// Association gate for this frame. A track that has been silent widens its world gate with
+    /// its own uncertainty and drops the box-overlap test, which compares against a stale box.
+    private func trackGate(at time: TimeInterval, now: TimeInterval) -> (world: Double?, screen: Bool) {
+        guard let track, let last = lastMeasurementAt else { return (nil, true) }
+        let silent = now - last
+        guard silent > 0.35 else { return (nil, true) }
+        let sigma = track.estimate(at: time).positionSigma
+        return (min(2.0, max(config.maximumWorldDistance, 3 * sigma)), false)
+    }
+
+    private func leadPoint(_ position: Vec2, velocity: Vec2?) -> Vec2 {
+        guard let velocity else { return position }
+        var dx = velocity.x * config.goalLeadSeconds, dy = velocity.y * config.goalLeadSeconds
+        let length = hypot(dx, dy)
+        if length > config.maximumGoalLead, length > 0 {
+            dx *= config.maximumGoalLead / length
+            dy *= config.maximumGoalLead / length
+        }
+        return Vec2(position.x + dx, position.y + dy)
+    }
+
+    private func noteMeasurement(_ person: FollowPersonObservation) {
+        guard config.coastSeconds > 0, var filter = track else { return }
+        filter.predict(to: person.timestamp)
+        let range = person.pose.position.distance(to: person.position)
+        filter.update(position: person.position, sigma: 0.06 + 0.03 * range)
+        track = filter
+        let gap = person.timestamp - (lastPositionAt ?? person.timestamp)
+        lastPositionAt = person.timestamp
+        lastMeasurementAt = person.timestamp
+        if coasting {
+            coasting = false
+            log("follow_coast.recovered", extra: ["gap_s": String(format: "%.2f", gap)])
+        }
+    }
+
+    /// The target was not matched this frame. Within the coast window, keep the estimate alive
+    /// (with a bearing-only update when a partly visible person lines up) and keep steering at
+    /// the predicted position. Returns false when coasting is off or has run out, so the caller
+    /// stops and searches exactly as before.
+    private func coast(_ batch: FollowFrameBatch, generation token: UInt64, now: TimeInterval) async -> Bool {
+        guard config.coastSeconds > 0, var filter = track, let locked, let lastMeasurementAt,
+              let lastPositionAt, let pose = batch.pose else { return false }
+        if config.tolerantContinuation, now - lastPositionAt <= config.maximumBearingOnlySeconds,
+           let partial = bearingMatch(batch, filter: filter, pose: pose) {
+            filter.predict(to: partial.timestamp)
+            filter.update(bearing: partial.bearing, from: pose.position, sigma: config.bearingSigma)
+            track = filter
+            self.lastMeasurementAt = partial.timestamp
+        }
+        let silent = now - (self.lastMeasurementAt ?? lastMeasurementAt)
+        guard silent <= config.coastSeconds else {
+            log("follow_coast.expired", extra: ["silent_s": String(format: "%.2f", silent)])
+            return false
+        }
+        if !coasting {
+            coasting = true
+            log("follow_coast.started", extra: ["last_position_age_s": String(format: "%.2f", now - lastPositionAt)])
+        }
+        let estimate = (track ?? filter).estimate(at: batch.timestamp)
+        let synthetic = FollowPersonObservation(frameID: batch.frameID, timestamp: batch.timestamp,
+            confidence: locked.confidence, boundingBox: locked.boundingBox, position: estimate.position,
+            pose: pose, rawPersonID: nil, bodyVerified: locked.bodyVerified)
+        await follow(synthetic, rover: pose.position, generation: token,
+                     lead: config.continuousGoals ? estimate.velocity : nil)
+        return true
+    }
+
+    private func bearingMatch(_ batch: FollowFrameBatch, filter: TargetKalmanFilter,
+                              pose: Pose2D) -> FollowBearingObservation? {
+        var ahead = filter
+        ahead.predict(to: batch.timestamp)
+        let gated = batch.partialPeople.filter { partial in
+            partial.confidence >= config.minimumPartialConfidence && partial.frameID == batch.frameID
+                && abs(ahead.bearingInnovation(partial.bearing, from: pose.position) ?? .infinity) <= config.maximumBearingInnovation
+                && ahead.gate(bearing: partial.bearing, from: pose.position, sigma: config.bearingSigma) <= 6.63
+        }
+        return gated.count == 1 ? gated[0] : nil   // two candidates in the gate: do not guess
     }
 
     private func align(generation token: UInt64) {
@@ -1374,6 +1508,7 @@ public final class FollowMeCoordinator {
 
     private func loseTarget(generation token: UInt64) async {
         guard generation == token, state != .reacquiring else { return }
+        resetTrack()
         if recoveryEpisode == nil {
             recoveryHasProvisionalLock = false
             recoveryCenterSource = nil

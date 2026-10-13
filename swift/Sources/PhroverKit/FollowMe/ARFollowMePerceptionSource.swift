@@ -91,6 +91,17 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                                             position: position, pose: snapshot.pose, rawPersonID: candidate.rawPersonID,
                                             bodyVerified: verified?.contains(candidate.rawPersonID) == true)
         }
+        let acceptedRawIDs = Set(people.compactMap(\.rawPersonID))
+        let minimumPartialConfidence = FollowMeConfiguration().minimumPartialConfidence
+        let partial: [FollowBearingObservation] = evaluated && snapshot.trackingQuality == .normal
+            ? rawPeople.enumerated().compactMap { id, detection in
+                guard !acceptedRawIDs.contains(id), detection.confidence >= minimumPartialConfidence,
+                      let bearing = FollowPersonProjection.centerBearing(box: detection.boundingBox, in: snapshot)
+                else { return nil }
+                return FollowBearingObservation(frameID: snapshot.id, timestamp: snapshot.timestamp,
+                    confidence: detection.confidence, boundingBox: detection.boundingBox,
+                    bearing: bearing, pose: snapshot.pose, rawPersonID: id)
+            } : []
         var diagnostics = FollowPerceptionDiagnostics(frameID: snapshot.id, timestamp: snapshot.timestamp,
             inferenceStatus: status, inferenceFailureReason: inferenceFailureReason,
             rawDetectorCount: detectorCountsKnown ? detections.count : nil, rawPersonCount: detectorCountsKnown ? rawPeople.count : nil,
@@ -103,7 +114,8 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                                 pose: snapshot.trackingQuality == .normal ? snapshot.pose : nil,
                                 depthAvailable: snapshot.depthMap != nil, people: people,
                                 trackingQuality: snapshot.trackingQuality, trackingReason: trackingReason,
-                                inferenceDuration: inferenceDuration, perceptionDiagnostics: diagnostics)
+                                inferenceDuration: inferenceDuration, perceptionDiagnostics: diagnostics,
+                                partialPeople: partial)
     }
 
     public static func trackingReason(from state: ARCamera.TrackingState) -> FollowTrackingReason? {

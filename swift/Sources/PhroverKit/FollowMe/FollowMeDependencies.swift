@@ -37,6 +37,9 @@ public struct FollowFrameBatch: @unchecked Sendable {
     public let pose: Pose2D?
     public let depthAvailable: Bool
     public let people: [FollowPersonObservation]
+    /// Detections that failed the full-observation rules but still give a direction; see
+    /// `FollowBearingObservation`. Empty from providers that do not supply them.
+    public let partialPeople: [FollowBearingObservation]
     public let trackingQuality: ARTrackingQuality?
     public let trackingReason: FollowTrackingReason?
     /// Detector wall-clock duration in seconds; nil means not measured.
@@ -46,7 +49,9 @@ public struct FollowFrameBatch: @unchecked Sendable {
     public init(frameID: ARFrameID, timestamp: TimeInterval, pose: Pose2D?,
                 depthAvailable: Bool, people: [FollowPersonObservation],
                 trackingQuality: ARTrackingQuality? = nil, trackingReason: FollowTrackingReason? = nil,
-                inferenceDuration: TimeInterval? = nil, perceptionDiagnostics: FollowPerceptionDiagnostics? = nil) {
+                inferenceDuration: TimeInterval? = nil, perceptionDiagnostics: FollowPerceptionDiagnostics? = nil,
+                partialPeople: [FollowBearingObservation] = []) {
+        self.partialPeople = partialPeople
         self.frameID = frameID
         self.timestamp = timestamp
         self.pose = pose
@@ -93,6 +98,9 @@ protocol FollowMeContextualMotion: FollowMeSourceClockMotion {
     func inhibitScanContinuation(origin: FollowMotionStopOrigin)
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult
     func motionFailures() -> AsyncStream<FollowMotionFailureDelivery>
+    /// Move the running follow-goal drive without stopping it. False means "not applied";
+    /// the caller stops and relaunches as before.
+    func updateFollowGoal(_ goal: Vec2) -> Bool
 }
 
 extension FollowMeMotion {
@@ -136,6 +144,7 @@ extension FollowMeMotion {
 extension FollowMeContextualMotion {
     var sourceUptime: TimeInterval? { nil }
     func inhibitScanContinuation(origin: FollowMotionStopOrigin) {}
+    func updateFollowGoal(_ goal: Vec2) -> Bool { false }
 
     func perform(_ request: FollowMotionRequest, context: FollowMotionRequestContext) async -> FollowMotionResult {
         await performLegacy(request, context: context)
