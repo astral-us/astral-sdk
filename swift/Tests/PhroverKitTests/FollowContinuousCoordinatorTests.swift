@@ -178,10 +178,9 @@ final class FollowContinuousCoordinatorTests: XCTestCase {
         await following(r)
         var t = 0.9
         var seq: UInt64 = 4
-        while t < 4.8 { await send(r, seq, at: t, partial: [partial(seq, at: t)]); t += 0.3; seq += 1 }
+        while t < 4.5 { await send(r, seq, at: t, partial: [partial(seq, at: t)]); t += 0.3; seq += 1 }
         XCTAssertEqual(r.coordinator.state, .following)
-        await send(r, seq, at: 5.2, partial: [partial(seq, at: 5.2)])   // > 4 s with no position
-        await send(r, seq + 1, at: 8.5)                                  // and the bearings stop too
+        await send(r, seq, at: 4.8, partial: [partial(seq, at: 4.8)])   // > 4 s with no position
         XCTAssertEqual(r.coordinator.state, .reacquiring)
         _ = await r.coordinator.stop(); r.motion.legacy.releaseNavigation()
     }
@@ -218,4 +217,40 @@ final class FollowContinuousCoordinatorTests: XCTestCase {
         XCTAssertTrue(r.motion.legacy.goals.isEmpty, "no motion toward a body that never passed the body check")
         _ = await r.coordinator.stop(); r.motion.legacy.releaseRotation()
     }
+
+    func testBearingOnlyMustStopAtConfiguredMaximum() async {
+        let r = rig { $0.coastSeconds = 3; $0.tolerantContinuation = true; $0.maximumBearingOnlySeconds = 6 }
+        await following(r)
+        for i in 1...21 {
+            let time = 0.6 + Double(i) * 0.3
+            let seq = UInt64(i + 3)
+            await send(r, seq, at: time, partial: [partial(seq, at: time)])
+        }
+        XCTAssertEqual(r.coordinator.state, .reacquiring,
+            "6.3 seconds without a full position must exceed the 6-second bearing-only limit")
+        _ = await r.coordinator.stop(); r.motion.legacy.releaseNavigation()
+    }
+
+    func testFullObservationResumesAfterBearingOnlyAndCameraTurn() async {
+        let r = rig { $0.coastSeconds = 3; $0.tolerantContinuation = true; $0.continuousGoals = true }
+        await following(r)
+        await send(r, 4, at: 0.9, partial: [partial(4, at: 0.9)])
+        await send(r, 5, at: 1.2, partial: [partial(5, at: 1.2)])
+        await send(r, 6, at: 1.5, partial: [partial(6, at: 1.5)])
+        // The rover turns while bearing-only evidence maintains the world position.
+        let pose = Pose2D(position: .zero, yaw: .pi / 4)
+        let observed = FollowPersonObservation(frameID: .init(generation: 1, sequence: 7), timestamp: 1.8,
+            confidence: 0.9, boundingBox: CGRect(x: 0.05, y: 0.4, width: 0.1, height: 0.2),
+            position: Vec2(0, 4), pose: pose)
+        r.clock.advance(to: 1.8)
+        r.perception.send(.frame(.init(frameID: observed.frameID, timestamp: 1.8, pose: pose,
+            depthAvailable: true, people: [observed], trackingQuality: .normal)))
+        await drain()
+        // Beyond the old bearing clock, but still inside a fresh coast window from t=1.8.
+        await send(r, 8, at: 4.6)
+        XCTAssertEqual(r.coordinator.state, .following,
+            "The full observation should refresh the track despite the pre-occlusion bounding box")
+        _ = await r.coordinator.stop(); r.motion.legacy.releaseNavigation()
+    }
+
 }

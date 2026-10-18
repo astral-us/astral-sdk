@@ -55,6 +55,52 @@ final class NavigationFollowLiveGoalTests: XCTestCase {
         XCTAssertEqual(result.result, .arrived)
     }
 
+    func testLiveGoalIsRefusedWhileArrivalStopIsSuspended() async {
+        let log = Log()
+        var suspendNextStop = false
+        var arrivalStop: CheckedContinuation<Void, Never>?
+        let nav = NavigationController(
+            currentPose: { Pose2D(position: .zero, yaw: 0) },
+            forwardClearance: { 5 },
+            plan: { _, goal in [goal] },
+            lastAckAt: { Date() },
+            sendCommand: { log.commands.append($0) },
+            stopRover: {
+                log.stops += 1
+                if suspendNextStop {
+                    suspendNextStop = false
+                    await withCheckedContinuation { arrivalStop = $0 }
+                }
+            },
+            sleep: { _ in await Task.yield() }
+        )
+        let drive = Task { await nav.performFollowMotion(.following(Vec2(5, 0), 1.25), context: context()) }
+        await waitForCommands(log, atLeast: 2)
+        XCTAssertGreaterThanOrEqual(log.commands.count, 2)
+
+        // The initial admission stop has completed. Suspend the next stop exactly
+        // when the running drive reaches this replacement goal.
+        suspendNextStop = true
+        XCTAssertTrue(nav.updateFollowGoal(Vec2(0.1, 0)))
+        for _ in 0..<2000 where arrivalStop == nil { await Task.yield() }
+        guard let stop = arrivalStop else {
+            XCTFail("The drive did not enter its arrival stop")
+            suspendNextStop = false
+            nav.cancel()
+            _ = await drive.value
+            return
+        }
+        let commandsAtStop = log.commands.count
+        XCTAssertFalse(nav.updateFollowGoal(Vec2(0, 5)),
+            "An arrival stop must refuse a goal that the terminating drive will discard")
+
+        stop.resume()
+        arrivalStop = nil
+        let result = await drive.value
+        XCTAssertEqual(result.result, .arrived)
+        XCTAssertEqual(log.commands.count, commandsAtStop)
+    }
+
     func testLiveGoalIsRefusedWhenNothingIsDriving() {
         let nav = controller(Log())
         XCTAssertFalse(nav.updateFollowGoal(Vec2(1, 1)))

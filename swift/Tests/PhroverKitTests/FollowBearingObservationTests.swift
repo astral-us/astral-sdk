@@ -105,4 +105,23 @@ final class FollowBearingObservationTests: XCTestCase {
         let batch = ARFollowMePerceptionSource.batch(from: frame, detections: [], inferenceStatus: .failed)
         XCTAssertTrue(batch.partialPeople.isEmpty)
     }
+
+    func testLowConfidenceVerifiedPersonRemainsAvailableAsBearing() throws {
+        let frame = try snapshot(transform: upright)
+        func joint(_ x: Double, _ y: Double) -> PersonBodyVerifier.Joint {
+            .init(location: .init(x: x, y: y), confidence: 0.9)
+        }
+        let box = CGRect(x: 0.6, y: 0.2, width: 0.2, height: 0.6)
+        let body = PersonBodyVerifier.Body(leftShoulder: joint(0.65, 0.7), rightShoulder: joint(0.75, 0.7),
+            leftHip: joint(0.66, 0.4), rightHip: joint(0.74, 0.4))
+        let decision = PersonBodyVerifier.verify(box: box, rawPersonID: 0, bodies: [body])
+        XCTAssertTrue(decision.accepted)
+        let batch = ARFollowMePerceptionSource.batch(from: frame,
+            detections: [.init(label: "person", confidence: 0.35, boundingBox: box)],
+            personVerification: [decision])
+        XCTAssertNil(FollowTargetTracker().selectInitial(batch.people, now: frame.timestamp))
+        XCTAssertEqual(batch.partialPeople.compactMap(\.rawPersonID), [0],
+            "A person below the 0.50 full-observation threshold but above 0.25 should retain bearing evidence")
+    }
+
 }

@@ -2068,6 +2068,7 @@ public final class NavigationController {
 
             let out = pursuit.step(pose: pose, path: path)
             if out.reachedGoal {
+                if isFollowGoal { liveFollowGoal = nil }
                 try? await stopRover()
                 let result = NavigationResult.arrived
                 finish(result)

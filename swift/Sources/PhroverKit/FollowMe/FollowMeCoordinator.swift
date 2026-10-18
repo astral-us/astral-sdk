@@ -895,10 +895,10 @@ public final class FollowMeCoordinator {
         return track.estimate(at: time).velocity
     }
 
-    /// Association gate for this frame. A track that has been silent widens its world gate with
-    /// its own uncertainty and drops the box-overlap test, which compares against a stale box.
+    /// Association gate for this frame. A track without a recent full position widens its world
+    /// gate with its uncertainty and drops the box-overlap test against a stale box.
     private func trackGate(at time: TimeInterval, now: TimeInterval) -> (world: Double?, screen: Bool) {
-        guard let track, let last = lastMeasurementAt else { return (nil, true) }
+        guard let track, let last = lastPositionAt else { return (nil, true) }
         let silent = now - last
         guard silent > 0.35 else { return (nil, true) }
         let sigma = track.estimate(at: time).positionSigma
@@ -946,7 +946,9 @@ public final class FollowMeCoordinator {
             self.lastMeasurementAt = partial.timestamp
         }
         let silent = now - (self.lastMeasurementAt ?? lastMeasurementAt)
-        guard silent <= config.coastSeconds else {
+        let bearingOnlyExpired = config.tolerantContinuation && (self.lastMeasurementAt ?? lastMeasurementAt) > lastPositionAt
+            && now - lastPositionAt > config.maximumBearingOnlySeconds
+        guard silent <= config.coastSeconds, !bearingOnlyExpired else {
             log("follow_coast.expired", extra: ["silent_s": String(format: "%.2f", silent)])
             return false
         }

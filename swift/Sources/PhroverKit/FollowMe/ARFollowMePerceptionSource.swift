@@ -91,8 +91,9 @@ public final class ARFollowMePerceptionSource: FollowMePerception {
                                             position: position, pose: snapshot.pose, rawPersonID: candidate.rawPersonID,
                                             bodyVerified: verified?.contains(candidate.rawPersonID) == true)
         }
-        let acceptedRawIDs = Set(people.compactMap(\.rawPersonID))
-        let minimumPartialConfidence = FollowMeConfiguration().minimumPartialConfidence
+        let thresholds = FollowMeConfiguration()
+        let acceptedRawIDs = Set(people.filter { $0.confidence >= thresholds.minimumConfidence }.compactMap(\.rawPersonID))
+        let minimumPartialConfidence = thresholds.minimumPartialConfidence
         let partial: [FollowBearingObservation] = evaluated && snapshot.trackingQuality == .normal
             ? rawPeople.enumerated().compactMap { id, detection in
                 guard !acceptedRawIDs.contains(id), detection.confidence >= minimumPartialConfidence,
